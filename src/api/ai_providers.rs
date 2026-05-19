@@ -284,6 +284,18 @@ fn read_grok_auth_entry() -> Option<serde_json::Value> {
     auth.get(GROK_OAUTH_CLIENT_KEY).cloned()
 }
 
+async fn wait_for_grok_auth_entry() -> Option<serde_json::Value> {
+    for attempt in 0..20 {
+        if let Some(entry) = read_grok_auth_entry() {
+            return Some(entry);
+        }
+        if attempt < 19 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    None
+}
+
 fn grok_auth_email(entry: &serde_json::Value) -> Option<String> {
     entry
         .get("email")
@@ -7482,7 +7494,7 @@ async fn oauth_callback_inner(
     };
 
     if provider_type == ProviderType::Xai {
-        let entry = read_grok_auth_entry().ok_or_else(|| {
+        let entry = wait_for_grok_auth_entry().await.ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
                 "Grok is not connected yet. Complete the xAI browser authorization first, then click Connect."
