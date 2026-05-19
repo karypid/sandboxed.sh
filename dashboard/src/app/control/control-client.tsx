@@ -82,7 +82,6 @@ import {
   getCurrentMission,
   uploadFile,
   uploadFileChunked,
-  downloadFromUrl,
   formatBytes,
   getProgress,
   getRunningMissions,
@@ -138,7 +137,6 @@ import {
   RefreshCw,
   RotateCcw,
   PlayCircle,
-  Link2,
   ListPlus,
   X,
   Wrench,
@@ -268,7 +266,7 @@ import {
   DataTable,
   parseSerializableDataTable,
 } from "@/components/tool-ui/data-table";
-import { useScrollToBottom } from "@/hooks/use-scroll-to-bottom";
+import { useVirtualTimelineAnchor } from "@/hooks/use-virtual-timeline-anchor";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { useVisibilityPolling } from "@/hooks/use-visibility-polling";
@@ -1684,7 +1682,7 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
         Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000),
       )
     : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(!item.done);
 
   const formatDuration = (seconds: number) => {
     if (seconds <= 0) return "<1s";
@@ -1822,89 +1820,57 @@ function ThinkingPanel({
   const hasActiveThinking = activeItems.some((i) => i.kind === "thinking");
   const hasActiveStream = activeItems.some((i) => i.kind === "stream");
 
-  // Deduplicate completed items by content - keep first occurrence
-  const completedItems = useMemo(() => {
-    const seen = new Set<string>();
-    return items.filter((t) => {
-      if (!t.done) return false;
-      // Skip empty/whitespace-only content
-      const trimmed = t.content.trim();
-      if (!trimmed) return false;
-      if (seen.has(trimmed)) return false;
-      seen.add(trimmed);
-      return true;
-    });
-  }, [items]);
-
   // Performance: limit visible thoughts, load more on demand
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [isThoughtsAtBottom, setIsThoughtsAtBottom] = useState(true);
   const panelRows = useMemo(() => {
-    const rows: Array<
-      | { kind: "completed"; item: SidePanelItem }
-      | { kind: "current" }
-      | { kind: "active"; item: SidePanelItem }
-    > = completedItems.map((item) => ({ kind: "completed", item }));
-    if (activeItems.length > 0 && completedItems.length > 0) {
-      rows.push({ kind: "current" });
-    }
-    for (const item of activeItems) {
-      rows.push({ kind: "active", item });
-    }
-    return rows;
-  }, [activeItems, completedItems]);
+    const seenDoneContent = new Set<string>();
+    return items
+      .filter((item) => {
+        const trimmed = item.content.trim();
+        if (!item.done) return true;
+        if (!trimmed) return false;
+        if (seenDoneContent.has(trimmed)) return false;
+        seenDoneContent.add(trimmed);
+        return true;
+      })
+      .map((item) => ({ item }));
+  }, [items]);
+  const thoughtsAnchorKey = useMemo(
+    () =>
+      panelRows
+        .slice(-8)
+        .map(
+          ({ item }) =>
+            `${item.id}:${item.done ? "done" : "active"}:${item.content.length}`,
+        )
+        .join("|"),
+    [panelRows],
+  );
   const thoughtsVirtualizer = useVirtualizer({
     count: panelRows.length,
     getScrollElement: () => scrollRef.current,
     getItemKey: (index) => {
       const row = panelRows[index];
       if (!row) return index;
-      if (row.kind === "current") return "current";
-      return `${row.kind}:${row.item.id}`;
+      return row.item.id;
     },
     estimateSize: (index) => {
       const row = panelRows[index];
       if (!row) return 96;
-      if (row.kind === "current") return 24;
       return row.item.kind === "stream" ? 140 : 112;
     },
     overscan: 6,
   });
-
-  // Auto-scroll to bottom when active thought content changes.
-  // Use useLayoutEffect to set scroll before paint (prevents flicker).
-  // Only scroll if already near the bottom (user hasn't scrolled up to read history).
-  const userScrolledUpRef = useRef(false);
-  useEffect(() => {
-    userScrolledUpRef.current = false;
-    setIsThoughtsAtBottom(true);
-  }, [missionId]);
-
-  useLayoutEffect(() => {
-    if (activeItems.length > 0 && !userScrolledUpRef.current) {
-      thoughtsVirtualizer.scrollToIndex(Math.max(panelRows.length - 1, 0), {
-        align: "end",
-      });
-    }
-  }, [
-    activeItems.map((i) => `${i.id}:${i.content.length}`).join("|"),
-    panelRows.length,
-    thoughtsVirtualizer,
-  ]);
-
-  // Track whether user has manually scrolled up
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const handleScroll = () => {
-      const distanceFromBottom =
-        el.scrollHeight - el.scrollTop - el.clientHeight;
-      userScrolledUpRef.current = distanceFromBottom > 80;
-      setIsThoughtsAtBottom(!userScrolledUpRef.current);
-    };
-    el.addEventListener("scroll", handleScroll, { passive: true });
-    return () => el.removeEventListener("scroll", handleScroll);
-  }, []);
+  const {
+    isAtBottom: isThoughtsAtBottom,
+    scrollToBottom: scrollThoughtsToBottom,
+  } = useVirtualTimelineAnchor({
+    scrollElementRef: scrollRef,
+    virtualizer: thoughtsVirtualizer,
+    itemCount: panelRows.length,
+    changeKey: thoughtsAnchorKey,
+    resetKey: missionId ?? null,
+  });
 
   // Handle Escape key
   useEffect(() => {
@@ -1943,10 +1909,8 @@ function ThinkingPanel({
                 ? "Streaming"
                 : "Thoughts"}
           </span>
-          {(completedItems.length > 0 || activeItems.length > 0) && (
-            <span className="text-xs text-white/30">
-              ({completedItems.length + activeItems.length})
-            </span>
+          {panelRows.length > 0 && (
+            <span className="text-xs text-white/30">({panelRows.length})</span>
           )}
         </div>
         <button
@@ -1958,7 +1922,11 @@ function ThinkingPanel({
       </div>
 
       {/* Content - flex-col with overflow, scrolls up for history */}
-      <div ref={scrollRef} className="relative flex-1 overflow-y-auto p-3">
+      <div
+        ref={scrollRef}
+        data-testid="thoughts-scroll-container"
+        className="relative flex-1 overflow-y-auto p-3"
+      >
         {items.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center p-4">
             <Brain className="h-8 w-8 text-white/20 mb-3" />
@@ -1989,17 +1957,12 @@ function ThinkingPanel({
                       transform: `translateY(${virtualRow.start}px)`,
                     }}
                   >
-                    {row.kind === "current" ? (
-                      <div className="text-[10px] uppercase tracking-wider text-white/30 px-1">
-                        Current
-                      </div>
-                    ) : (
-                      <ThinkingPanelItem
-                        item={row.item}
-                        isActive={row.kind === "active"}
-                        basePath={basePath}
-                      />
-                    )}
+                    <ThinkingPanelItem
+                      item={row.item}
+                      isActive={!row.item.done}
+                      basePath={basePath}
+                      missionId={missionId ?? undefined}
+                    />
                   </div>
                 );
               })}
@@ -2007,12 +1970,7 @@ function ThinkingPanel({
             {!isThoughtsAtBottom && (
               <button
                 type="button"
-                onClick={() =>
-                  thoughtsVirtualizer.scrollToIndex(
-                    Math.max(panelRows.length - 1, 0),
-                    { align: "end" },
-                  )
-                }
+                onClick={() => scrollThoughtsToBottom()}
                 className="absolute bottom-3 right-3 flex h-8 w-8 items-center justify-center rounded-full border border-white/[0.1] bg-black/50 text-white/60 shadow-lg transition-colors hover:bg-white/[0.08] hover:text-white"
                 title="Scroll to bottom"
               >
@@ -3942,9 +3900,6 @@ export default function ControlClient() {
     fileName: string;
     progress: UploadProgress;
   } | null>(null);
-  const [showUrlInput, setShowUrlInput] = useState(false);
-  const [urlInput, setUrlInput] = useState("");
-  const [urlDownloading, setUrlDownloading] = useState(false);
 
   // Server configuration (fetched from health endpoint)
   const [maxIterations, setMaxIterations] = useState<number>(50); // Default fallback
@@ -4059,6 +4014,7 @@ export default function ControlClient() {
     | ((id: string, traceEvents: StoredEvent[], maxSequence?: number) => void)
     | null
   >(null);
+  const deferredTraceLoadsRef = useRef<Set<string>>(new Set());
   /**
    * Per-mission high-water mark for `sequence`. When non-zero, reload
    * paths pass it as `since_seq` to `/events` so the server returns
@@ -4193,57 +4149,46 @@ export default function ControlClient() {
       }
 
       if (!sorted) {
-        try {
-          const transcript = await getMissionTranscript(id);
-          sorted = transcript.messages
-            .map(
-              ({
-                trace_count: _traceCount,
-                trace_summary: _traceSummary,
-                ...event
-              }) => event,
-            )
-            .sort((a, b) => a.sequence - b.sequence);
-          metaMaxSeq = transcript.latest_sequence;
-          // Only count types the client actually loads. The transcript's
-          // `event_counts` includes debug/status events outside
-          // `HISTORY_EVENT_TYPES`; summing them all inflates the total and
-          // makes `computeHasMoreOlder(id)` (which compares against the
-          // count of *loaded* events) return true forever, leaving the
-          // "Load older messages" button permanently visible. The fallback
-          // branch below already does this correctly via the meta returned
-          // by the typed `getMissionEventsWithMeta` call.
-          metaTotal = Object.entries(transcript.event_counts).reduce(
-            (sum, [type, count]) =>
-              HISTORY_EVENT_TYPES.includes(type) ? sum + count : sum,
-            0,
-          );
+        const transcript = await getMissionTranscript(id);
+        sorted = transcript.messages
+          .map(
+            ({
+              trace_count: _traceCount,
+              trace_summary: _traceSummary,
+              ...event
+            }) => event,
+          )
+          .sort((a, b) => a.sequence - b.sequence);
+        metaMaxSeq = transcript.latest_sequence;
+        // Only count types the client actually loads. The transcript's
+        // `event_counts` includes debug/status events outside
+        // `HISTORY_EVENT_TYPES`; summing them all inflates the total and
+        // makes `computeHasMoreOlder(id)` (which compares against the
+        // count of *loaded* events) return true forever.
+        metaTotal = Object.entries(transcript.event_counts).reduce(
+          (sum, [type, count]) =>
+            HISTORY_EVENT_TYPES.includes(type) ? sum + count : sum,
+          0,
+        );
 
-          // Fetch hidden thoughts/tools after first paint. The renderer ref is
-          // populated below `eventsToItems`; this avoids blocking transcript
-          // display on the heavier activity trace.
-          setTimeout(() => {
-            void getMissionTraceWithMeta(id, {
-              sinceSeq: 0,
-              limit: HISTORY_PAGE_SIZE,
+        // Fetch hidden thoughts/tools after first paint. The renderer ref is
+        // populated below `eventsToItems`; this avoids blocking transcript
+        // display on the heavier activity trace.
+        setTimeout(() => {
+          if (deferredTraceLoadsRef.current.has(id)) return;
+          deferredTraceLoadsRef.current.add(id);
+          void getMissionTraceWithMeta(id, {
+            sinceSeq: 0,
+            limit: HISTORY_PAGE_SIZE,
+          })
+            .then(({ events, meta }) => {
+              renderDeferredTraceRef.current?.(id, events, meta.maxSequence);
             })
-              .then(({ events, meta }) => {
-                renderDeferredTraceRef.current?.(id, events, meta.maxSequence);
-              })
-              .catch(() => undefined);
-          }, 0);
-        } catch {
-          // Older backends do not expose `/transcript`; keep the existing full
-          // tail fetch as a compatibility fallback.
-          const { events, meta } = await getMissionEventsWithMeta(id, {
-            types: HISTORY_EVENT_TYPES,
-            latest: true,
-            limit: INITIAL_HISTORY_PAGE_SIZE,
-          });
-          sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
-          metaMaxSeq = meta.maxSequence;
-          metaTotal = meta.totalEvents;
-        }
+            .catch(() => undefined)
+            .finally(() => {
+              deferredTraceLoadsRef.current.delete(id);
+            });
+        }, 0);
       }
 
       // Only seed `missionMaxSeqRef` when the server has confirmed it
@@ -4394,6 +4339,7 @@ export default function ControlClient() {
     [items, deferredShowThinkingPanel],
   );
 
+  const containerRef = useRef<HTMLDivElement>(null);
   const chatVirtualizer = useVirtualizer({
     count: groupedItems.length,
     getScrollElement: () => containerRef.current,
@@ -4412,6 +4358,37 @@ export default function ControlClient() {
       return 100;
     },
     overscan: 8,
+  });
+  const chatAnchorKey = useMemo(
+    () =>
+      groupedItems
+        .slice(-8)
+        .map((item) => {
+          const key = getGroupedItemKey(item);
+          if (item.kind === "thinking_group") {
+            const tailThoughts = item.thoughts.slice(-4);
+            return `${key}:${item.thoughts.length}:${tailThoughts.map((thought) => `${thought.id}:${thought.done ? "done" : "active"}:${thought.content.length}`).join(",")}`;
+          }
+          if (item.kind === "tool_group") {
+            return `${key}:${item.tools.length}`;
+          }
+          if (item.kind === "thinking" || item.kind === "stream") {
+            return `${key}:${item.done ? "done" : "active"}:${item.content.length}`;
+          }
+          if (item.kind === "assistant" || item.kind === "user") {
+            return `${key}:${item.content.length}`;
+          }
+          return key;
+        })
+        .join("|"),
+    [groupedItems],
+  );
+  const { isAtBottom, scrollToBottom } = useVirtualTimelineAnchor({
+    scrollElementRef: containerRef,
+    virtualizer: chatVirtualizer,
+    itemCount: groupedItems.length,
+    changeKey: chatAnchorKey,
+    resetKey: viewingMissionId,
   });
 
   const showAgentWorkingIndicator = useMemo(() => {
@@ -4690,25 +4667,6 @@ export default function ControlClient() {
     itemsRef.current = items;
   }, [items]);
 
-  // Smart auto-scroll
-  const {
-    containerRef,
-    endRef,
-    isAtBottom,
-    scrollToBottom,
-    scrollToBottomImmediate,
-  } = useScrollToBottom();
-
-  // Scroll to bottom synchronously before paint when items change.
-  // This ensures the page appears at the bottom instantly when returning
-  // to the control page (no visible scroll animation).
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useLayoutEffect(() => {
-    if (items.length > 0 && isAtBottom) {
-      scrollToBottomImmediate();
-    }
-  }, [items]);
-
   // Backwards-pagination scroll restore. `loadOlderHistoryEvents` snapshots
   // `scrollTop` + `scrollHeight` BEFORE prepending items into this ref;
   // after React commits the longer list, we adjust `scrollTop` to keep the
@@ -4888,44 +4846,6 @@ export default function ControlClient() {
     },
     [compressImageFile, currentMission, viewingMission],
   );
-
-  // Handle URL download
-  const handleUrlDownload = useCallback(async () => {
-    if (!urlInput.trim()) return;
-
-    setUrlDownloading(true);
-    try {
-      const contextPath = "./context/";
-
-      // Get workspace_id and mission_id from current or viewing mission
-      const mission = viewingMission ?? currentMission;
-      const workspaceId = mission?.workspace_id;
-      const missionId = mission?.id;
-
-      const result = await downloadFromUrl(
-        urlInput.trim(),
-        contextPath,
-        undefined,
-        workspaceId,
-        missionId,
-      );
-      toast.success(`Downloaded ${result.name}`);
-
-      // Add a message about the download at the beginning (use full path)
-      setInput((prev) => {
-        const downloadNote = `[Downloaded: ${result.path}]`;
-        return prev ? `${downloadNote}\n${prev}` : downloadNote;
-      });
-
-      setUrlInput("");
-      setShowUrlInput(false);
-    } catch (error) {
-      console.error("URL download failed:", error);
-      toast.error(`Failed to download from URL`);
-    } finally {
-      setUrlDownloading(false);
-    }
-  }, [urlInput, currentMission, viewingMission]);
 
   // Handle file input change
   const handleFileChange = async (
@@ -5349,7 +5269,10 @@ export default function ControlClient() {
   }, []);
 
   const eventsToItemsAsync = useCallback(
-    async (events: StoredEvent[], mission?: Mission | null): Promise<ChatItem[]> => {
+    async (
+      events: StoredEvent[],
+      mission?: Mission | null,
+    ): Promise<ChatItem[]> => {
       if (events.length < 500) {
         return eventsToItems(events, mission);
       }
@@ -5377,7 +5300,10 @@ export default function ControlClient() {
         eventsWorkerPendingRef.current.delete(id);
         eventsWorkerRef.current = false;
         worker.terminate();
-        console.warn("[control] events worker failed; falling back to sync", error);
+        console.warn(
+          "[control] events worker failed; falling back to sync",
+          error,
+        );
         return eventsToItems(events, mission);
       }
     },
@@ -5409,6 +5335,16 @@ export default function ControlClient() {
     }
     if (maxSequence !== undefined && maxSequence > 0) {
       missionMaxSeqRef.current.set(id, maxSequence);
+    }
+    const cacheMaxSequence =
+      maxSequence ??
+      missionMaxSeqRef.current.get(id) ??
+      merged.at(-1)?.sequence;
+    const cacheTotal = missionTotalHistoryRef.current.get(id) ?? merged.length;
+    if (cacheMaxSequence !== undefined && cacheMaxSequence > 0) {
+      void writeCachedEvents(id, merged, cacheMaxSequence, cacheTotal).catch(
+        () => undefined,
+      );
     }
 
     const newHistoricItems = eventsToItems(merged, mission);
@@ -9205,7 +9141,9 @@ export default function ControlClient() {
   // viewed worker, so the worker strip stays visible after selecting a chip.
   const childMissions = useMemo(() => {
     if (!currentMission) return [];
-    return recentMissions.filter((m) => m.parent_mission_id === currentMission.id);
+    return recentMissions.filter(
+      (m) => m.parent_mission_id === currentMission.id,
+    );
   }, [currentMission, recentMissions]);
   const activeMissionRole = activeMission
     ? inferMissionRole(activeMission)
@@ -10064,7 +10002,11 @@ export default function ControlClient() {
               onSelectWorker={handleViewMission}
             />
             {/* Messages */}
-            <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
+            <div
+              ref={containerRef}
+              data-testid="chat-scroll-container"
+              className="flex-1 overflow-y-auto p-6"
+            >
               {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
               previous page; scroll position is preserved so the message
@@ -10373,8 +10315,6 @@ export default function ControlClient() {
                       </div>
                     </div>
                   )}
-
-                  <div ref={endRef} />
                 </div>
               )}
             </div>
@@ -10436,60 +10376,6 @@ export default function ControlClient() {
                 </div>
               )}
 
-              {/* URL Input */}
-              {showUrlInput && (
-                <div className="mx-auto max-w-3xl mb-3">
-                  <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-                    <Link2 className="h-4 w-4 text-white/40 shrink-0" />
-                    <input
-                      type="url"
-                      value={urlInput}
-                      onChange={(e) => setUrlInput(e.target.value)}
-                      placeholder="Paste URL to download (Dropbox, Google Drive, direct link...)"
-                      className="flex-1 bg-transparent text-sm text-white placeholder:text-white/30 focus:outline-none"
-                      autoFocus
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          handleUrlDownload();
-                        } else if (e.key === "Escape") {
-                          setShowUrlInput(false);
-                          setUrlInput("");
-                        }
-                      }}
-                    />
-                    {urlDownloading ? (
-                      <Loader className="h-4 w-4 animate-spin text-indigo-400" />
-                    ) : (
-                      <>
-                        <button
-                          type="button"
-                          onClick={handleUrlDownload}
-                          disabled={!urlInput.trim()}
-                          className="text-sm text-indigo-400 hover:text-indigo-300 disabled:text-white/20 disabled:cursor-not-allowed"
-                        >
-                          Download
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowUrlInput(false);
-                            setUrlInput("");
-                          }}
-                          className="text-white/40 hover:text-white/70"
-                        >
-                          <X className="h-4 w-4" />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                  <p className="text-xs text-white/30 mt-1.5 px-1">
-                    Server will download the file directly — faster for large
-                    files
-                  </p>
-                </div>
-              )}
-
               {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
               {/* Both are always rendered to prevent unmounting the input (which loses typed text) */}
               {showResumeUI && (
@@ -10543,24 +10429,14 @@ export default function ControlClient() {
                   onSubmit={(e) => e.preventDefault()}
                   className="flex gap-3 items-end"
                 >
-                  <div className="flex gap-1">
-                    <button
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
-                      title="Attach files"
-                    >
-                      <Paperclip className="h-5 w-5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setShowUrlInput(!showUrlInput)}
-                      className={`p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0 ${showUrlInput ? "text-indigo-400 border-indigo-500/30" : ""}`}
-                      title="Download from URL"
-                    >
-                      <Link2 className="h-5 w-5" />
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
+                    title="Attach files"
+                  >
+                    <Paperclip className="h-5 w-5" />
+                  </button>
 
                   <EnhancedInput
                     ref={enhancedInputRef}
