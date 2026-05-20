@@ -5184,9 +5184,11 @@ pub fn run_claudecode_turn<'a>(
                                                         }
                                                         active_thinking_index = Some(index);
 
-                                                        // Accumulate thinking content per block
+                                                        // Accumulate thinking content per block. Most Claude events are
+                                                        // incremental deltas, but using the merge helper also handles
+                                                        // CLI versions that resend a cumulative snapshot.
                                                         let buffer = thinking_buffer.entry(index).or_default();
-                                                        buffer.push_str(&thinking_content);
+                                                        merge_stream_fragment(buffer, &thinking_content);
 
                                                         // Send this block's accumulated content
                                                         let _ = events_tx.send(AgentEvent::Thinking {
@@ -5201,9 +5203,12 @@ pub fn run_claudecode_turn<'a>(
                                                 // For text deltas, content is in the `text` field
                                                 if let Some(text) = delta.text {
                                                     if !text.is_empty() {
-                                                        // Accumulate text content (will be used for final response)
+                                                        // Accumulate text content (will be used for final response).
+                                                        // This accepts both incremental chunks and snapshot-style
+                                                        // replacements so streamed text never doubles words if a CLI
+                                                        // changes semantics.
                                                         let buffer = text_buffer.entry(index).or_default();
-                                                        buffer.push_str(&text);
+                                                        merge_stream_fragment(buffer, &text);
 
                                                         // Stream text deltas similar to thinking panel
                                                         // This allows users to see tool use descriptions as they're generated
@@ -13894,18 +13899,13 @@ pub async fn run_codex_turn(
                         }
                     }
                     ExecutionEvent::Thinking { content } => {
-                        // Stream incrementally for real-time UI
+                        merge_stream_fragment(&mut thinking_accumulated, &content);
+                        // Stream the canonical cumulative buffer for real-time UI.
                         let _ = events_tx.send(AgentEvent::Thinking {
-                            content: content.clone(),
+                            content: thinking_accumulated.clone(),
                             done: false,
                             mission_id: Some(mission_id),
                         });
-                        // Accumulate for persistence: Codex sends snapshot-style
-                        // thinking updates (each one replaces the previous), so
-                        // keep the latest (longest) content.
-                        if content.len() >= thinking_accumulated.len() {
-                            thinking_accumulated = content;
-                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
@@ -14423,9 +14423,9 @@ pub async fn run_gemini_turn(
     };
 
     // Process events until completion or cancellation
-    // Gemini emits incremental token deltas (not cumulative buffers),
-    // so it doesn't apply P3-#21 coalescing — skipping a delta there
-    // would drop content.
+    // Gemini usually emits incremental token deltas. Keep canonical
+    // cumulative buffers anyway so a future CLI snapshot event cannot
+    // duplicate streamed words in the UI.
     let mut assistant_message = String::new();
     let mut success = false;
     let mut error_message: Option<String> = None;
@@ -14455,23 +14455,20 @@ pub async fn run_gemini_turn(
             Some(event) = event_rx.recv() => {
                 match event {
                     ExecutionEvent::TextDelta { content } => {
-                        assistant_message.push_str(&content);
+                        merge_stream_fragment(&mut assistant_message, &content);
                         let _ = events_tx.send(AgentEvent::TextDelta {
-                            content,
+                            content: assistant_message.clone(),
                             mission_id: Some(mission_id),
                         });
                     }
                     ExecutionEvent::Thinking { content } => {
-                        // Stream incrementally for real-time UI
+                        merge_stream_fragment(&mut thinking_accumulated, &content);
+                        // Stream the canonical cumulative buffer for real-time UI.
                         let _ = events_tx.send(AgentEvent::Thinking {
-                            content: content.clone(),
+                            content: thinking_accumulated.clone(),
                             done: false,
                             mission_id: Some(mission_id),
                         });
-                        // Accumulate for persistence (keep longest snapshot)
-                        if content.len() >= thinking_accumulated.len() {
-                            thinking_accumulated = content;
-                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
@@ -15063,6 +15060,15 @@ mod tests {
         );
         assert!(!buffer.contains("reportI have"));
         assert!(!buffer.contains("goinggoing"));
+    }
+
+    #[test]
+    fn merge_stream_fragment_ignores_shorter_replayed_snapshots() {
+        let mut buffer = "The focused report is written".to_string();
+        merge_stream_fragment(&mut buffer, "The focused report");
+        merge_stream_fragment(&mut buffer, "The focused report is written.");
+
+        assert_eq!(buffer, "The focused report is written.");
     }
 
     #[test]
