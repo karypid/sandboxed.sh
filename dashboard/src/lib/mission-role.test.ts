@@ -35,4 +35,8 @@ describe("inferMissionRole", () => {
   it("returns null for normal missions", () => {
     expect(inferMissionRole(makeMission())).toBeNull();
   });
+
+  it("handles missions without historical transcript arrays", () => {
+    expect(inferMissionRole(makeMission({ history: undefined as unknown as Mission["history"] }))).toBeNull();
+  });
 });

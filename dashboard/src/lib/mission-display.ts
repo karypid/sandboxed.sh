@@ -77,7 +77,8 @@ function hashString(input: string): number {
   return hash >>> 0;
 }
 
-export function getMissionShortName(missionId: string): string {
+export function getMissionShortName(missionId: string | null | undefined): string {
+  if (!missionId) return "Mission";
   const hash = hashString(missionId);
   return ANIMAL_NAMES[hash % ANIMAL_NAMES.length];
 }

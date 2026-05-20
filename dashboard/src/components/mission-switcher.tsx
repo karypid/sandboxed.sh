@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   Search,
   XCircle,
@@ -31,6 +32,19 @@ interface MissionSwitcherProps {
   onFollowUpMission?: (missionId: string) => Promise<void> | void;
   onRefresh?: () => void;
 }
+
+type MissionSwitcherItem = {
+  type: 'running' | 'current' | 'recent';
+  mission?: Mission;
+  runningInfo?: RunningMissionInfo;
+  id: string;
+  isWorkerOf?: string;
+  isBoss?: boolean;
+};
+
+type MissionSwitcherRow =
+  | { kind: 'section'; id: string; label: string }
+  | { kind: 'item'; id: string; item: MissionSwitcherItem; itemIndex: number };
 
 function getWorkspaceLabel(
   mission: Mission,
@@ -625,6 +639,13 @@ export function MissionSwitcher({
     () => normalizeMetadataText(searchQuery),
     [searchQuery]
   );
+  const missionById = useMemo(() => {
+    const map = new Map<string, Mission>();
+    for (const mission of missions) {
+      map.set(mission.id, mission);
+    }
+    return map;
+  }, [missions]);
 
   // Handle mission selection with loading state
   const handleSelect = useCallback(async (missionId: string) => {
@@ -672,14 +693,7 @@ export function MissionSwitcher({
 
   // Build flat list of all selectable items, grouping workers under their boss
   const allItems = useMemo(() => {
-    const items: Array<{
-      type: 'running' | 'current' | 'recent';
-      mission?: Mission;
-      runningInfo?: RunningMissionInfo;
-      id: string;
-      isWorkerOf?: string; // parent boss mission id
-      isBoss?: boolean;
-    }> = [];
+    const items: MissionSwitcherItem[] = [];
 
     const addedIds = new Set<string>();
 
@@ -687,7 +701,7 @@ export function MissionSwitcher({
     const addRunningWithWorkers = (rm: RunningMissionInfo) => {
       if (addedIds.has(rm.mission_id)) return;
       addedIds.add(rm.mission_id);
-      const mission = missions.find((m) => m.id === rm.mission_id);
+      const mission = missionById.get(rm.mission_id);
       const workerIds = bossMissionWorkerIds.get(rm.mission_id);
       const isBoss = Boolean(workerIds && workerIds.size > 0);
       items.push({
@@ -702,7 +716,7 @@ export function MissionSwitcher({
         for (const workerId of workerIds) {
           if (addedIds.has(workerId)) continue;
           addedIds.add(workerId);
-          const workerMission = missions.find((m) => m.id === workerId);
+          const workerMission = missionById.get(workerId);
           const workerRunningInfo = runningMissions.find((r) => r.mission_id === workerId);
           items.push({
             type: workerRunningInfo ? 'running' : 'recent',
@@ -717,7 +731,7 @@ export function MissionSwitcher({
 
     // Current mission first if not running
     if (currentMissionId) {
-      const currentMission = missions.find((m) => m.id === currentMissionId);
+      const currentMission = missionById.get(currentMissionId);
       if (currentMission && !runningMissionIds.has(currentMissionId)) {
         addedIds.add(currentMissionId);
         const workerIds = bossMissionWorkerIds.get(currentMissionId);
@@ -733,10 +747,10 @@ export function MissionSwitcher({
     // Running missions (boss missions first, then standalone)
     const bosses = runningMissions.filter((rm) => bossMissionWorkerIds.has(rm.mission_id));
     const standalone = runningMissions.filter(
-      (rm) => !bossMissionWorkerIds.has(rm.mission_id) && !missions.find((m) => m.id === rm.mission_id)?.parent_mission_id
+      (rm) => !bossMissionWorkerIds.has(rm.mission_id) && !missionById.get(rm.mission_id)?.parent_mission_id
     );
     const workerOnlyRunning = runningMissions.filter((rm) => {
-      const m = missions.find((mi) => mi.id === rm.mission_id);
+      const m = missionById.get(rm.mission_id);
       return m?.parent_mission_id && !bossMissionWorkerIds.has(rm.mission_id);
     });
 
@@ -748,7 +762,7 @@ export function MissionSwitcher({
     for (const rm of workerOnlyRunning) {
       if (addedIds.has(rm.mission_id)) continue;
       addedIds.add(rm.mission_id);
-      const mission = missions.find((m) => m.id === rm.mission_id);
+      const mission = missionById.get(rm.mission_id);
       items.push({
         type: 'running',
         mission,
@@ -765,7 +779,7 @@ export function MissionSwitcher({
     });
 
     return items;
-  }, [missions, currentMissionId, runningMissions, runningMissionIds, recentMissions, bossMissionWorkerIds]);
+  }, [currentMissionId, runningMissions, runningMissionIds, recentMissions, bossMissionWorkerIds, missionById]);
 
   useEffect(() => {
     if (!open) return;
@@ -836,6 +850,42 @@ export function MissionSwitcher({
     });
     return scored.map(({ item }) => item);
   }, [allItems, normalizedSearchQuery, workspaceNameById, serverScoreByMissionId]);
+
+  const renderedRows = useMemo<MissionSwitcherRow[]>(() => {
+    const rows: MissionSwitcherRow[] = [];
+    let previousType: MissionSwitcherItem['type'] | null = null;
+    const hasCurrent = Boolean(currentMissionId && !runningMissionIds.has(currentMissionId));
+
+    filteredItems.forEach((item, itemIndex) => {
+      const isWorkerItem = Boolean(item.isWorkerOf);
+      if (!normalizedSearchQuery) {
+        if (hasCurrent && item.type === 'current' && previousType !== 'current') {
+          rows.push({ kind: 'section', id: 'section-current', label: 'Current' });
+        }
+        if (
+          item.type === 'running' &&
+          !isWorkerItem &&
+          (previousType !== 'running' || previousType === null)
+        ) {
+          rows.push({ kind: 'section', id: 'section-running', label: 'Running' });
+        }
+        if (item.type === 'recent' && !isWorkerItem && previousType !== 'recent') {
+          rows.push({ kind: 'section', id: 'section-recent', label: 'Recent' });
+        }
+      }
+      rows.push({ kind: 'item', id: item.id, item, itemIndex });
+      previousType = item.type;
+    });
+
+    return rows;
+  }, [currentMissionId, filteredItems, normalizedSearchQuery, runningMissionIds]);
+
+  const rowVirtualizer = useVirtualizer({
+    count: renderedRows.length,
+    getScrollElement: () => listRef.current,
+    estimateSize: (index) => (renderedRows[index]?.kind === 'section' ? 34 : 72),
+    overscan: 8,
+  });
 
   useEffect(() => {
     searchScoreCacheRef.current.clear();
@@ -929,11 +979,13 @@ export function MissionSwitcher({
   // Scroll selected item into view
   useEffect(() => {
     if (!listRef.current) return;
-    const selectedEl = listRef.current.querySelector('[data-selected="true"]');
-    if (selectedEl) {
-      selectedEl.scrollIntoView({ block: 'nearest' });
+    const rowIndex = renderedRows.findIndex(
+      (row) => row.kind === 'item' && row.itemIndex === selectedIndex
+    );
+    if (rowIndex >= 0) {
+      rowVirtualizer.scrollToIndex(rowIndex, { align: 'auto' });
     }
-  }, [selectedIndex]);
+  }, [renderedRows, rowVirtualizer, selectedIndex]);
 
   // Handle click outside
   useEffect(() => {
@@ -991,31 +1043,30 @@ export function MissionSwitcher({
               No missions found
             </div>
           ) : (
-            <>
-              {/* Current mission */}
-              {hasCurrent && !normalizedSearchQuery && (
-                <div className="px-3 pt-1 pb-2">
-                  <span className="text-[10px] font-medium uppercase tracking-wider text-white/30">
-                    Current
-                  </span>
-                </div>
-              )}
-              {filteredItems.map((item, index) => {
-                // Show section headers only when not searching
-                const isWorkerItem = Boolean(item.isWorkerOf);
-                const showRunningHeader =
-                  !normalizedSearchQuery &&
-                  item.type === 'running' &&
-                  !isWorkerItem &&
-                  (index === 0 ||
-                    (index === 1 && hasCurrent) ||
-                    filteredItems[index - 1]?.type !== 'running');
-                const showRecentHeader =
-                  !normalizedSearchQuery &&
-                  item.type === 'recent' &&
-                  !isWorkerItem &&
-                  filteredItems[index - 1]?.type !== 'recent';
+            <div
+              className="relative"
+              style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
+            >
+              {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                const row = renderedRows[virtualRow.index];
+                if (!row) return null;
+                if (row.kind === 'section') {
+                  return (
+                    <div
+                      key={row.id}
+                      className="absolute left-0 top-0 w-full px-3 pt-3 pb-2 border-t border-white/[0.06] bg-[#1a1a1a]"
+                      style={{ transform: `translateY(${virtualRow.start}px)` }}
+                    >
+                      <span className="text-[10px] font-medium uppercase tracking-wider text-white/30">
+                        {row.label}
+                      </span>
+                    </div>
+                  );
+                }
 
+                const item = row.item;
+                const index = row.itemIndex;
+                const isWorkerItem = Boolean(item.isWorkerOf);
                 const mission = item.mission;
                 const isSelected = index === selectedIndex;
                 const isViewing = item.id === viewingMissionId;
@@ -1041,21 +1092,11 @@ export function MissionSwitcher({
                 const hasProgress = runningInfo && runningInfo.subtask_total > 0;
 
                 return (
-                  <div key={item.id}>
-                    {showRunningHeader && (
-                      <div className="px-3 pt-3 pb-2 border-t border-white/[0.06] mt-1">
-                        <span className="text-[10px] font-medium uppercase tracking-wider text-white/30">
-                          Running
-                        </span>
-                      </div>
-                    )}
-                    {showRecentHeader && (
-                      <div className="px-3 pt-3 pb-2 border-t border-white/[0.06] mt-1">
-                        <span className="text-[10px] font-medium uppercase tracking-wider text-white/30">
-                          Recent
-                        </span>
-                      </div>
-                    )}
+                  <div
+                    key={item.id}
+                    className="absolute left-0 top-0 w-full"
+                    style={{ transform: `translateY(${virtualRow.start}px)` }}
+                  >
                     <a
                       href={`/control?mission=${item.id}`}
                       data-selected={isSelected}
@@ -1239,7 +1280,7 @@ export function MissionSwitcher({
                   </div>
                 );
               })}
-            </>
+            </div>
           )}
         </div>
 

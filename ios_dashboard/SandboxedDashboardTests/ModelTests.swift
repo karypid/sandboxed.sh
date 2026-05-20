@@ -126,6 +126,35 @@ final class ModelTests: XCTestCase {
         XCTAssertNil(mission.goalObjective)
     }
 
+    func testControlViewKeepsIOSValidationAnchors() throws {
+        let source = try controlViewSource()
+
+        XCTAssertTrue(source.contains("control-inline-thinking"))
+        XCTAssertTrue(source.contains("thoughts-timeline"))
+        XCTAssertTrue(source.contains("thought-latest"))
+        XCTAssertTrue(source.contains("thoughts-bottom"))
+        XCTAssertTrue(source.contains(".defaultScrollAnchor(.bottom)"))
+    }
+
+    func testControlViewKeepsReconnectAndStreamingGates() throws {
+        let source = try controlViewSource()
+
+        XCTAssertTrue(source.contains("stream_lagged"))
+        XCTAssertTrue(source.contains("resumeMissionAfterReconnect"))
+        XCTAssertTrue(source.contains("sinceSeq"))
+        XCTAssertTrue(source.contains("Task.sleep(for: .milliseconds(16))"))
+        XCTAssertTrue(source.contains("controlDroppedEvents"))
+    }
+
+    private func controlViewSource() throws -> String {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let controlView = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("SandboxedDashboard/Views/Control/ControlView.swift")
+        return try String(contentsOf: controlView, encoding: .utf8)
+    }
+
     // MARK: - FileEntry Tests
 
     func testFileEntryDecoding() throws {

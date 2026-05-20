@@ -827,13 +827,14 @@ function getMessageFingerprint(kind: string, content: string): string {
  */
 function hasHistoryChanged(
   items: ReadonlyArray<{ kind: string; content?: string }>,
-  history: ReadonlyArray<{ role: string; content?: string | null }>,
+  history: ReadonlyArray<{ role: string; content?: string | null }> | undefined,
 ): boolean {
+  const historyEntries = Array.isArray(history) ? history : [];
   const currentFingerprints = items
     .filter((i) => i.kind === "user" || i.kind === "assistant")
     .map((i) => getMessageFingerprint(i.kind, i.content || ""));
 
-  const newFingerprints = history.map((e) =>
+  const newFingerprints = historyEntries.map((e) =>
     getMessageFingerprint(
       e.role === "user" ? "user" : "assistant",
       e.content || "",
@@ -3273,7 +3274,7 @@ const ChatItemRow = memo(function ChatItemRow({
     item.kind === "assistant" && item.sharedFiles?.length
       ? stripRichFileTagsByName(
           item.content,
-          item.sharedFiles.map((file) => file.name),
+          item.sharedFiles.flatMap((file) => [file.name, file.url]),
         )
       : item.kind === "assistant"
         ? item.content
@@ -4914,7 +4915,8 @@ export default function ControlClient() {
         return true;
       }
       let hasSession = false;
-      for (const entry of mission.history) {
+      const history = Array.isArray(mission.history) ? mission.history : [];
+      for (const entry of history) {
         // Check for session start
         if (
           entry.content.includes("desktop_start_session") ||
@@ -5089,15 +5091,16 @@ export default function ControlClient() {
   const missionHistoryToItems = useCallback((mission: Mission): ChatItem[] => {
     // Estimate timestamps based on mission creation time
     const baseTime = new Date(mission.created_at).getTime();
+    const history = Array.isArray(mission.history) ? mission.history : [];
     // Find index of last assistant message to apply mission status
-    const lastAssistantIdx = mission.history.reduce(
+    const lastAssistantIdx = history.reduce(
       (lastIdx, entry, i) => (entry.role === "assistant" ? i : lastIdx),
       -1,
     );
     // Mission is considered failed if status is "failed"
     const missionFailed = mission.status === "failed";
 
-    return mission.history.map((entry, i) => {
+    return history.map((entry, i) => {
       // Spread timestamps across history (rough estimate)
       const timestamp = baseTime + i * 60000; // 1 minute apart
       if (entry.role === "user") {
@@ -5134,7 +5137,8 @@ export default function ControlClient() {
         return eventItems;
       }
 
-      const historyHasAssistant = mission.history.some(
+      const history = Array.isArray(mission.history) ? mission.history : [];
+      const historyHasAssistant = history.some(
         (entry) => entry.role === "assistant",
       );
       if (!historyHasAssistant) {

@@ -472,7 +472,12 @@ export interface QueuedMessage {
 }
 
 export async function getQueue(): Promise<QueuedMessage[]> {
-  return apiGet("/api/control/queue", "Failed to fetch queue");
+  const response = await apiGet<QueuedMessage[] | { queue?: QueuedMessage[] }>(
+    "/api/control/queue",
+    "Failed to fetch queue",
+  );
+  if (Array.isArray(response)) return response;
+  return Array.isArray(response.queue) ? response.queue : [];
 }
 
 export async function removeFromQueue(messageId: string): Promise<void> {

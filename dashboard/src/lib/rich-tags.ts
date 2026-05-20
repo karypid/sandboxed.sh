@@ -74,20 +74,58 @@ export function transformRichTags(content: string): string {
   });
 }
 
-/** Remove file rich tags whose display name or basename is already rendered elsewhere. */
+function fileStem(value: string): string {
+  return value.replace(/\.[a-z0-9]+$/i, "");
+}
+
+function normalizeFileKey(value: string | undefined): string {
+  return (value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+function basename(value: string | undefined): string {
+  return (value ?? "").split(/[\\/]/).pop() ?? "";
+}
+
+/**
+ * Remove file rich tags whose display name, path, basename, or stem is already
+ * rendered elsewhere as a shared-file card.
+ */
 export function stripRichFileTagsByName(
   content: string,
   names: Iterable<string>,
 ): string {
-  const nameSet = new Set([...names].filter(Boolean));
+  const nameSet = new Set<string>();
+  for (const name of names) {
+    const raw = String(name ?? "");
+    const base = basename(raw);
+    for (const key of [raw, base, fileStem(raw), fileStem(base)]) {
+      const normalized = normalizeFileKey(key);
+      if (normalized) nameSet.add(normalized);
+    }
+  }
   if (nameSet.size === 0) return content;
 
   return content.replace(TAG_RE, (match, tagType: string, attrStr: string) => {
     if (tagType.toLowerCase() !== "file") return match;
     const attrs = parseAttrs(attrStr);
-    const basename = attrs.path?.split("/").pop() ?? "";
-    const displayName = attrs.name || basename;
-    return nameSet.has(displayName) || nameSet.has(basename) ? "" : match;
+    const base = basename(attrs.path);
+    const displayName = attrs.name || base;
+    const candidates = [
+      displayName,
+      base,
+      attrs.path,
+      fileStem(displayName),
+      fileStem(base),
+    ];
+    return candidates.some((candidate) =>
+      nameSet.has(normalizeFileKey(candidate)),
+    )
+      ? ""
+      : match;
   });
 }
 

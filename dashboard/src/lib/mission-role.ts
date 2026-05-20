@@ -1,7 +1,8 @@
 import type { Mission } from "./api/missions";
 
 function missionRoleText(mission: Mission): string {
-  const firstUserPrompt = mission.history.find((entry) => entry.role === "user")?.content ?? "";
+  const history = Array.isArray(mission.history) ? mission.history : [];
+  const firstUserPrompt = history.find((entry) => entry.role === "user")?.content ?? "";
   return [
     mission.title ?? "",
     mission.short_description ?? "",

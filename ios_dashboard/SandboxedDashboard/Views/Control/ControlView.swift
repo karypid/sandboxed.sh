@@ -1249,6 +1249,13 @@ struct ControlView: View {
         }
     }
 
+    private var latestVisibleThought: ChatMessage? {
+        messages.last { message in
+            guard message.isThinking else { return false }
+            return !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
     private var inputView: some View {
         VStack(spacing: 0) {
             // Slash-command popover. Renders above the composer when the
@@ -1261,6 +1268,17 @@ struct ControlView: View {
             .animation(.easeInOut(duration: 0.15), value: slashSuggestions.count)
 
             goalPill
+
+            if let thought = latestVisibleThought {
+                InlineThinkingSurface(message: thought) {
+                    showThoughts = true
+                    HapticService.lightTap()
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .accessibilityIdentifier("control-inline-thinking")
+            }
 
             // Queue indicator above input when agent is busy with queued messages
             if runState != .idle && queueLength > 0 {
@@ -4250,6 +4268,49 @@ struct ToolCallBubble: View {
 
 // MARK: - Thinking Bubble
 
+private struct InlineThinkingSurface: View {
+    let message: ChatMessage
+    let onOpenTimeline: () -> Void
+
+    var body: some View {
+        Button(action: onOpenTimeline) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: "brain")
+                        .font(.caption)
+                        .foregroundStyle(message.thinkingDone ? Theme.textMuted : Theme.accent)
+                        .symbolEffect(.pulse, options: message.thinkingDone ? .nonRepeating : .repeating)
+
+                    Text(message.thinkingDone ? "Latest thought" : "Thinking")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(message.thinkingDone ? Theme.textSecondary : Theme.accent)
+
+                    Spacer()
+
+                    Image(systemName: "chevron.up.forward")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Theme.textMuted)
+                }
+
+                (Text(message.content) + (message.thinkingDone ? Text("") : Text(" ▍").foregroundColor(Theme.accent)))
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(message.thinkingDone ? 2 : 4)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(10)
+            .background(Theme.backgroundSecondary.opacity(0.96))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(message.thinkingDone ? Theme.border : Theme.accent.opacity(0.35), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 private struct ThinkingBubble: View {
     let message: ChatMessage
     @State private var isExpanded: Bool = true
@@ -4436,13 +4497,16 @@ private struct ThoughtsSheet: View {
                                         isLatest: index == visibleThoughts.count - 1
                                     )
                                     .id(msg.id)
+                                    .accessibilityIdentifier(index == visibleThoughts.count - 1 ? "thought-latest" : "thought-row")
                                 }
                                 Color.clear
                                     .frame(height: 1)
                                     .id("thoughts-bottom")
+                                    .accessibilityIdentifier("thoughts-bottom")
                             }
                             .padding()
                         }
+                        .accessibilityIdentifier("thoughts-timeline")
                         .onAppear {
                             scrollToLatestThought(proxy)
                         }

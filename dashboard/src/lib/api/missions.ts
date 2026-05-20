@@ -278,10 +278,31 @@ export async function getMissionEventsWithMeta(
 }
 
 export async function getMissionSnapshot(id: string): Promise<MissionSnapshot> {
-  return apiGet(
+  const snapshot = await apiGet<MissionSnapshot>(
     `/api/control/missions/${id}/snapshot`,
     "Failed to fetch mission snapshot",
   );
+  return {
+    ...snapshot,
+    mission: {
+      ...snapshot.mission,
+      history: Array.isArray(snapshot.mission?.history)
+        ? snapshot.mission.history
+        : [],
+    },
+    events: Array.isArray(snapshot.events) ? snapshot.events : [],
+    event_counts: snapshot.event_counts ?? {},
+    visibility_counts: snapshot.visibility_counts ?? {},
+    total_events:
+      typeof snapshot.total_events === "number" ? snapshot.total_events : 0,
+    latest_sequence:
+      typeof snapshot.latest_sequence === "number"
+        ? snapshot.latest_sequence
+        : 0,
+    child_missions: Array.isArray(snapshot.child_missions)
+      ? snapshot.child_missions
+      : [],
+  };
 }
 
 export async function getCurrentMission(): Promise<Mission | null> {

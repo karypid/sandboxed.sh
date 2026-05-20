@@ -120,6 +120,14 @@ describe("stripRichFileTagsByName", () => {
     );
     expect(result).toBe("Here\n");
   });
+
+  it("removes duplicate file tags by normalized stem", () => {
+    const result = stripRichFileTagsByName(
+      'Here\n<file path="./keel_os_mvp_roadmap.md" name="Keel OS MVP Roadmap" />',
+      ["/api/control/shared-files/Keel-OS-MVP-Roadmap.md"],
+    );
+    expect(result).toBe("Here\n");
+  });
 });
 
 describe("hasPartialRichTag", () => {
