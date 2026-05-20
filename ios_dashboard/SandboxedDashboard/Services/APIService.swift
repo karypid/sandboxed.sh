@@ -284,36 +284,8 @@ final class APIService {
         return MissionEventsResult(events: events, maxSequence: maxSequence)
     }
 
-    func getMissionTranscript(id: String) async throws -> MissionTranscriptResult {
-        try await get("/api/control/missions/\(id)/transcript")
-    }
-
-    func getMissionTraceWithMeta(
-        id: String,
-        limit: Int? = nil,
-        sinceSeq: Int64? = nil
-    ) async throws -> MissionEventsResult {
-        var queryItems: [URLQueryItem] = []
-        if let limit = limit {
-            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
-        }
-        if let sinceSeq = sinceSeq {
-            queryItems.append(URLQueryItem(name: "since_seq", value: String(sinceSeq)))
-        }
-
-        var urlString = "/api/control/missions/\(id)/trace"
-        if !queryItems.isEmpty {
-            var components = URLComponents(string: urlString)
-            components?.queryItems = queryItems
-            if let fullPath = components?.string {
-                urlString = fullPath
-            }
-        }
-
-        let (events, response): ([StoredEvent], HTTPURLResponse) = try await getWithResponse(urlString)
-        let maxSequence = (response.value(forHTTPHeaderField: "X-Max-Sequence") ?? response.value(forHTTPHeaderField: "x-max-sequence"))
-            .flatMap { Int64($0) }
-        return MissionEventsResult(events: events, maxSequence: maxSequence)
+    func getMissionSnapshot(id: String) async throws -> MissionSnapshotResult {
+        try await get("/api/control/missions/\(id)/snapshot")
     }
 
     /// Get child (worker) missions for a boss mission.
@@ -613,7 +585,7 @@ final class APIService {
 
     // MARK: - SSE Streaming
 
-    func streamControl(onEvent: @escaping (String, [String: Any]) -> Void) -> Task<Void, Never> {
+    func streamControl(missionId: String?, onEvent: @escaping (String, [String: Any]) -> Void) -> Task<Void, Never> {
         let base = baseURL
         let token = jwtToken
         let maxBuffer = Self.streamMaxBufferBytes
@@ -621,7 +593,13 @@ final class APIService {
         let session = Self.streamSession
 
         return Task { [weak self] in
-            guard let url = URL(string: "\(base)/api/control/stream?cap=text_op") else { return }
+            var components = URLComponents(string: "\(base)/api/control/stream")
+            var queryItems = [URLQueryItem(name: "cap", value: "text_op")]
+            if let missionId {
+                queryItems.append(URLQueryItem(name: "mission", value: missionId))
+            }
+            components?.queryItems = queryItems
+            guard let url = components?.url else { return }
 
             var request = URLRequest(url: url)
             request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -888,8 +866,7 @@ private struct DecodedBox<T>: @unchecked Sendable {
 }
 
 /// Result of a `/missions/:id/events` fetch. `maxSequence` is the response's
-/// `X-Max-Sequence` header — `nil` if the backend doesn't advertise it (older
-/// versions). Callers must treat `nil` as "delta resume unsupported".
+/// `X-Max-Sequence` header.
 ///
 /// `Sendable` so it can cross `async let` boundaries from the main actor —
 /// `StoredEvent` and `AnyCodable` are Sendable above.
@@ -898,64 +875,25 @@ struct MissionEventsResult: Sendable {
     let maxSequence: Int64?
 }
 
-struct TranscriptMessage: Codable, Sendable {
-    let traceCount: Int
-    let traceSummary: [String: Int]
-    let id: Int64
-    let missionId: String
-    let sequence: Int64
-    let eventType: String
-    let timestamp: String
-    let eventId: String?
-    let toolCallId: String?
-    let toolName: String?
-    let content: String
-    let metadata: [String: AnyCodable]
-
-    enum CodingKeys: String, CodingKey {
-        case traceCount = "trace_count"
-        case traceSummary = "trace_summary"
-        case id
-        case missionId = "mission_id"
-        case sequence
-        case eventType = "event_type"
-        case timestamp
-        case eventId = "event_id"
-        case toolCallId = "tool_call_id"
-        case toolName = "tool_name"
-        case content
-        case metadata
-    }
-
-    var storedEvent: StoredEvent {
-        StoredEvent(
-            id: id,
-            missionId: missionId,
-            sequence: sequence,
-            eventType: eventType,
-            timestamp: timestamp,
-            eventId: eventId,
-            toolCallId: toolCallId,
-            toolName: toolName,
-            content: content,
-            metadata: metadata
-        )
-    }
-}
-
-struct MissionTranscriptResult: Codable, Sendable {
+struct MissionSnapshotResult: Codable, Sendable {
     let mission: Mission
-    let messages: [TranscriptMessage]
+    let events: [StoredEvent]
     let eventCounts: [String: Int]
     let visibilityCounts: [String: Int]
+    let totalEvents: Int
     let latestSequence: Int64
+    let childMissions: [Mission]
+    let running: RunningMissionInfo?
 
     enum CodingKeys: String, CodingKey {
         case mission
-        case messages
+        case events
         case eventCounts = "event_counts"
         case visibilityCounts = "visibility_counts"
+        case totalEvents = "total_events"
         case latestSequence = "latest_sequence"
+        case childMissions = "child_missions"
+        case running
     }
 }
 

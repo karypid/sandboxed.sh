@@ -1093,6 +1093,16 @@ pub trait MissionStore: Send + Sync {
         Ok(0)
     }
 
+    /// Count events grouped by event type for one mission.
+    async fn count_events_by_type(
+        &self,
+        mission_id: Uuid,
+        event_types: Option<&[&str]>,
+    ) -> Result<HashMap<String, usize>, String> {
+        let _ = (mission_id, event_types);
+        Ok(HashMap::new())
+    }
+
     /// Return the highest `sequence` value for this mission, or 0 if
     /// the mission has no events yet.
     async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {

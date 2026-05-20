@@ -15,6 +15,17 @@ export type ReducerSample = {
   maxMs: number;
 };
 
+export type PerfDiagnostics = {
+  missionId?: string;
+  transport?: "sse" | "ws";
+  streamScope?: "global" | "mission";
+  maxSequence?: number;
+  cacheHit?: boolean;
+  eventMergeCount?: number;
+  renderCount?: number;
+  droppedEvents?: number;
+};
+
 class PerfBus {
   enabled = false;
 
@@ -25,6 +36,8 @@ class PerfBus {
 
   /** Reducer name → aggregated timing since tab load. */
   reducerTimings = new Map<string, ReducerSample>();
+
+  diagnostics: PerfDiagnostics = {};
 
   /** Sliding window of longtask entries in the last 10s (start-time, duration). */
   longtasks: { t: number; d: number }[] = [];
@@ -51,6 +64,11 @@ class PerfBus {
     entry.totalMs += durationMs;
     if (durationMs > entry.maxMs) entry.maxMs = durationMs;
     this.reducerTimings.set(name, entry);
+  }
+
+  updateDiagnostics(update: PerfDiagnostics) {
+    if (!this.enabled) return;
+    this.diagnostics = { ...this.diagnostics, ...update };
   }
 
   pruneLongtasks(now = performance.now()) {

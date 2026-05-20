@@ -145,7 +145,7 @@ impl ControlMetrics {
         }
     }
 
-    /// Record a single `/api/control/events` (or `/trace`) request hit.
+    /// Record a single `/api/control/missions/:id/events` request hit.
     pub fn record_events_request(&self) {
         if let Ok(mut hits) = self.events_endpoint_hits.lock() {
             self.trim_window(&mut hits);

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { perfBus, type ReducerSample } from "@/lib/perf-bus";
+import { perfBus, type PerfDiagnostics, type ReducerSample } from "@/lib/perf-bus";
 
 type Snapshot = {
   longtaskTotalMs: number;
@@ -14,6 +14,7 @@ type Snapshot = {
   sseTotalKb: number;
   sseEventsPerSec: number;
   sseFilteredPerSec: number;
+  diagnostics: PerfDiagnostics;
   reducers: { name: string; sample: ReducerSample }[];
 };
 
@@ -67,6 +68,7 @@ export function PerfOverlay() {
           dt > 0 ? (perfBus.sseEventsReceived - prevReceived) / dt : 0,
         sseFilteredPerSec:
           dt > 0 ? (perfBus.sseEventsFiltered - prevFiltered) / dt : 0,
+        diagnostics: perfBus.diagnostics,
         reducers,
       });
 
@@ -133,6 +135,31 @@ export function PerfOverlay() {
       <Row
         label="SSE evt/s"
         value={`${fmtRate(snap.sseEventsPerSec)} rx · ${fmtRate(snap.sseFilteredPerSec)} drop`}
+      />
+      <Row
+        label="Mission"
+        value={snap.diagnostics.missionId?.slice(0, 8) ?? "none"}
+      />
+      <Row
+        label="Transport"
+        value={`${snap.diagnostics.transport ?? "sse"} · ${snap.diagnostics.streamScope ?? "global"}`}
+      />
+      <Row
+        label="Max seq"
+        value={snap.diagnostics.maxSequence?.toLocaleString() ?? "?"}
+      />
+      <Row
+        label="Cache"
+        value={snap.diagnostics.cacheHit === undefined ? "?" : snap.diagnostics.cacheHit ? "hit" : "miss"}
+      />
+      <Row
+        label="Merge/render"
+        value={`${snap.diagnostics.eventMergeCount ?? 0} ev · ${snap.diagnostics.renderCount ?? 0} rows`}
+      />
+      <Row
+        label="Lag drops"
+        value={(snap.diagnostics.droppedEvents ?? 0).toLocaleString()}
+        warn={(snap.diagnostics.droppedEvents ?? 0) > 0}
       />
       {snap.reducers.length > 0 && (
         <div className="mt-2 border-t border-white/10 pt-1">

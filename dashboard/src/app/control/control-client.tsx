@@ -56,11 +56,8 @@ import { inferMissionRole } from "@/lib/mission-role";
 import { getMissionDotColor, isFinishedStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
-import {
-  readCachedEvents,
-  writeCachedEvents,
-  deleteCachedEvents,
-} from "@/lib/event-cache";
+import { stripRichFileTagsByName } from "@/lib/rich-tags";
+import { readCachedEvents, writeCachedEvents } from "@/lib/event-cache";
 import {
   cancelControl,
   postControlMessage,
@@ -71,8 +68,7 @@ import {
   getMission,
   getMissionEvents,
   getMissionEventsWithMeta,
-  getMissionTranscript,
-  getMissionTraceWithMeta,
+  getMissionSnapshot,
   searchMissionMoments,
   createMission,
   updateMissionSettings,
@@ -348,17 +344,31 @@ function deriveItemViews(
   for (let i = 0; i < items.length; i++) {
     lastIndexById.set(items[i].id, i);
   }
-  const dedupedItems: ChatItem[] = [];
+  let dedupedItems: ChatItem[] = [];
   for (let i = 0; i < items.length; i++) {
     if (lastIndexById.get(items[i].id) === i) {
       dedupedItems.push(items[i]);
     }
   }
+  const lastThinkingItemIndexByContent = new Map<string, number>();
+  for (let i = 0; i < dedupedItems.length; i++) {
+    const item = dedupedItems[i];
+    if (item.kind !== "thinking" && item.kind !== "stream") continue;
+    const key = item.content.trim();
+    if (key) lastThinkingItemIndexByContent.set(key, i);
+  }
+  if (lastThinkingItemIndexByContent.size > 0) {
+    dedupedItems = dedupedItems.filter((item, index) => {
+      if (item.kind !== "thinking" && item.kind !== "stream") return true;
+      const key = item.content.trim();
+      return !key || lastThinkingItemIndexByContent.get(key) === index;
+    });
+  }
 
   // Pass 2: split queued user messages off the end, collect thinking
   // items, find lastNonQueued — all in one sweep.
   let hasQueuedUser = false;
-  const thinkingItems: SidePanelItem[] = [];
+  let thinkingItems: SidePanelItem[] = [];
   let hasActiveThinking = false;
   for (const item of dedupedItems) {
     if (item.kind === "user" && item.queued) {
@@ -368,6 +378,18 @@ function deriveItemViews(
       thinkingItems.push(item as SidePanelItem);
       if (!item.done) hasActiveThinking = true;
     }
+  }
+  const lastThinkingIndexByContent = new Map<string, number>();
+  for (let i = 0; i < thinkingItems.length; i++) {
+    const key = thinkingItems[i].content.trim();
+    if (key) lastThinkingIndexByContent.set(key, i);
+  }
+  if (lastThinkingIndexByContent.size > 0) {
+    thinkingItems = thinkingItems.filter((item, index) => {
+      const key = item.content.trim();
+      return !key || lastThinkingIndexByContent.get(key) === index;
+    });
+    hasActiveThinking = thinkingItems.some((item) => !item.done);
   }
 
   let displayItems: ChatItem[];
@@ -1871,6 +1893,20 @@ function ThinkingPanel({
     changeKey: thoughtsAnchorKey,
     resetKey: missionId ?? null,
   });
+  useEffect(() => {
+    if (panelRows.length > 1) return;
+    const forceBottom = () => {
+      scrollThoughtsToBottom("auto");
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    };
+    const frame = requestAnimationFrame(forceBottom);
+    const timeout = window.setTimeout(forceBottom, 250);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+    };
+  }, [panelRows.length, scrollThoughtsToBottom, thoughtsAnchorKey]);
 
   // Handle Escape key
   useEffect(() => {
@@ -3233,6 +3269,16 @@ const ChatItemRow = memo(function ChatItemRow({
   onToolResult,
   onOptimisticToolResult,
 }: ChatItemRowProps) {
+  const renderedContent =
+    item.kind === "assistant" && item.sharedFiles?.length
+      ? stripRichFileTagsByName(
+          item.content,
+          item.sharedFiles.map((file) => file.name),
+        )
+      : item.kind === "assistant"
+        ? item.content
+        : "";
+
   if (item.kind === "tool_group") {
     return (
       <div
@@ -3372,7 +3418,7 @@ const ChatItemRow = memo(function ChatItemRow({
           {/* P2-#13: lazy markdown — bubbles render as raw text until they
               scroll near the viewport, then upgrade to full markdown. */}
           <LazyMarkdownContent
-            content={item.content}
+            content={renderedContent}
             basePath={basePath}
             workspaceId={workspaceId}
             missionId={missionId}
@@ -4010,11 +4056,6 @@ export default function ControlClient() {
     ],
     [],
   );
-  const renderDeferredTraceRef = useRef<
-    | ((id: string, traceEvents: StoredEvent[], maxSequence?: number) => void)
-    | null
-  >(null);
-  const deferredTraceLoadsRef = useRef<Set<string>>(new Set());
   /**
    * Per-mission high-water mark for `sequence`. When non-zero, reload
    * paths pass it as `since_seq` to `/events` so the server returns
@@ -4025,12 +4066,6 @@ export default function ControlClient() {
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
 
-  // Page size for the initial history fetch. Kept deliberately small so the
-  // newest messages render fast on a fresh mission load — a long-running
-  // mission with hundreds of events used to ship 1.5 MB / 20+ s of payload
-  // before the UI could paint a single message. We then `streamOlderHistory`
-  // in the background to fill in older events without blocking first paint.
-  const INITIAL_HISTORY_PAGE_SIZE = 200;
   // Page size for each backwards-paginate-older fetch (both the explicit
   // "Load older messages" button and the post-initial background fill).
   // Tuned for memory headroom on long missions — see the
@@ -4052,22 +4087,12 @@ export default function ControlClient() {
         // Delta load — used on reconnect/visibility/periodic sync.
         // The server returns events with sequence > sinceSeq already
         // ordered ASC, so we don't need to re-sort client-side.
-        //
-        // If the server does NOT support `since_seq` (older backend),
-        // it silently ignores the param and returns events from
-        // offset=0, which would pollute the tail with stale oldest-
-        // events. `X-Max-Sequence` is only set by backends that
-        // support delta reload — if it's missing, we clear the ref
-        // so callers fall back to full reload next time.
         const { events, meta } = await getMissionEventsWithMeta(id, {
           types: HISTORY_EVENT_TYPES,
           sinceSeq: opts.sinceSeq,
           limit: HISTORY_PAGE_SIZE,
         });
-        if (meta.maxSequence === undefined) {
-          missionMaxSeqRef.current.delete(id);
-          return [];
-        }
+        const maxSequence = meta.maxSequence ?? opts.sinceSeq;
         // If the page was capped by `limit`, advance the cursor to the
         // last returned event's sequence instead of `meta.maxSequence` —
         // otherwise the next poll would skip every event between the
@@ -4077,29 +4102,20 @@ export default function ControlClient() {
             ? events[events.length - 1].sequence
             : opts.sinceSeq;
         const cursor =
-          events.length >= HISTORY_PAGE_SIZE && lastSeq < meta.maxSequence
+          events.length >= HISTORY_PAGE_SIZE && lastSeq < maxSequence
             ? lastSeq
-            : meta.maxSequence;
+            : maxSequence;
         missionMaxSeqRef.current.set(id, cursor);
         return events;
       }
 
-      // Initial load. Two-phase strategy:
-      //
-      // 1. If a recent IDB cache exists for this mission, hydrate from it
-      //    and issue a small `since_seq` delta fetch — most reopens find
-      //    zero or a handful of new events, turning a 1.5 MB / 20 s
-      //    `latest=true` round-trip into a sub-second catch-up.
-      //
-      // 2. Cache miss (or stale / regressed server state) falls through to
-      //    the original `latest=true` fetch with a small page size. The
-      //    background `streamOlderHistory` then fills in older context
-      //    after first paint either way.
       let sorted: StoredEvent[] | null = null;
       let metaMaxSeq: number | undefined;
       let metaTotal: number | undefined;
 
       const cached = await readCachedEvents(id).catch(() => null);
+      let cacheHit = false;
+      let eventMergeCount = 0;
       if (cached && cached.events.length > 0) {
         try {
           const delta = await getMissionEventsWithMeta(id, {
@@ -4107,19 +4123,10 @@ export default function ControlClient() {
             sinceSeq: cached.maxSequence,
             limit: HISTORY_PAGE_SIZE,
           });
-          // If the server doesn't expose `X-Max-Sequence` it's an older
-          // build that ignored `since_seq` and returned offset=0 rows.
-          // Don't trust it — fall through to a fresh `latest` fetch.
-          //
           // If the server's max sequence is *behind* what we cached, the
           // mission was reset or replaced server-side and our cache is
           // bogus — drop it and reload fresh.
-          if (
-            delta.meta.maxSequence === undefined ||
-            delta.meta.maxSequence < cached.maxSequence
-          ) {
-            void deleteCachedEvents(id).catch(() => undefined);
-          } else {
+          if ((delta.meta.maxSequence ?? 0) >= cached.maxSequence) {
             // Merge cached tail + delta. Both are sorted by sequence;
             // dedup defensively in case the server re-sent an overlap row.
             const seen = new Set<number>();
@@ -4140,6 +4147,8 @@ export default function ControlClient() {
             sorted = merged;
             metaMaxSeq = delta.meta.maxSequence;
             metaTotal = delta.meta.totalEvents;
+            cacheHit = true;
+            eventMergeCount = merged.length;
           }
         } catch {
           // Network or auth failure on the delta — fall through to the
@@ -4149,56 +4158,22 @@ export default function ControlClient() {
       }
 
       if (!sorted) {
-        const transcript = await getMissionTranscript(id);
-        sorted = transcript.messages
-          .map(
-            ({
-              trace_count: _traceCount,
-              trace_summary: _traceSummary,
-              ...event
-            }) => event,
-          )
-          .sort((a, b) => a.sequence - b.sequence);
-        metaMaxSeq = transcript.latest_sequence;
-        // Only count types the client actually loads. The transcript's
-        // `event_counts` includes debug/status events outside
-        // `HISTORY_EVENT_TYPES`; summing them all inflates the total and
-        // makes `computeHasMoreOlder(id)` (which compares against the
-        // count of *loaded* events) return true forever.
-        metaTotal = Object.entries(transcript.event_counts).reduce(
-          (sum, [type, count]) =>
-            HISTORY_EVENT_TYPES.includes(type) ? sum + count : sum,
-          0,
-        );
-
-        // Fetch hidden thoughts/tools after first paint. The renderer ref is
-        // populated below `eventsToItems`; this avoids blocking transcript
-        // display on the heavier activity trace.
-        setTimeout(() => {
-          if (deferredTraceLoadsRef.current.has(id)) return;
-          deferredTraceLoadsRef.current.add(id);
-          void getMissionTraceWithMeta(id, {
-            sinceSeq: 0,
-            limit: HISTORY_PAGE_SIZE,
-          })
-            .then(({ events, meta }) => {
-              renderDeferredTraceRef.current?.(id, events, meta.maxSequence);
-            })
-            .catch(() => undefined)
-            .finally(() => {
-              deferredTraceLoadsRef.current.delete(id);
-            });
-        }, 0);
+        const snapshot = await getMissionSnapshot(id);
+        sorted = snapshot.events.sort((a, b) => a.sequence - b.sequence);
+        metaMaxSeq = snapshot.latest_sequence;
+        metaTotal = snapshot.total_events;
+        eventMergeCount = sorted.length;
       }
 
-      // Only seed `missionMaxSeqRef` when the server has confirmed it
-      // supports the resume protocol via `X-Max-Sequence`. Seeding from
-      // `event.sequence` alone would enable the delta path against old
-      // backends that ignore `since_seq`, causing them to return
-      // offset=0 rows that'd get appended as bogus "new" events.
       if (metaMaxSeq !== undefined && metaMaxSeq > 0) {
         missionMaxSeqRef.current.set(id, metaMaxSeq);
       }
+      perfBus.updateDiagnostics({
+        missionId: id,
+        maxSequence: metaMaxSeq,
+        cacheHit,
+        eventMergeCount,
+      });
       // Seed pagination caches: snapshot of historic events, lowest seq
       // (cursor for next backwards page), and total filtered count from
       // the server (so we know when the user has reached the start).
@@ -4216,9 +4191,7 @@ export default function ControlClient() {
 
       // Persist the freshly-loaded tail to the IDB cache so the next
       // reopen hits the fast path. Best-effort — write failures are
-      // silently ignored. We only write when the server confirmed the
-      // delta protocol via `X-Max-Sequence`; otherwise we'd risk
-      // poisoning the cache with offset=0 rows from a legacy backend.
+      // silently ignored.
       if (
         metaMaxSeq !== undefined &&
         metaMaxSeq > 0 &&
@@ -4236,10 +4209,7 @@ export default function ControlClient() {
       // here would just stall the same task we tried to free up. The ref
       // indirection breaks TDZ against `streamOlderHistory`, which is
       // declared after the older-paginator below.
-      const hasMoreLocal =
-        metaTotal !== undefined
-          ? sorted.length < metaTotal
-          : sorted.length >= INITIAL_HISTORY_PAGE_SIZE;
+      const hasMoreLocal = metaTotal !== undefined && sorted.length < metaTotal;
       if (hasMoreLocal) {
         const fillFn = streamOlderHistoryRef.current;
         if (fillFn) {
@@ -4250,7 +4220,7 @@ export default function ControlClient() {
       }
       return sorted;
     },
-    [HISTORY_EVENT_TYPES, INITIAL_HISTORY_PAGE_SIZE],
+    [HISTORY_EVENT_TYPES],
   );
 
   // Bridge between `loadHistoryEvents` (declared above) and
@@ -4264,19 +4234,10 @@ export default function ControlClient() {
   /**
    * Recompute "is there more older history to load" for a mission, by
    * comparing the locally-cached event count against the server's total.
-   * `undefined` total (e.g. older backend without `X-Total-Events`) is
-   * treated as "unknown → assume yes" if we got a full page on the last
-   * fetch — gives the user the option to try, and the next fetch will
-   * surface emptiness.
    */
   const computeHasMoreOlder = useCallback((id: string): boolean => {
     const accumulated = missionHistoricEventsRef.current.get(id)?.length ?? 0;
-    const total = missionTotalHistoryRef.current.get(id);
-    if (total === undefined) {
-      // Heuristic: a full page suggests there could be more. Empty/short
-      // page rules it out.
-      return accumulated >= HISTORY_PAGE_SIZE;
-    }
+    const total = missionTotalHistoryRef.current.get(id) ?? 0;
     return accumulated < total;
   }, []);
 
@@ -4333,9 +4294,11 @@ export default function ControlClient() {
     // `useDeferredValue`: the toggle button + panel mount react instantly
     // while the chat-list regrouping is treated as a non-urgent transition.
     () =>
-      perfBus.time("replay:group", () =>
-        deriveItemViews(items, deferredShowThinkingPanel),
-      ),
+      perfBus.time("replay:group", () => {
+        const views = deriveItemViews(items, deferredShowThinkingPanel);
+        perfBus.updateDiagnostics({ renderCount: views.groupedItems.length });
+        return views;
+      }),
     [items, deferredShowThinkingPanel],
   );
 
@@ -5310,67 +5273,6 @@ export default function ControlClient() {
     [eventsToItems, getEventsWorker],
   );
 
-  renderDeferredTraceRef.current = (id, traceEvents, maxSequence) => {
-    if (traceEvents.length === 0) return;
-    const liveCurrent = currentMissionRef.current;
-    const liveViewing = viewingMissionRef.current;
-    const mission =
-      liveCurrent?.id === id
-        ? liveCurrent
-        : liveViewing?.id === id
-          ? liveViewing
-          : null;
-    if (!mission) return;
-
-    const existing = missionHistoricEventsRef.current.get(id) ?? [];
-    const bySequence = new Map<number, StoredEvent>();
-    for (const event of existing) bySequence.set(event.sequence, event);
-    for (const event of traceEvents) bySequence.set(event.sequence, event);
-    const merged = [...bySequence.values()].sort(
-      (a, b) => a.sequence - b.sequence,
-    );
-    missionHistoricEventsRef.current.set(id, merged);
-    if (merged.length > 0) {
-      missionMinSeqRef.current.set(id, merged[0].sequence);
-    }
-    if (maxSequence !== undefined && maxSequence > 0) {
-      missionMaxSeqRef.current.set(id, maxSequence);
-    }
-    const cacheMaxSequence =
-      maxSequence ??
-      missionMaxSeqRef.current.get(id) ??
-      merged.at(-1)?.sequence;
-    const cacheTotal = missionTotalHistoryRef.current.get(id) ?? merged.length;
-    if (cacheMaxSequence !== undefined && cacheMaxSequence > 0) {
-      void writeCachedEvents(id, merged, cacheMaxSequence, cacheTotal).catch(
-        () => undefined,
-      );
-    }
-
-    const newHistoricItems = eventsToItems(merged, mission);
-    const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
-    historicItemsCountRef.current.set(id, newHistoricItems.length);
-    setItems((prev) => {
-      const liveTail = prev.slice(oldHistoricCount);
-      return [...newHistoricItems, ...liveTail];
-    });
-
-    // Re-derive `hasMore` now that the deferred trace has merged in.
-    // `seedPaginationStateAfterInitialLoad` ran with only transcript
-    // messages in `missionHistoricEventsRef`, so its comparison against
-    // the all-event-types `totalEvents` was always under-counted and
-    // pinned `hasMore` to true. With the trace merged the counts match,
-    // and short missions correctly hide the "Load older messages" button.
-    // We don't touch state if the user is already paginating (loading=true)
-    // or has switched missions — both are handled by the existing
-    // missionId-tagged read selector elsewhere.
-    setOlderLoadState((prev) =>
-      prev.missionId === id && !prev.loading
-        ? { ...prev, hasMore: computeHasMoreOlder(id) }
-        : prev,
-    );
-  };
-
   /**
    * Fetch the next page of older history events (events with `sequence`
    * strictly less than the lowest currently loaded). Replays
@@ -5982,6 +5884,19 @@ export default function ControlClient() {
     (update: StreamDiagnosticUpdate) => {
       if (typeof update.bytes === "number") {
         perfBus.recordSseBytes(update.bytes);
+      }
+      if (update.url) {
+        try {
+          const url = new URL(update.url);
+          const missionId = url.searchParams.get("mission") ?? undefined;
+          perfBus.updateDiagnostics({
+            missionId,
+            transport: url.protocol.startsWith("ws") ? "ws" : "sse",
+            streamScope: missionId ? "mission" : "global",
+          });
+        } catch {
+          // Diagnostics only; malformed URLs still flow through normal logging.
+        }
       }
       switch (update.phase) {
         case "connecting":
@@ -7039,6 +6954,7 @@ export default function ControlClient() {
     let cleanup: (() => void) | null = null;
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempts = 0;
+    let connectionGeneration = 0;
     let mounted = true;
     const maxReconnectDelay = 30000;
     const baseDelay = 1000;
@@ -7489,9 +7405,16 @@ export default function ControlClient() {
           setItems((prev) => {
             // Remove phase items when thinking starts
             const filtered = prev.filter((it) => it.kind !== "phase");
-            const existingIdx = filtered.findIndex(
+            let existingIdx = filtered.findIndex(
               (it) => it.kind === "thinking" && !it.done,
             );
+            if (existingIdx < 0) {
+              existingIdx = filtered.findLastIndex(
+                (it) =>
+                  it.kind === "thinking" &&
+                  isStreamContinuation(pending.content, it.content),
+              );
+            }
             if (existingIdx >= 0) {
               const updated = [...filtered];
               const existing = updated[existingIdx] as Extract<
@@ -8001,6 +7924,7 @@ export default function ControlClient() {
           isRecord(data) && typeof data["dropped"] === "number"
             ? (data["dropped"] as number)
             : undefined;
+        perfBus.updateDiagnostics({ droppedEvents: dropped ?? 0 });
         streamLog("warn", "stream_lagged — refetching", { dropped });
         const viewingId = viewingMissionIdRef.current;
         if (viewingId) {
@@ -8440,18 +8364,40 @@ export default function ControlClient() {
 
     const connect = () => {
       cleanup?.();
+      const generation = ++connectionGeneration;
       const missionFilter = viewingMissionIdRef.current ?? undefined;
       streamLog("info", "connecting stream", { missionFilter });
-      cleanup = streamControl(handleEvent, handleStreamDiagnostics, {
-        missionId: missionFilter,
-        sinceSeq: missionFilter
-          ? missionMaxSeqRef.current.get(missionFilter)
-          : undefined,
-      });
+      cleanup = streamControl(
+        (event) => {
+          if (generation !== connectionGeneration) return;
+          const data = event.data;
+          const eventMissionId =
+            isRecord(data) && data["mission_id"]
+              ? String(data["mission_id"])
+              : null;
+          if (!missionFilter && viewingMissionIdRef.current && eventMissionId) {
+            return;
+          }
+          handleEvent(event);
+        },
+        handleStreamDiagnostics,
+        {
+          missionId: missionFilter,
+          sinceSeq: missionFilter
+            ? missionMaxSeqRef.current.get(missionFilter)
+            : undefined,
+        },
+      );
     };
 
-    connect();
-    streamCleanupRef.current = cleanup;
+    const initialUrlMission =
+      typeof window !== "undefined"
+        ? new URLSearchParams(window.location.search).get("mission")
+        : null;
+    if (!initialUrlMission || viewingMissionIdRef.current) {
+      connect();
+      streamCleanupRef.current = cleanup;
+    }
     // Expose the reconnect hook so the per-mission switcher effect (below)
     // can tear down the current SSE and open a new one filtered for the
     // freshly-viewed mission. Reading from a ref keeps this effect's deps

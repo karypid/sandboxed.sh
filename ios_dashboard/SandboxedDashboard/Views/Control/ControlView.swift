@@ -17,6 +17,11 @@ struct GoalPillInfo: Equatable {
     var objective: String
 }
 
+private struct BufferedStreamEvent: @unchecked Sendable {
+    let type: String
+    let data: [String: AnyCodable]
+}
+
 struct ControlView: View {
     private static let draftTextKey = "control_draft_text"
     private static let lastMissionIdKey = "control_last_mission_id"
@@ -94,7 +99,6 @@ struct ControlView: View {
     // Thoughts panel state
     @State private var showThoughts = false
     @State private var textOpBuffers: [String: String] = [:]
-    @State private var deferredTraceLoads: Set<String> = []
 
     // Tool grouping state - track which groups are expanded
     @State private var expandedToolGroups: Set<String> = []
@@ -458,6 +462,10 @@ struct ControlView: View {
         }
         .onChange(of: viewingMissionId) { _, newId in
             UserDefaults.standard.set(newId, forKey: Self.lastMissionIdKey)
+            streamTask?.cancel()
+            connectionState = .disconnected
+            reconnectAttempt = 0
+            startStreaming()
         }
         .onChange(of: inputText) { _, newText in
             // Debounced save: persist draft after 1 second of inactivity
@@ -1537,6 +1545,9 @@ struct ControlView: View {
 
         viewingMission = mission
         viewingMissionId = mission.id
+        goalInfo = mission.goalMode
+            ? GoalPillInfo(iteration: goalInfo?.iteration ?? 0, status: "active", objective: mission.goalObjective ?? "")
+            : nil
         hasMoreHistory = false
         loadedEventCount = 0
         messages = mission.history.enumerated().map { index, entry in
@@ -1555,13 +1566,14 @@ struct ControlView: View {
         clearLoadingHistoryAfterRender()
     }
 
-    private static let initialEventLimit = 50
-
     private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
         isLoadingHistory = true  // Suppress animated auto-scroll during history load
 
         viewingMission = mission
         viewingMissionId = mission.id
+        goalInfo = mission.goalMode
+            ? GoalPillInfo(iteration: goalInfo?.iteration ?? 0, status: "active", objective: mission.goalObjective ?? "")
+            : nil
 
         // Ensure deterministic replay order in case the backend returns unsorted results
         let orderedEvents = events.sorted { lhs, rhs in
@@ -1721,25 +1733,20 @@ struct ControlView: View {
                 // Fetch events for event-based display
                 if updateViewing || viewingMissionId == nil || viewingMissionId == mission.id {
                     do {
-                        let eventTypes = historyEventTypes
-                        let result = try await api.getMissionEventsWithMeta(id: mission.id, types: eventTypes, limit: Self.initialEventLimit, latest: true)
-                        let events = result.events
+                        let snapshot = try await api.getMissionSnapshot(id: mission.id)
+                        let events = snapshot.events
 
                         if events.isEmpty {
                             // Clear stale cache when events are empty
                             removeMissionFromCache(mission.id)
                             applyViewingMission(mission)
                         } else {
-                            hasMoreHistory = events.count >= Self.initialEventLimit
-                            applyViewingMissionWithEvents(mission, events: events)
-                            // Seed delta cursor only when the backend advertises support
-                            // via X-Max-Sequence — otherwise a delta call would be
-                            // ignored and return offset=0 rows.
-                            if let maxSeq = result.maxSequence, maxSeq > 0 {
-                                missionMaxSeq[mission.id] = maxSeq
-                            }
+                            hasMoreHistory = snapshot.totalEvents > events.count
+                            applyViewingMissionWithEvents(snapshot.mission, events: events)
+                            if snapshot.latestSequence > 0 { missionMaxSeq[mission.id] = snapshot.latestSequence }
+                            childMissions = snapshot.childMissions
                             // Update cache with fresh data
-                            cacheMissionWithEvents(mission, events: events)
+                            cacheMissionWithEvents(snapshot.mission, events: events)
                         }
                     } catch {
                         print("Failed to load mission events: \(error)")
@@ -1791,8 +1798,8 @@ struct ControlView: View {
         }
 
         do {
-            let mission = try await api.getMission(id: id)
-            let transcript = try await api.getMissionTranscript(id: id)
+            let snapshot = try await api.getMissionSnapshot(id: id)
+            let mission = snapshot.mission
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -1803,74 +1810,23 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            let events = transcript.messages.map(\.storedEvent)
+            let events = snapshot.events
             if events.isEmpty {
                 // Clear stale cache when events are empty to prevent visual flashing
                 removeMissionFromCache(mission.id)
                 applyViewingMission(mission)
             } else {
-                // Mirror the web client's transcript-meta fix: only
-                // count event types the iOS app actually loads. The
-                // backend's `event_counts` includes debug/status
-                // events outside `historyEventTypes`; summing them
-                // all inflates the total and keeps the "Load earlier
-                // messages" affordance visible on missions that have
-                // already shown every loadable event.
-                let loadable = Set(historyEventTypes)
-                let loadableTotal = transcript.eventCounts
-                    .filter { loadable.contains($0.key) }
-                    .values
-                    .reduce(0, +)
-                hasMoreHistory = loadableTotal > events.count
+                hasMoreHistory = snapshot.totalEvents > events.count
                 applyViewingMissionWithEvents(mission, events: events)
-                if transcript.latestSequence > 0 {
-                    missionMaxSeq[id] = transcript.latestSequence
+                if snapshot.latestSequence > 0 {
+                    missionMaxSeq[id] = snapshot.latestSequence
                 }
+                childMissions = snapshot.childMissions
                 cacheMissionWithEvents(mission, events: events)
-                if !deferredTraceLoads.contains(id) {
-                    deferredTraceLoads.insert(id)
-                    Task { [api] in
-                        let trace = try? await api.getMissionTraceWithMeta(id: id, limit: Self.initialEventLimit, sinceSeq: 0)
-                        await MainActor.run {
-                            deferredTraceLoads.remove(id)
-                            guard fetchingMissionId == id || viewingMissionId == id else { return }
-                            guard let trace, !trace.events.isEmpty else { return }
-                            // Deduplicate by sequence — transcript and
-                            // trace endpoints can overlap on shared
-                            // sequence numbers (the web client does the
-                            // same via a Map keyed by sequence in its
-                            // `renderDeferredTraceRef`). Without dedup
-                            // any overlapping event would render twice
-                            // after the deferred trace fetch lands.
-                            var bySequence: [Int64: StoredEvent] = [:]
-                            bySequence.reserveCapacity(events.count + trace.events.count)
-                            for e in events { bySequence[e.sequence] = e }
-                            for e in trace.events { bySequence[e.sequence] = e }
-                            let merged = bySequence.values
-                                .sorted { $0.sequence < $1.sequence }
-                            applyViewingMissionWithEvents(mission, events: merged)
-                            if let maxSeq = trace.maxSequence, maxSeq > 0 {
-                                missionMaxSeq[id] = maxSeq
-                            }
-                            cacheMissionWithEvents(mission, events: merged)
-                        }
-                    }
-                }
             }
 
             isLoading = false
             HapticService.success()
-
-            // Fetch child (worker) missions in background
-            Task {
-                if let workers = try? await api.getChildMissions(parentId: id) {
-                    guard fetchingMissionId == id else { return }
-                    childMissions = workers
-                } else {
-                    guard fetchingMissionId == id else { return }
-                    childMissions = []
-                }
-            }
         } catch {
             // Race condition guard
             guard fetchingMissionId == id else { return }
@@ -1932,7 +1888,6 @@ struct ControlView: View {
         case applied      // backend supports resume, events applied, cursor advanced
         case viewChanged  // user navigated away mid-request; nothing applied, no
                           // fallback should run (the new view will refetch on its own)
-        case unsupported  // backend stripped `X-Max-Sequence` — cursor dropped
         case noCursor     // no high-water mark recorded; nothing attempted
         case failed       // network/server error; cursor untouched
     }
@@ -1952,12 +1907,7 @@ struct ControlView: View {
                 sinceSeq: knownSeq
             )
             guard viewingMissionId == id else { return .viewChanged }
-            guard let maxSeq = result.maxSequence else {
-                // Backend stripped `X-Max-Sequence` — drop the cursor so the
-                // delta path is disabled until the next header-bearing fetch.
-                missionMaxSeq.removeValue(forKey: id)
-                return .unsupported
-            }
+            let maxSeq = result.maxSequence ?? knownSeq
             applyDeltaEvents(result.events)
             // If the page was capped by the limit, advance the cursor to the
             // largest sequence we actually saw so the next call resumes from
@@ -1997,7 +1947,7 @@ struct ControlView: View {
                 switch await tryDeltaResume(missionId: id) {
                 case .applied, .viewChanged:
                     return
-                case .noCursor, .unsupported, .failed:
+                case .noCursor, .failed:
                     break  // fall through to full tail reload below
                 }
             }
@@ -2010,20 +1960,18 @@ struct ControlView: View {
             // the event-rendered chat under flaky networks. On empty we
             // clear the cache and fall back, since the mission really does
             // have no events.
-            let limit = hasMoreHistory ? Self.initialEventLimit : nil
-            let latest = hasMoreHistory
             do {
-                let result = try await api.getMissionEventsWithMeta(id: id, types: historyEventTypes, limit: limit, latest: latest)
+                let snapshot = try await api.getMissionSnapshot(id: id)
                 guard viewingMissionId == id else { return }
-                if result.events.isEmpty {
+                if snapshot.events.isEmpty {
                     removeMissionFromCache(mission.id)
-                    applyViewingMission(mission, scrollToBottom: false)
+                    applyViewingMission(snapshot.mission, scrollToBottom: false)
                 } else {
-                    applyViewingMissionWithEvents(mission, events: result.events, scrollToBottom: false)
-                    if let maxSeq = result.maxSequence, maxSeq > 0 {
-                        missionMaxSeq[id] = maxSeq
-                    }
-                    cacheMissionWithEvents(mission, events: result.events)
+                    hasMoreHistory = snapshot.totalEvents > snapshot.events.count
+                    applyViewingMissionWithEvents(snapshot.mission, events: snapshot.events, scrollToBottom: false)
+                    if snapshot.latestSequence > 0 { missionMaxSeq[id] = snapshot.latestSequence }
+                    childMissions = snapshot.childMissions
+                    cacheMissionWithEvents(snapshot.mission, events: snapshot.events)
                 }
             } catch {
                 // Tail fetch failed — keep the existing rendered conversation.
@@ -2045,7 +1993,7 @@ struct ControlView: View {
         switch await tryDeltaResume(missionId: id) {
         case .applied, .viewChanged:
             return
-        case .noCursor, .unsupported:
+        case .noCursor:
             // Cursor wasn't usable — fall back to a tail reload. Skip its
             // delta retry since the cursor state is what just told us the
             // delta path isn't available right now.
@@ -2523,6 +2471,8 @@ struct ControlView: View {
     }
 
     private func startStreaming() {
+        streamTask?.cancel()
+        let missionFilter = viewingMissionId
         streamTask = Task {
             // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
             let maxBackoff: UInt64 = 30
@@ -2540,15 +2490,28 @@ struct ControlView: View {
                 // Use OSAllocatedUnfairLock for thread-safe boolean access across actor boundaries
                 // Track successful (non-error) events separately from all events
                 let receivedSuccessfulEvent = OSAllocatedUnfairLock(initialState: false)
+                let pendingEvents = OSAllocatedUnfairLock(initialState: [BufferedStreamEvent]())
+                let flushScheduled = OSAllocatedUnfairLock(initialState: false)
 
-                _ = await withCheckedContinuation { continuation in
-                    let innerTask = api.streamControl { eventType, data in
-                        // Only count non-error events as successful for backoff reset
-                        if eventType != "error" {
-                            receivedSuccessfulEvent.withLock { $0 = true }
+                func scheduleEventFlush() {
+                    let shouldSchedule = flushScheduled.withLock { scheduled in
+                        if scheduled { return false }
+                        scheduled = true
+                        return true
+                    }
+                    guard shouldSchedule else { return }
+
+                    Task {
+                        try? await Task.sleep(for: .milliseconds(16))
+                        let batch = pendingEvents.withLock { events in
+                            let batch = events
+                            events.removeAll(keepingCapacity: true)
+                            return batch
                         }
-                        Task { @MainActor in
-                            // Successfully received an event - we're connected
+                        flushScheduled.withLock { $0 = false }
+                        guard !batch.isEmpty else { return }
+
+                        await MainActor.run {
                             let wasReconnecting = !self.connectionState.isConnected && self.reconnectAttempt > 0
                             if !self.connectionState.isConnected {
                                 self.connectionState = .connected
@@ -2565,8 +2528,32 @@ struct ControlView: View {
                                     }
                                 }
                             }
-                            self.handleStreamEvent(type: eventType, data: data)
+                            for event in batch {
+                                self.handleStreamEvent(
+                                    type: event.type,
+                                    data: event.data.mapValues { $0.value }
+                                )
+                            }
                         }
+                    }
+                }
+
+                _ = await withCheckedContinuation { continuation in
+                    let innerTask = api.streamControl(missionId: missionFilter) { eventType, data in
+                        // Only count non-error events as successful for backoff reset
+                        if eventType != "error" {
+                            receivedSuccessfulEvent.withLock { $0 = true }
+                        }
+                        let codableData = data.mapValues { AnyCodable($0) }
+                        pendingEvents.withLock { events in
+                            events.append(
+                                BufferedStreamEvent(
+                                    type: eventType,
+                                    data: codableData
+                                )
+                            )
+                        }
+                        scheduleEventFlush()
                     }
 
                     // Wait for the stream task to complete
@@ -2701,14 +2688,8 @@ struct ControlView: View {
         progress = nil
 
         do {
-            // Fan out metadata + events in parallel. They share only `id`, so
-            // the previous serial chain (getMission then
-            // getMissionEventsWithMeta) added one mandatory RTT for nothing.
-            // (UX audit item #2.)
-            async let metadataTask = api.getMission(id: id)
-            async let eventsTask: MissionEventsResult? = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes)
-            let mission = try await metadataTask
-            let eventResult = await eventsTask
+            let snapshot = try await api.getMissionSnapshot(id: id)
+            let mission = snapshot.mission
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -2720,15 +2701,15 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            if let result = eventResult, !result.events.isEmpty {
-                applyViewingMissionWithEvents(mission, events: result.events)
-                if let maxSeq = result.maxSequence, maxSeq > 0 {
-                    missionMaxSeq[id] = maxSeq
-                }
-                cacheMissionWithEvents(mission, events: result.events)
+            if !snapshot.events.isEmpty {
+                hasMoreHistory = snapshot.totalEvents > snapshot.events.count
+                applyViewingMissionWithEvents(mission, events: snapshot.events)
+                if snapshot.latestSequence > 0 { missionMaxSeq[id] = snapshot.latestSequence }
+                childMissions = snapshot.childMissions
+                cacheMissionWithEvents(mission, events: snapshot.events)
             } else if !hasCache {
-                // Only fall through to "no events" if we never rendered the
-                // cached transcript — otherwise an intermittent events
+                // Only fall through to "no events" if we never rendered cached
+                // events — otherwise an intermittent snapshot
                 // failure would blow away a perfectly good cached view.
                 removeMissionFromCache(mission.id)
                 applyViewingMission(mission)
@@ -2736,14 +2717,6 @@ struct ControlView: View {
 
             isLoading = false
             HapticService.selectionChanged()
-
-            // Fetch child (worker) missions in background
-            Task {
-                if let workers = try? await api.getChildMissions(parentId: id) {
-                    guard fetchingMissionId == id else { return }
-                    childMissions = workers
-                }
-            }
         } catch {
             // Race condition guard: only show error if this is still the mission we want
             guard fetchingMissionId == id else { return }
@@ -4187,7 +4160,6 @@ private struct ThinkingBubble: View {
     let message: ChatMessage
     @State private var isExpanded: Bool = true
     @State private var elapsedSeconds: Int = 0
-    @State private var hasAutoCollapsed = false
     @State private var timerTask: Task<Void, Never>?
     
     var body: some View {
@@ -4277,22 +4249,6 @@ private struct ThinkingBubble: View {
                 }
             }
 
-            if done && !hasAutoCollapsed {
-                // Don't auto-collapse for extended thinking (> 30 seconds)
-                // User may want to review what the agent was thinking about
-                let duration = message.thinkingStartTime.map { Int(Date().timeIntervalSince($0)) } ?? 0
-                if duration > 30 {
-                    hasAutoCollapsed = true // Mark as handled but don't collapse
-                    return
-                }
-                // Auto-collapse shorter thinking after a delay
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    withAnimation(.spring(duration: 0.25)) {
-                        isExpanded = false
-                        hasAutoCollapsed = true
-                    }
-                }
-            }
         }
     }
     
@@ -4376,13 +4332,32 @@ private struct ThoughtsSheet: View {
                         description: Text("Agent thoughts will appear here during execution.")
                     )
                 } else {
-                    ScrollView {
-                        LazyVStack(spacing: 14) {
-                            ForEach(visibleThoughts) { msg in
-                                ThoughtTimelineRow(message: msg, emphasize: !msg.thinkingDone)
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 14) {
+                                ForEach(Array(visibleThoughts.enumerated()), id: \.element.id) { index, msg in
+                                    ThoughtTimelineRow(
+                                        message: msg,
+                                        emphasize: !msg.thinkingDone,
+                                        isLatest: index == visibleThoughts.count - 1
+                                    )
+                                    .id(msg.id)
+                                }
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id("thoughts-bottom")
                             }
+                            .padding()
                         }
-                        .padding()
+                        .onAppear {
+                            scrollToLatestThought(proxy)
+                        }
+                        .onChange(of: visibleThoughtCount) { _, _ in
+                            scrollToLatestThought(proxy)
+                        }
+                        .onChange(of: hasActiveThinking) { _, _ in
+                            scrollToLatestThought(proxy)
+                        }
                     }
                 }
             }
@@ -4408,19 +4383,31 @@ private struct ThoughtsSheet: View {
             }
         }
     }
+
+    private func scrollToLatestThought(_ proxy: ScrollViewProxy) {
+        guard hasVisibleThoughts else { return }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            withAnimation(.snappy(duration: 0.2)) {
+                proxy.scrollTo("thoughts-bottom", anchor: .bottom)
+            }
+        }
+    }
 }
 
 private struct ThoughtTimelineRow: View {
     let message: ChatMessage
     let emphasize: Bool
+    let isLatest: Bool
     @State private var isExpanded: Bool
     @State private var elapsedSeconds: Int = 0
     @State private var timerTask: Task<Void, Never>?
 
-    init(message: ChatMessage, emphasize: Bool) {
+    init(message: ChatMessage, emphasize: Bool, isLatest: Bool) {
         self.message = message
         self.emphasize = emphasize
-        _isExpanded = State(initialValue: emphasize)
+        self.isLatest = isLatest
+        _isExpanded = State(initialValue: emphasize || isLatest)
     }
 
     var body: some View {
@@ -4484,6 +4471,13 @@ private struct ThoughtTimelineRow: View {
                 timerTask = nil
                 if let startTime = message.thinkingStartTime {
                     elapsedSeconds = Int(Date().timeIntervalSince(startTime))
+                }
+            }
+        }
+        .onChange(of: isLatest) { _, latest in
+            if latest {
+                withAnimation(.spring(duration: 0.2)) {
+                    isExpanded = true
                 }
             }
         }

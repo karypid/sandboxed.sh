@@ -69,6 +69,8 @@ export interface Mission {
   parent_mission_id?: string;
   working_directory?: string;
   mission_mode?: "task" | "assistant";
+  goal_mode?: boolean;
+  goal_objective?: string | null;
 }
 
 export interface StoredEvent {
@@ -84,27 +86,15 @@ export interface StoredEvent {
   metadata: Record<string, unknown>;
 }
 
-export interface TranscriptMessage {
-  trace_count: number;
-  trace_summary: Record<string, number>;
-  id: number;
-  mission_id: string;
-  sequence: number;
-  event_type: string;
-  timestamp: string;
-  event_id?: string;
-  tool_call_id?: string;
-  tool_name?: string;
-  content: string;
-  metadata: Record<string, unknown>;
-}
-
-export interface MissionTranscript {
+export interface MissionSnapshot {
   mission: Mission;
-  messages: TranscriptMessage[];
+  events: StoredEvent[];
   event_counts: Record<string, number>;
   visibility_counts: Record<string, number>;
+  total_events: number;
   latest_sequence: number;
+  child_missions: Mission[];
+  running?: RunningMissionInfo;
 }
 
 export interface CreateMissionOptions {
@@ -175,20 +165,20 @@ export async function listMissions(): Promise<Mission[]> {
 
 export async function searchMissions(
   query: string,
-  options?: { limit?: number }
+  options?: { limit?: number },
 ): Promise<MissionSearchResult[]> {
   const params = new URLSearchParams();
   params.set("q", query);
   if (options?.limit) params.set("limit", String(options.limit));
   return apiGet(
     `/api/control/missions/search?${params.toString()}`,
-    "Failed to search missions"
+    "Failed to search missions",
   );
 }
 
 export async function searchMissionMoments(
   query: string,
-  options?: { limit?: number; missionId?: string }
+  options?: { limit?: number; missionId?: string },
 ): Promise<MissionMomentSearchResult[]> {
   const params = new URLSearchParams();
   params.set("q", query);
@@ -196,7 +186,7 @@ export async function searchMissionMoments(
   if (options?.missionId) params.set("mission_id", options.missionId);
   return apiGet(
     `/api/control/missions/search/moments?${params.toString()}`,
-    "Failed to search mission moments"
+    "Failed to search mission moments",
   );
 }
 
@@ -218,7 +208,7 @@ export async function getMissionEvents(
      * returned ASC. Takes precedence over `sinceSeq`/`offset`/`latest`.
      * Used for backwards pagination. */
     beforeSeq?: number;
-  }
+  },
 ): Promise<StoredEvent[]> {
   const { events } = await getMissionEventsWithMeta(id, options);
   return events;
@@ -245,23 +235,27 @@ export async function getMissionEventsWithMeta(
   id: string,
   options?: {
     types?: string[];
+    view?: "transcript" | "trace" | "history" | "all";
     limit?: number;
     offset?: number;
     latest?: boolean;
     sinceSeq?: number;
     beforeSeq?: number;
-  }
+  },
 ): Promise<{ events: StoredEvent[]; meta: MissionEventsMeta }> {
   const params = new URLSearchParams();
   if (options?.types?.length) params.set("types", options.types.join(","));
+  if (options?.view) params.set("view", options.view);
   if (options?.limit) params.set("limit", String(options.limit));
   if (options?.offset) params.set("offset", String(options.offset));
   if (options?.latest) params.set("latest", "true");
-  if (options?.sinceSeq !== undefined) params.set("since_seq", String(options.sinceSeq));
-  if (options?.beforeSeq !== undefined) params.set("before_seq", String(options.beforeSeq));
+  if (options?.sinceSeq !== undefined)
+    params.set("since_seq", String(options.sinceSeq));
+  if (options?.beforeSeq !== undefined)
+    params.set("before_seq", String(options.beforeSeq));
   const query = params.toString();
   const res = await apiFetch(
-    `/api/control/missions/${id}/events${query ? `?${query}` : ""}`
+    `/api/control/missions/${id}/events${query ? `?${query}` : ""}`,
   );
   if (!res.ok) throw new Error("Failed to fetch mission events");
   const events = (await res.json()) as StoredEvent[];
@@ -269,67 +263,36 @@ export async function getMissionEventsWithMeta(
   const totalHeader = res.headers.get("x-total-events");
   const maxSeqHeader = res.headers.get("x-max-sequence");
   const totalEvents =
-    totalHeader !== null && totalHeader !== "" && !Number.isNaN(Number(totalHeader))
+    totalHeader !== null &&
+    totalHeader !== "" &&
+    !Number.isNaN(Number(totalHeader))
       ? Number(totalHeader)
       : undefined;
   const maxSequence =
-    maxSeqHeader !== null && maxSeqHeader !== "" && !Number.isNaN(Number(maxSeqHeader))
+    maxSeqHeader !== null &&
+    maxSeqHeader !== "" &&
+    !Number.isNaN(Number(maxSeqHeader))
       ? Number(maxSeqHeader)
       : undefined;
   return { events, meta: { totalEvents, maxSequence } };
 }
 
-export async function getMissionTranscript(id: string): Promise<MissionTranscript> {
+export async function getMissionSnapshot(id: string): Promise<MissionSnapshot> {
   return apiGet(
-    `/api/control/missions/${id}/transcript`,
-    "Failed to fetch mission transcript"
+    `/api/control/missions/${id}/snapshot`,
+    "Failed to fetch mission snapshot",
   );
-}
-
-export async function getMissionTraceWithMeta(
-  id: string,
-  options?: {
-    limit?: number;
-    offset?: number;
-    latest?: boolean;
-    sinceSeq?: number;
-    beforeSeq?: number;
-  }
-): Promise<{ events: StoredEvent[]; meta: MissionEventsMeta }> {
-  const params = new URLSearchParams();
-  // `!== undefined` matches the sinceSeq/beforeSeq pattern below — a
-  // truthiness check drops `0`, but `offset: 0` is a valid value meaning
-  // "start from the beginning."
-  if (options?.limit !== undefined) params.set("limit", String(options.limit));
-  if (options?.offset !== undefined) params.set("offset", String(options.offset));
-  if (options?.latest) params.set("latest", "true");
-  if (options?.sinceSeq !== undefined) params.set("since_seq", String(options.sinceSeq));
-  if (options?.beforeSeq !== undefined) params.set("before_seq", String(options.beforeSeq));
-  const query = params.toString();
-  const res = await apiFetch(
-    `/api/control/missions/${id}/trace${query ? `?${query}` : ""}`
-  );
-  if (!res.ok) throw new Error("Failed to fetch mission trace");
-  const events = (await res.json()) as StoredEvent[];
-  const totalHeader = res.headers.get("x-total-events");
-  const maxSeqHeader = res.headers.get("x-max-sequence");
-  const totalEvents =
-    totalHeader !== null && totalHeader !== "" && !Number.isNaN(Number(totalHeader))
-      ? Number(totalHeader)
-      : undefined;
-  const maxSequence =
-    maxSeqHeader !== null && maxSeqHeader !== "" && !Number.isNaN(Number(maxSeqHeader))
-      ? Number(maxSeqHeader)
-      : undefined;
-  return { events, meta: { totalEvents, maxSequence } };
 }
 
 export async function getCurrentMission(): Promise<Mission | null> {
-  return apiGet("/api/control/missions/current", "Failed to fetch current mission");
+  return apiGet(
+    "/api/control/missions/current",
+    "Failed to fetch current mission",
+  );
 }
 
 export async function createMission(
-  options?: CreateMissionOptions
+  options?: CreateMissionOptions,
 ): Promise<Mission> {
   const body: {
     title?: string;
@@ -362,7 +325,9 @@ export async function createMission(
 }
 
 export async function loadMission(id: string): Promise<Mission | null> {
-  const res = await apiFetch(`/api/control/missions/${id}/load`, { method: "POST" });
+  const res = await apiFetch(`/api/control/missions/${id}/load`, {
+    method: "POST",
+  });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("Failed to load mission");
   return res.json();
@@ -375,7 +340,9 @@ export async function loadMission(id: string): Promise<Mission | null> {
  * updated mission so the caller can rerender the dot immediately.
  */
 export async function markMissionOpened(id: string): Promise<Mission | null> {
-  const res = await apiFetch(`/api/control/missions/${id}/opened`, { method: "POST" });
+  const res = await apiFetch(`/api/control/missions/${id}/opened`, {
+    method: "POST",
+  });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("Failed to mark mission opened");
   return res.json();
@@ -387,7 +354,7 @@ export async function getRunningMissions(): Promise<RunningMissionInfo[]> {
 
 export async function startMissionParallel(
   missionId: string,
-  content: string
+  content: string,
 ): Promise<{ ok: boolean; mission_id: string }> {
   const res = await apiFetch(`/api/control/missions/${missionId}/parallel`, {
     method: "POST",
@@ -402,19 +369,27 @@ export async function startMissionParallel(
 }
 
 export async function cancelMission(missionId: string): Promise<void> {
-  return apiPost(`/api/control/missions/${missionId}/cancel`, undefined, "Failed to cancel mission");
+  return apiPost(
+    `/api/control/missions/${missionId}/cancel`,
+    undefined,
+    "Failed to cancel mission",
+  );
 }
 
 export async function setMissionStatus(
   id: string,
-  status: MissionStatus
+  status: MissionStatus,
 ): Promise<void> {
-  return apiPost(`/api/control/missions/${id}/status`, { status }, "Failed to set mission status");
+  return apiPost(
+    `/api/control/missions/${id}/status`,
+    { status },
+    "Failed to set mission status",
+  );
 }
 
 export async function updateMissionSettings(
   id: string,
-  options: UpdateMissionSettingsOptions
+  options: UpdateMissionSettingsOptions,
 ): Promise<Mission> {
   const body: {
     backend?: string;
@@ -441,7 +416,9 @@ export async function updateMissionSettings(
   return res.json();
 }
 
-export async function deleteMission(id: string): Promise<{ ok: boolean; deleted: string }> {
+export async function deleteMission(
+  id: string,
+): Promise<{ ok: boolean; deleted: string }> {
   const res = await apiFetch(`/api/control/missions/${id}`, {
     method: "DELETE",
   });
@@ -452,7 +429,10 @@ export async function deleteMission(id: string): Promise<{ ok: boolean; deleted:
   return res.json();
 }
 
-export async function cleanupEmptyMissions(): Promise<{ ok: boolean; deleted_count: number }> {
+export async function cleanupEmptyMissions(): Promise<{
+  ok: boolean;
+  deleted_count: number;
+}> {
   const res = await apiFetch("/api/control/missions/cleanup", {
     method: "POST",
   });
@@ -465,12 +445,14 @@ export async function cleanupEmptyMissions(): Promise<{ ok: boolean; deleted_cou
 
 export async function resumeMission(
   id: string,
-  options?: { skipMessage?: boolean }
+  options?: { skipMessage?: boolean },
 ): Promise<Mission> {
   const res = await apiFetch(`/api/control/missions/${id}/resume`, {
     method: "POST",
     headers: options ? { "Content-Type": "application/json" } : undefined,
-    body: options ? JSON.stringify({ skip_message: options.skipMessage }) : undefined,
+    body: options
+      ? JSON.stringify({ skip_message: options.skipMessage })
+      : undefined,
   });
   if (!res.ok) {
     const text = await res.text();
@@ -486,12 +468,12 @@ export async function resumeMission(
 /** Rename a mission via the backend API. */
 export async function updateMissionTitle(
   id: string,
-  title: string
+  title: string,
 ): Promise<void> {
   return apiPost(
     `/api/control/missions/${id}/title`,
     { title },
-    "Failed to update mission title"
+    "Failed to update mission title",
   );
 }
 
@@ -503,7 +485,7 @@ export async function updateMissionTitle(
 export async function autoGenerateMissionTitle(
   missionId: string,
   userMessage: string,
-  assistantReply: string
+  assistantReply: string,
 ): Promise<string | null> {
   if (!isAutoTitleEnabled()) return null;
   try {

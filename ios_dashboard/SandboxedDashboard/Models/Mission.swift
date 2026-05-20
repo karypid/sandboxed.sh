@@ -99,6 +99,8 @@ struct Mission: Codable, Identifiable, Hashable {
     let agent: String?
     let modelOverride: String?
     let backend: String?
+    let goalMode: Bool
+    let goalObjective: String?
     let history: [MissionHistoryEntry]
     let createdAt: String
     var updatedAt: String
@@ -120,6 +122,8 @@ struct Mission: Codable, Identifiable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, status, title, history, resumable, agent, backend
+        case goalMode = "goal_mode"
+        case goalObjective = "goal_objective"
         case shortDescription = "short_description"
         case metadataUpdatedAt = "metadata_updated_at"
         case metadataSource = "metadata_source"
@@ -150,6 +154,8 @@ struct Mission: Codable, Identifiable, Hashable {
         agent = try container.decodeIfPresent(String.self, forKey: .agent)
         modelOverride = try container.decodeIfPresent(String.self, forKey: .modelOverride)
         backend = try container.decodeIfPresent(String.self, forKey: .backend)
+        goalMode = try container.decodeIfPresent(Bool.self, forKey: .goalMode) ?? false
+        goalObjective = try container.decodeIfPresent(String.self, forKey: .goalObjective)
         history = try container.decode([MissionHistoryEntry].self, forKey: .history)
         createdAt = try container.decode(String.self, forKey: .createdAt)
         updatedAt = try container.decode(String.self, forKey: .updatedAt)

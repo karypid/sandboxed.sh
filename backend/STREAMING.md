@@ -2,11 +2,11 @@
 
 The control plane emits agent activity to dashboard and iOS clients via
 SSE (`GET /api/control/stream`), WebSocket (`GET /api/control/ws`), and
-a database-backed event log (`GET /api/control/missions/:id/events`,
-`…/trace`, `…/transcript`). This document is the canonical contract for what each
+a database-backed event log (`GET /api/control/missions/:id/events`).
+This document is the canonical contract for what each
 backend emits and what each client expects. It exists because two
-incidents (the iOS replay-text-delta bug, the verity duplicated-thoughts
-freeze) traced back to drift between these three implementations.
+incidents (the iOS replay-text-delta bug, the duplicated-thoughts freeze)
+traced back to drift between live transport and historical replay.
 
 ## SSE channel
 
@@ -15,7 +15,7 @@ freeze) traced back to drift between these three implementations.
 | Param | Meaning |
 | --- | --- |
 | `mission` | When present, the server only emits events whose `mission_id` matches. `status` and `stream_lagged` (connection-scoped) always pass. Omit the param to receive every event the authenticated user can see (used by the mission list and the `?debug=perf` overlay). |
-| `cap` | Optional comma-separated client capabilities. `text_op` asks the transport to convert cumulative `text_delta` events into negotiated CRDT-style `text_op` operations for this connection. Omit it for the cumulative compatibility path. |
+| `cap` | Comma-separated client capabilities. Current dashboard and iOS clients send `text_op`, which asks the transport to convert cumulative backend `text_delta` events into CRDT-style `text_op` operations for this connection. |
 
 Each line is one of:
 
@@ -59,7 +59,7 @@ Listed with the backends that emit them.
 | `user_message` | server | `{id, mission_id, content, queued}` | Echoes the user message back after persisting. |
 | `assistant_message` | server | `{id, mission_id, content, success, cost_cents?, cost_source?, model?, shared_files?}` | One per completed agent turn. **Cumulative content** — the message is the final consolidated text. |
 | `text_delta` | grok, codex | `{mission_id, content, event_id?}` | **Cumulative buffer** — the `content` field contains the *entire* text so far, not the new tokens. Clients must consolidate by replacing, not appending. See "Continuation rule". |
-| `text_op` | negotiated streaming backends | `{mission_id, bubble_id, ops}` | CRDT-style delta stream. `ops` entries are `insert`, `replace`, or `finalize`; clients apply them to a local buffer keyed by `bubble_id`. Backends only emit this when the client advertises support; `text_delta` remains the compatibility path. |
+| `text_op` | negotiated streaming backends | `{mission_id, bubble_id, ops}` | CRDT-style delta stream. `ops` entries are `insert`, `replace`, or `finalize`; clients apply them to a local buffer keyed by `bubble_id`. Current dashboard and iOS clients request this via `cap=text_op`. |
 | `thinking` | grok, codex | `{mission_id, content, done, goal_role?, event_id?}` | Cumulative buffer. `done: true` finalises the current thought; subsequent non-prefix payloads start a new thought. |
 | `tool_call` | all | `{mission_id, tool_call_id, name, args}` | One per tool invocation. |
 | `tool_result` | all | `{mission_id, tool_call_id, name, result}` | Pairs with `tool_call` via `tool_call_id`. |
@@ -99,8 +99,7 @@ check classifies the second copy as a new thought. The chat then
 shows duplicated tokens that grow quadratically with stream length.
 
 The dashboard implements this in `dashboard/src/lib/stream-continuation.ts`.
-The iOS app must mirror the same rule (the
-`HistoricalTranscriptBuilder.isStreamContinuation` Swift port).
+The iOS app mirrors the same rule in `ControlView.isStreamContinuation`.
 
 ## Database event log
 
@@ -116,23 +115,17 @@ the log through the unified cursor endpoint:
     seen and pass it on resume.
   - `before_seq=N` — page backwards (oldest-first within the page).
     For "load older messages" UI.
-  - `types=user_message,assistant_message,…` — filter to a subset.
-    With the default set (the constant `HISTORY_EVENT_TYPES` on the
-    client) this returns the same shape as the legacy `/transcript`.
+  - `types=user_message,assistant_message,…` — filter to an explicit subset.
+  - `view=transcript|trace|history|all` — named type presets. `history`
+    is the default client view for chat replay.
   - `limit=N` — page size; default 5000.
 
-Legacy endpoints kept as thin aliases for iOS clients on older
-binaries:
+- `GET /api/control/missions/:id/snapshot` is the first-paint endpoint.
+  It returns mission metadata, the latest `history` event tail, event
+  counts, max sequence, child missions, and the running state.
 
-- `GET /api/control/missions/:id/trace?since_seq=N&limit=N` — same
-  shape as `/events` but defaults to the activity-trace type set.
-- `GET /api/control/missions/:id/transcript` — flattened message
-  list. New clients should use `/events?types=user_message,…` with
-  a high `limit` instead.
-
-The historical reducer (`eventsToItems` in dashboard, the Swift
-`HistoricalTranscriptBuilder`) walks events in `sequence` order and
-must:
+The historical reducer (`eventsToItems` in dashboard, and the Swift replay
+path in `ControlView`) walks events in `sequence` order and must:
 
 1. Apply the same continuation rule above when consolidating
    `text_delta` and `thinking`.
@@ -154,16 +147,14 @@ For negotiated `text_op` streams, in-flight ops persist as `text_op` rows.
 When a `finalize` op arrives, the mission store applies the full op log for
 that `bubble_id`, deletes those delta rows, and writes one
 `assistant_message_canonical` row. Future `/events` fetches return the
-canonical row rather than the op log. Existing missions and cumulative
-`text_delta` rows are unchanged.
+canonical row rather than the op log.
 
 ## Client expectations
 
 ### Dashboard (`dashboard/src/app/control/control-client.tsx`)
 
-- Connects with `?mission=<id>` when viewing a specific mission. The
-  transport prefers `/api/control/ws` and falls back to `/api/control/stream`
-  on WebSocket connection error.
+- Uses `/snapshot` for first paint and `/events` for pagination/resume.
+- Connects with `?mission=<id>` when viewing a specific mission.
 - Reconnects whenever the viewing mission changes.
 - Coalesces `text_delta` and `thinking` re-renders via
   `requestAnimationFrame` — at most one React commit per frame.
@@ -175,9 +166,9 @@ canonical row rather than the op log. Existing missions and cumulative
 
 ### iOS (`ios_dashboard/SandboxedDashboard/Views/Control/ControlView.swift`)
 
-- Live SSE handler at `ControlStreamSession`.
-- Historical replay at `HistoricalTranscriptBuilder` — gated on
-  `mission.goalMode` for goal-role inference.
+- Uses `/snapshot` for first paint and `/events` for pagination/resume.
+- Live SSE connects with `?mission=<id>` for the viewed mission.
+- Historical replay is gated on `mission.goalMode` for goal-role inference.
 - Preserves `goalRole` through finalize-thinking transitions.
 
 ## Per-backend notes
@@ -199,9 +190,8 @@ canonical row rather than the op log. Existing missions and cumulative
    `events_tx` channel.
 2. Always populate `mission_id` (the `?mission=<uuid>` filter drops
    events without it).
-3. For streaming text, send cumulative buffers in `text_delta`. Don't
-   send incremental tokens — every client consumer assumes cumulative
-   semantics today.
+3. For streaming text, send cumulative buffers in `text_delta`; the control
+   transport converts them to `text_op` for current clients.
 4. Update this file with the per-backend notes.
 
 ## Where this document is enforced

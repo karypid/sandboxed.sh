@@ -30,10 +30,7 @@ const STORE = "missions";
 
 /**
  * Per-mission cap on cached events. Newest entries are kept on overflow.
- * Sized to keep the transcript plus the recent deferred trace together for
- * active missions. If this is too small, reopen renders chat first and then
- * has to refetch thoughts/tools as a second pass, which causes a visible
- * redraw.
+ * Sized to keep the latest snapshot tail together for active missions.
  */
 const MAX_CACHED_EVENTS = 1_500;
 

@@ -4585,23 +4585,18 @@ pub async fn get_progress(
 /// Query params for the unified mission events endpoint (P3-#18).
 ///
 /// `GET /api/control/missions/:id/events` is the canonical cursor
-/// endpoint for fetching persisted events. With `since_seq=N` it
-/// returns events strictly after sequence N (forward delta — what
-/// SSE reconnect uses). With `before_seq=N` it pages backwards. With
-/// `types=tool_call,tool_result` it filters to a subset (replaces
-/// `/trace`). With `types=user_message,assistant_message,thinking,...`
-/// + a high `limit` it returns the full transcript shape.
-///
-/// `/trace` and `/transcript` remain as thin alias handlers for
-/// backward compatibility with iOS clients on older binaries — both
-/// forward to the same `mission_store.list_events` call. Document
-/// the migration: new clients should use `/events?since_seq=N`
-/// exclusively.
+/// endpoint for fetching persisted events. With `since_seq=N` it returns
+/// events strictly after sequence N. With `before_seq=N` it pages backwards.
+/// Use `view=transcript|trace|history|all` or explicit `types=` filters.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetEventsQuery {
     /// Comma-separated event types to filter (e.g., "tool_call,tool_result")
     #[serde(default)]
     pub types: Option<String>,
+    /// Preset event type view. `transcript` returns user/assistant rows,
+    /// `trace` returns intermediate activity, and `all` disables filtering.
+    #[serde(default)]
+    pub view: Option<String>,
     /// Maximum number of events to return
     #[serde(default)]
     pub limit: Option<usize>,
@@ -4726,11 +4721,10 @@ pub async fn get_mission_events(
         .map_err(internal_error)?
         .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
 
-    // Parse event types filter
-    let types: Option<Vec<&str>> = query
-        .types
+    let type_names = event_types_for_query(&query);
+    let types: Option<Vec<&str>> = type_names
         .as_ref()
-        .map(|s| s.split(',').map(|t| t.trim()).collect());
+        .map(|t| t.iter().map(String::as_str).collect());
 
     let events = if let Some(before_seq) = query.before_seq {
         control
@@ -4833,6 +4827,45 @@ const TRACE_EVENT_TYPES: &[&str] = &[
     "phase",
     "status",
 ];
+const HISTORY_EVENT_TYPES: &[&str] = &[
+    "user_message",
+    "assistant_message",
+    "assistant_message_canonical",
+    "tool_call",
+    "tool_result",
+    "text_delta",
+    "text_op",
+    "thinking",
+    "goal_iteration",
+    "goal_status",
+];
+const SNAPSHOT_EVENT_LIMIT: usize = 200;
+
+fn event_types_for_query(query: &GetEventsQuery) -> Option<Vec<String>> {
+    if let Some(types) = query.types.as_ref() {
+        return Some(
+            types
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(ToString::to_string)
+                .collect(),
+        );
+    }
+
+    match query.view.as_deref() {
+        Some("transcript") => Some(
+            TRANSCRIPT_EVENT_TYPES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        Some("trace") => Some(TRACE_EVENT_TYPES.iter().map(|s| s.to_string()).collect()),
+        Some("history") => Some(HISTORY_EVENT_TYPES.iter().map(|s| s.to_string()).collect()),
+        Some("all") | None => None,
+        Some(_) => None,
+    }
+}
 
 fn event_visibility(event_type: &str) -> &'static str {
     match event_type {
@@ -4847,60 +4880,24 @@ fn event_visibility(event_type: &str) -> &'static str {
 }
 
 #[derive(Debug, Serialize)]
-pub struct TranscriptMessage {
-    #[serde(flatten)]
-    pub event: mission_store::StoredEvent,
-    /// Count of non-transcript events after the previous transcript row and
-    /// before this row. Lets clients reserve a Thinking/Activity affordance
-    /// without downloading the trace on the first mission paint.
-    pub trace_count: usize,
-    pub trace_summary: HashMap<String, usize>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MissionTranscriptResponse {
+pub struct MissionSnapshotResponse {
     pub mission: Mission,
-    pub messages: Vec<TranscriptMessage>,
+    pub events: Vec<mission_store::StoredEvent>,
     pub event_counts: HashMap<String, usize>,
     pub visibility_counts: HashMap<String, usize>,
+    pub total_events: usize,
     pub latest_sequence: i64,
+    pub child_missions: Vec<Mission>,
+    pub running: Option<super::mission_runner::RunningMissionInfo>,
 }
 
-async fn event_count_map(
-    store: &(dyn MissionStore + Send + Sync),
-    mission_id: Uuid,
-    event_types: &[&str],
-) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    for event_type in event_types {
-        if let Ok(count) = store.count_events(mission_id, Some(&[*event_type])).await {
-            counts.insert((*event_type).to_string(), count);
-        }
-    }
-    counts
-}
-
-fn trace_summary_between(
-    trace_events: &[mission_store::StoredEvent],
-    after_sequence: i64,
-    before_sequence: i64,
-) -> HashMap<String, usize> {
-    let mut summary = HashMap::new();
-    for event in trace_events {
-        if event.sequence > after_sequence && event.sequence < before_sequence {
-            *summary.entry(event.event_type.clone()).or_insert(0) += 1;
-        }
-    }
-    summary
-}
-
-/// Lightweight initial mission payload: final chat transcript only, plus event
-/// counts/cursors so clients can fetch the hidden activity trace afterward.
-pub async fn get_mission_transcript(
+/// Single first-paint payload for clients. It returns the latest visible event
+/// tail plus metadata needed to avoid the old transcript-then-trace redraw.
+pub async fn get_mission_snapshot(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(mission_id): Path<Uuid>,
-) -> Result<Json<MissionTranscriptResponse>, (StatusCode, String)> {
+) -> Result<Json<MissionSnapshotResponse>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mut mission = control
         .mission_store
@@ -4913,159 +4910,63 @@ pub async fn get_mission_transcript(
         mission.workspace_name = Some(workspace.name);
     }
 
-    let transcript_events = control
+    let total = control
         .mission_store
-        .get_events(mission_id, Some(TRANSCRIPT_EVENT_TYPES), None, None)
+        .count_events(mission_id, Some(HISTORY_EVENT_TYPES))
         .await
         .map_err(internal_error)?;
-    let trace_events = control
+    let offset = total.saturating_sub(SNAPSHOT_EVENT_LIMIT);
+    let events = control
         .mission_store
-        .get_events(mission_id, Some(TRACE_EVENT_TYPES), None, None)
+        .get_events(
+            mission_id,
+            Some(HISTORY_EVENT_TYPES),
+            Some(SNAPSHOT_EVENT_LIMIT),
+            Some(offset),
+        )
         .await
         .map_err(internal_error)?;
-    let trace_events = if should_summarize_events(&mission) {
-        summarize_inactive_stream_events(trace_events).events
+    let summary = if should_summarize_events(&mission) {
+        summarize_inactive_stream_events(events)
     } else {
-        trace_events
+        EventSummary::unchanged(events)
     };
-    let latest_sequence = control
+    let event_counts = control
         .mission_store
-        .max_event_sequence(mission_id)
+        .count_events_by_type(mission_id, Some(HISTORY_EVENT_TYPES))
         .await
         .map_err(internal_error)?;
-
-    let mut previous_transcript_sequence = 0;
-    let mut messages = Vec::with_capacity(transcript_events.len());
-    for event in transcript_events {
-        let trace_summary =
-            trace_summary_between(&trace_events, previous_transcript_sequence, event.sequence);
-        let trace_count = trace_summary.values().sum();
-        previous_transcript_sequence = event.sequence;
-        messages.push(TranscriptMessage {
-            event,
-            trace_count,
-            trace_summary,
-        });
-    }
-
-    let mut known_types = Vec::new();
-    known_types.extend_from_slice(TRANSCRIPT_EVENT_TYPES);
-    known_types.extend_from_slice(TRACE_EVENT_TYPES);
-    known_types.push("mission_status_changed");
-    let event_counts = event_count_map(&*control.mission_store, mission_id, &known_types).await;
-
     let mut visibility_counts: HashMap<String, usize> = HashMap::new();
     for (event_type, count) in &event_counts {
         *visibility_counts
             .entry(event_visibility(event_type).to_string())
             .or_insert(0) += *count;
     }
-
-    Ok(Json(MissionTranscriptResponse {
-        mission,
-        messages,
-        event_counts,
-        visibility_counts,
-        latest_sequence,
-    }))
-}
-
-/// Deferred intermediate activity for a mission. This returns thoughts, tool
-/// calls/results, text deltas, and runtime/status events while keeping the
-/// first transcript request small.
-pub async fn get_mission_trace(
-    State(state): State<Arc<AppState>>,
-    Extension(user): Extension<AuthUser>,
-    Path(mission_id): Path<Uuid>,
-    axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
-) -> Result<Response, (StatusCode, String)> {
-    state.control_metrics.record_events_request();
-    let control = control_for_user(&state, &user).await;
-    let mission = control
-        .mission_store
-        .get_mission(mission_id)
-        .await
-        .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
-
-    let events = if let Some(before_seq) = query.before_seq {
-        control
-            .mission_store
-            .get_events_before(mission_id, before_seq, Some(TRACE_EVENT_TYPES), query.limit)
-            .await
-            .map_err(internal_error)?
-    } else if let Some(since_seq) = query.since_seq {
-        control
-            .mission_store
-            .get_events_since(mission_id, since_seq, Some(TRACE_EVENT_TYPES), query.limit)
-            .await
-            .map_err(internal_error)?
-    } else {
-        let offset = if query.latest.unwrap_or(false) {
-            if let Some(limit) = query.limit {
-                let total = control
-                    .mission_store
-                    .count_events(mission_id, Some(TRACE_EVENT_TYPES))
-                    .await
-                    .map_err(internal_error)?;
-                Some(total.saturating_sub(limit))
-            } else {
-                query.offset
-            }
-        } else {
-            query.offset
-        };
-        control
-            .mission_store
-            .get_events(mission_id, Some(TRACE_EVENT_TYPES), query.limit, offset)
-            .await
-            .map_err(internal_error)?
-    };
-    let summary = if should_summarize_events(&mission) {
-        summarize_inactive_stream_events(events)
-    } else {
-        EventSummary::unchanged(events)
-    };
-
-    let total = control
-        .mission_store
-        .count_events(mission_id, Some(TRACE_EVENT_TYPES))
-        .await
-        .ok();
-    let max_seq = control
+    let latest_sequence = control
         .mission_store
         .max_event_sequence(mission_id)
         .await
-        .ok();
+        .map_err(internal_error)?;
+    let child_missions = control
+        .mission_store
+        .get_child_missions(mission_id)
+        .await
+        .unwrap_or_default();
+    let running = get_running_missions(&control)
+        .await?
+        .into_iter()
+        .find(|info| info.mission_id == mission_id);
 
-    let mut response = Json(summary.events).into_response();
-    let headers = response.headers_mut();
-    if let Some(total) = total {
-        if let Ok(v) = header::HeaderValue::from_str(&total.to_string()) {
-            headers.insert("X-Total-Events", v);
-        }
-    }
-    if let Some(max_seq) = max_seq {
-        if let Ok(v) = header::HeaderValue::from_str(&max_seq.to_string()) {
-            headers.insert("X-Max-Sequence", v);
-        }
-    }
-    if summary.summarized_count < summary.original_count {
-        if let Ok(v) = header::HeaderValue::from_str(&summary.original_count.to_string()) {
-            headers.insert("X-Original-Event-Count", v);
-        }
-        if let Ok(v) = header::HeaderValue::from_str(&summary.summarized_count.to_string()) {
-            headers.insert("X-Summarized-Event-Count", v);
-        }
-    }
-    headers.insert(
-        header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        header::HeaderValue::from_static(
-            "X-Total-Events, X-Max-Sequence, X-Original-Event-Count, X-Summarized-Event-Count",
-        ),
-    );
-
-    Ok(response)
+    Ok(Json(MissionSnapshotResponse {
+        mission,
+        events: summary.events,
+        event_counts,
+        visibility_counts,
+        total_events: total,
+        latest_sequence,
+        child_missions,
+        running,
+    }))
 }
 
 // ==================== Parallel Mission Endpoints ====================
@@ -18081,37 +17982,5 @@ Investigate <service/> failures.
             before_bytes >= after_bytes * 10,
             "expected >=10x payload drop, before={before_bytes}, after={after_bytes}"
         );
-    }
-
-    #[test]
-    fn transcript_trace_summary_counts_only_events_between_transcript_rows() {
-        let mission_id = Uuid::new_v4();
-        let event = |sequence, event_type: &str| mission_store::StoredEvent {
-            id: sequence,
-            mission_id,
-            sequence,
-            event_type: event_type.to_string(),
-            timestamp: "2026-05-16T00:00:00Z".to_string(),
-            event_id: None,
-            tool_call_id: None,
-            tool_name: None,
-            content: String::new(),
-            metadata: serde_json::json!({}),
-        };
-        let trace_events = vec![
-            event(2, "thinking"),
-            event(3, "thinking"),
-            event(4, "tool_call"),
-            event(7, "tool_result"),
-        ];
-
-        let first = trace_summary_between(&trace_events, 1, 5);
-        assert_eq!(first.get("thinking"), Some(&2));
-        assert_eq!(first.get("tool_call"), Some(&1));
-        assert_eq!(first.get("tool_result"), None);
-
-        let second = trace_summary_between(&trace_events, 5, 8);
-        assert_eq!(second.get("tool_result"), Some(&1));
-        assert_eq!(second.get("thinking"), None);
     }
 }

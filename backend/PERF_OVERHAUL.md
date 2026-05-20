@@ -83,8 +83,8 @@ iOS simulator smoke evidence:
 - `ios-control-direct-after-sequential.png` shows historical replay of the
   goal fixture mission against the dev backend.
 - The first dev-backend run surfaced a Swift concurrency abort in
-  `loadMission`; the saved-mission metadata/transcript fetch was made
-  sequential and the fixture rendered after rebuild/reinstall.
+  `loadMission`; mission first paint now uses one snapshot payload and the
+  fixture rendered after rebuild/reinstall.
 
 ## Deferred items, with reasoning
 
@@ -117,10 +117,9 @@ with a sync fallback if worker startup fails.
 ### P3-#17..#21: backend streaming changes
 
 P3-#17 adds a pure read-side summarization pass for inactive missions:
-`thinking` and `text_delta` runs are collapsed for `/events`, `/trace`,
-and transcript wrappers only when `updated_at` is older than five
-minutes. Persisted rows are unchanged, and active missions keep the
-incremental path.
+`thinking` and `text_delta` runs are collapsed for `/events` only when
+`updated_at` is older than five minutes. Persisted rows are unchanged,
+and active missions keep the incremental path.
 
 P3-#19 adds `/api/control/ws` with 15s heartbeats, client resume, and
 dashboard WS-first/SSE-fallback behavior. P3-#18, #20, and #21 remain

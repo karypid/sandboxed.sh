@@ -123,55 +123,55 @@ sequence metadata is available.
 ]
 ```
 
-## Transcript-First Mission Loading
+## Snapshot-First Mission Loading
 
 Use this endpoint for initial mission paint:
 
 ```
-GET /api/control/missions/:id/transcript
+GET /api/control/missions/:id/snapshot
 ```
 
-It returns only transcript-visible rows (`user_message` and final
-`assistant_message`) plus counts/cursors for hidden activity. Clients should
-render these messages immediately, reserve any Thinking/Activity affordance from
-`trace_count` / `trace_summary`, then fetch trace data separately.
+It returns mission metadata, the latest history events, event counts, child
+mission summary, and running state in one payload. Clients should use this for
+first paint, then use `/events` for pagination and delta catch-up.
 
 Event visibility categories:
-- `transcript`: `user_message`, `assistant_message`, mission status/completion metadata
-- `trace`: `thinking`, `tool_call`, `tool_result`, `text_delta`, errors, command/runtime status
+- `history`: transcript-visible messages plus thinking/tool/text operation rows
+- `transcript`: `user_message`, `assistant_message`, canonical assistant rows
+- `trace`: `thinking`, `tool_call`, `tool_result`, `text_delta`, `text_op`, errors, command/runtime status
 - `debug`: diagnostics and backend protocol noise
 
 **Response**:
 ```json
 {
   "mission": { "id": "uuid", "status": "active" },
-  "messages": [
+  "events": [
     {
       "id": 1,
       "mission_id": "uuid",
       "sequence": 1,
       "event_type": "user_message",
-      "content": "Question",
-      "trace_count": 0,
-      "trace_summary": {}
+      "content": "Question"
     }
   ],
   "event_counts": { "user_message": 1, "assistant_message": 1, "thinking": 4 },
-  "visibility_counts": { "transcript": 2, "trace": 4 },
-  "latest_sequence": 12
+  "visibility_counts": { "history": 6 },
+  "total_events": 6,
+  "latest_sequence": 12,
+  "child_missions": [],
+  "running": null
 }
 ```
 
-Fetch deferred activity with:
+Fetch history and pagination with:
 
 ```
-GET /api/control/missions/:id/trace?since_seq=0&limit=200
+GET /api/control/missions/:id/events?view=history&since_seq=0&limit=200
 ```
 
-`/trace` supports `limit`, `offset`, `latest`, `since_seq`, and `before_seq`,
-returns only trace-visible events, and includes `X-Total-Events` /
-`X-Max-Sequence` headers like `/events`. The full `/events` endpoint remains the
-compatibility/debug API.
+`/events` supports `view=transcript|trace|history|all`, explicit `types`,
+`limit`, `offset`, `latest`, `since_seq`, and `before_seq`, and includes
+`X-Total-Events` / `X-Max-Sequence` headers.
 
 ## Stream Events (SSE)
 
@@ -204,8 +204,8 @@ data: {"id":"uuid","content":"Done!","success":true,"cost_cents":5,"model":"clau
 | `/api/control/missions` | GET | List missions |
 | `/api/control/missions/:id` | GET | Get mission details |
 | `/api/control/missions/:id` | DELETE | Delete mission |
-| `/api/control/missions/:id/transcript` | GET | Get lightweight user/final-answer transcript for initial paint |
-| `/api/control/missions/:id/trace` | GET | Get deferred thinking/tool/runtime activity |
+| `/api/control/missions/:id/snapshot` | GET | Get first-paint mission payload |
+| `/api/control/missions/:id/events` | GET | Get historical mission events and pagination |
 | `/api/control/missions/:id/tree` | GET | Get agent tree for mission |
 | `/api/control/missions/current` | GET | Get current active mission |
 | `/api/control/missions/:id/resume` | POST | Resume interrupted mission |

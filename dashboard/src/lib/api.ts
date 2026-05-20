@@ -1,6 +1,6 @@
 /**
  * Main API module - re-exports from split modules for backward compatibility.
- * 
+ *
  * New code should import from specific modules when possible:
  * - Core utilities: @/lib/api/core
  * - Missions: @/lib/api/missions
@@ -103,7 +103,10 @@ export async function getHealth(): Promise<HealthResponse> {
   return res.json();
 }
 
-export async function login(password: string, username?: string): Promise<LoginResponse> {
+export async function login(
+  password: string,
+  username?: string,
+): Promise<LoginResponse> {
   const payload: { password: string; username?: string } = { password };
   if (username && username.trim().length > 0) {
     payload.username = username.trim();
@@ -144,9 +147,13 @@ export interface ChangePasswordResponse {
 }
 
 export async function changePassword(
-  request: ChangePasswordRequest
+  request: ChangePasswordRequest,
 ): Promise<ChangePasswordResponse> {
-  return apiPost("/api/auth/change-password", request, "Failed to change password");
+  return apiPost(
+    "/api/auth/change-password",
+    request,
+    "Failed to change password",
+  );
 }
 
 // Get statistics
@@ -172,7 +179,7 @@ export async function getTask(id: string): Promise<TaskState> {
 
 // Create a new task
 export async function createTask(
-  request: CreateTaskRequest
+  request: CreateTaskRequest,
 ): Promise<{ id: string; status: string }> {
   return apiPost("/api/task", request, "Failed to create task");
 }
@@ -185,7 +192,7 @@ export async function stopTask(id: string): Promise<void> {
 // Stream task progress (SSE)
 export function streamTask(
   id: string,
-  onEvent: (event: { type: string; data: unknown }) => void
+  onEvent: (event: { type: string; data: unknown }) => void,
 ): () => void {
   const controller = new AbortController();
   const decoder = new TextDecoder();
@@ -275,9 +282,12 @@ export function streamTask(
 // List runs
 export async function listRuns(
   limit = 20,
-  offset = 0
+  offset = 0,
 ): Promise<{ runs: Run[]; limit: number; offset: number }> {
-  return apiGet(`/api/runs?limit=${limit}&offset=${offset}`, "Failed to fetch runs");
+  return apiGet(
+    `/api/runs?limit=${limit}&offset=${offset}`,
+    "Failed to fetch runs",
+  );
 }
 
 // Get run details
@@ -288,7 +298,7 @@ export async function getRun(id: string): Promise<Run> {
 // Get run events
 export async function getRunEvents(
   id: string,
-  limit?: number
+  limit?: number,
 ): Promise<{ run_id: string; events: unknown[] }> {
   const url = limit
     ? `/api/runs/${id}/events?limit=${limit}`
@@ -298,7 +308,7 @@ export async function getRunEvents(
 
 // Get run tasks
 export async function getRunTasks(
-  id: string
+  id: string,
 ): Promise<{ run_id: string; tasks: unknown[] }> {
   return apiGet(`/api/runs/${id}/tasks`, "Failed to fetch run tasks");
 }
@@ -328,7 +338,13 @@ export type ControlAgentEvent =
       queue_len: number;
       mission_id?: string;
     }
-  | { type: "user_message"; id: string; content: string; mission_id?: string; queued?: boolean }
+  | {
+      type: "user_message";
+      id: string;
+      content: string;
+      mission_id?: string;
+      queued?: boolean;
+    }
   | {
       type: "assistant_message";
       id: string;
@@ -401,7 +417,7 @@ export type ControlAgentEvent =
 
 export async function postControlMessage(
   content: string,
-  options?: { agent?: string; mission_id?: string; client_message_id?: string }
+  options?: { agent?: string; mission_id?: string; client_message_id?: string },
 ): Promise<{ id: string; queued: boolean }> {
   const body: {
     content: string;
@@ -432,11 +448,19 @@ export async function postControlToolResult(payload: {
   name: string;
   result: unknown;
 }): Promise<void> {
-  return apiPost("/api/control/tool_result", payload, "Failed to post tool result");
+  return apiPost(
+    "/api/control/tool_result",
+    payload,
+    "Failed to post tool result",
+  );
 }
 
 export async function cancelControl(): Promise<void> {
-  return apiPost("/api/control/cancel", undefined, "Failed to cancel control session");
+  return apiPost(
+    "/api/control/cancel",
+    undefined,
+    "Failed to cancel control session",
+  );
 }
 
 // Queue management
@@ -452,7 +476,10 @@ export async function getQueue(): Promise<QueuedMessage[]> {
 }
 
 export async function removeFromQueue(messageId: string): Promise<void> {
-  return apiDel(`/api/control/queue/${messageId}`, "Failed to remove from queue");
+  return apiDel(
+    `/api/control/queue/${messageId}`,
+    "Failed to remove from queue",
+  );
 }
 
 export async function clearQueue(): Promise<{ cleared: number }> {
@@ -475,9 +502,12 @@ export interface AgentTreeNode {
 
 // Get tree for a specific mission (either live from memory or saved from database)
 export async function getMissionTree(
-  missionId: string
+  missionId: string,
 ): Promise<AgentTreeNode | null> {
-  return apiGet(`/api/control/missions/${missionId}/tree`, "Failed to fetch mission tree");
+  return apiGet(
+    `/api/control/missions/${missionId}/tree`,
+    "Failed to fetch mission tree",
+  );
 }
 
 // Execution progress
@@ -492,7 +522,13 @@ export async function getProgress(): Promise<ExecutionProgress> {
   return apiGet("/api/control/progress", "Failed to fetch progress");
 }
 
-export type StreamDiagnosticPhase = "connecting" | "open" | "chunk" | "event" | "closed" | "error";
+export type StreamDiagnosticPhase =
+  | "connecting"
+  | "open"
+  | "chunk"
+  | "event"
+  | "closed"
+  | "error";
 
 export type StreamDiagnosticUpdate = {
   phase: StreamDiagnosticPhase;
@@ -510,12 +546,13 @@ export type StreamControlOptions = {
    * the user can see. */
   missionId?: string;
   sinceSeq?: number;
+  preferWebSocket?: boolean;
 };
 
 export function streamControl(
   onEvent: (event: { type: string; data: unknown }) => void,
   onDiagnostics?: (update: StreamDiagnosticUpdate) => void,
-  options?: StreamControlOptions
+  options?: StreamControlOptions,
 ): () => void {
   const controller = new AbortController();
   const decoder = new TextDecoder();
@@ -549,145 +586,145 @@ export function streamControl(
     if (sseStarted || controller.signal.aborted) return;
     sseStarted = true;
     void (async () => {
-    try {
-      const res = await apiFetch(streamUrl, {
-        method: "GET",
-        headers: { Accept: "text/event-stream" },
-        signal: controller.signal,
-      });
+      try {
+        const res = await apiFetch(streamUrl, {
+          method: "GET",
+          headers: { Accept: "text/event-stream" },
+          signal: controller.signal,
+        });
 
-      if (!res.ok) {
-        onEvent({
-          type: "error",
-          data: {
-            message: `Stream request failed (${res.status})`,
+        if (!res.ok) {
+          onEvent({
+            type: "error",
+            data: {
+              message: `Stream request failed (${res.status})`,
+              status: res.status,
+            },
+          });
+          onDiagnostics?.({
+            phase: "error",
+            url: streamUrl,
             status: res.status,
-          },
+            error: `Stream request failed (${res.status})`,
+            timestamp: Date.now(),
+          });
+          return;
+        }
+        if (!res.body) {
+          onEvent({
+            type: "error",
+            data: { message: "Stream response had no body" },
+          });
+          onDiagnostics?.({
+            phase: "error",
+            url: streamUrl,
+            status: res.status,
+            error: "Stream response had no body",
+            timestamp: Date.now(),
+          });
+          return;
+        }
+
+        const headers: Record<string, string> = {};
+        res.headers.forEach((value, key) => {
+          headers[key.toLowerCase()] = value;
         });
         onDiagnostics?.({
-          phase: "error",
+          phase: "open",
           url: streamUrl,
           status: res.status,
-          error: `Stream request failed (${res.status})`,
+          headers,
           timestamp: Date.now(),
         });
-        return;
-      }
-      if (!res.body) {
+
+        const reader = res.body.getReader();
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) {
+            bytesRead += value.length;
+          }
+          const chunk = decoder.decode(value, { stream: true });
+          if (buffer.endsWith("\r") && chunk.startsWith("\n")) {
+            buffer = buffer.slice(0, -1);
+          }
+          buffer += chunk;
+          if (buffer.includes("\r")) {
+            buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          }
+          onDiagnostics?.({
+            phase: "chunk",
+            url: streamUrl,
+            bytes: bytesRead,
+            timestamp: Date.now(),
+          });
+
+          let idx = buffer.indexOf("\n\n");
+          while (idx !== -1) {
+            const raw = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            idx = buffer.indexOf("\n\n");
+
+            let eventType = "message";
+            let data = "";
+            for (const line of raw.split("\n")) {
+              if (line.startsWith("event:")) {
+                eventType = line.slice("event:".length).trim();
+              } else if (line.startsWith("data:")) {
+                data += line.slice("data:".length).trim();
+              }
+              // SSE comments (lines starting with :) are ignored for keepalive
+            }
+
+            if (!data) continue;
+            try {
+              onEvent({ type: eventType, data: JSON.parse(data) });
+              onDiagnostics?.({
+                phase: "event",
+                url: streamUrl,
+                bytes: bytesRead,
+                timestamp: Date.now(),
+              });
+            } catch {
+              // ignore parse errors
+            }
+          }
+        }
+
+        // Stream ended normally (server closed connection)
         onEvent({
           type: "error",
-          data: { message: "Stream response had no body" },
+          data: { message: "Stream ended - server closed connection" },
         });
         onDiagnostics?.({
-          phase: "error",
-          url: streamUrl,
-          status: res.status,
-          error: "Stream response had no body",
-          timestamp: Date.now(),
-        });
-        return;
-      }
-
-      const headers: Record<string, string> = {};
-      res.headers.forEach((value, key) => {
-        headers[key.toLowerCase()] = value;
-      });
-      onDiagnostics?.({
-        phase: "open",
-        url: streamUrl,
-        status: res.status,
-        headers,
-        timestamp: Date.now(),
-      });
-
-      const reader = res.body.getReader();
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (value) {
-          bytesRead += value.length;
-        }
-        const chunk = decoder.decode(value, { stream: true });
-        if (buffer.endsWith("\r") && chunk.startsWith("\n")) {
-          buffer = buffer.slice(0, -1);
-        }
-        buffer += chunk;
-        if (buffer.includes("\r")) {
-          buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-        }
-        onDiagnostics?.({
-          phase: "chunk",
+          phase: "closed",
           url: streamUrl,
           bytes: bytesRead,
           timestamp: Date.now(),
         });
-
-        let idx = buffer.indexOf("\n\n");
-        while (idx !== -1) {
-          const raw = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + 2);
-          idx = buffer.indexOf("\n\n");
-
-          let eventType = "message";
-          let data = "";
-          for (const line of raw.split("\n")) {
-            if (line.startsWith("event:")) {
-              eventType = line.slice("event:".length).trim();
-            } else if (line.startsWith("data:")) {
-              data += line.slice("data:".length).trim();
-            }
-            // SSE comments (lines starting with :) are ignored for keepalive
-          }
-
-          if (!data) continue;
-          try {
-            onEvent({ type: eventType, data: JSON.parse(data) });
-            onDiagnostics?.({
-              phase: "event",
-              url: streamUrl,
-              bytes: bytesRead,
-              timestamp: Date.now(),
-            });
-          } catch {
-            // ignore parse errors
-          }
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          // Provide more specific error messages
+          const errorMessage =
+            err instanceof Error
+              ? `Stream connection failed: ${err.message}`
+              : "Stream connection failed";
+          onEvent({
+            type: "error",
+            data: { message: errorMessage },
+          });
+          onDiagnostics?.({
+            phase: "error",
+            url: streamUrl,
+            error: errorMessage,
+            timestamp: Date.now(),
+          });
         }
       }
-
-      // Stream ended normally (server closed connection)
-      onEvent({
-        type: "error",
-        data: { message: "Stream ended - server closed connection" },
-      });
-      onDiagnostics?.({
-        phase: "closed",
-        url: streamUrl,
-        bytes: bytesRead,
-        timestamp: Date.now(),
-      });
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        // Provide more specific error messages
-        const errorMessage =
-          err instanceof Error
-            ? `Stream connection failed: ${err.message}`
-            : "Stream connection failed";
-        onEvent({
-          type: "error",
-          data: { message: errorMessage },
-        });
-        onDiagnostics?.({
-          phase: "error",
-          url: streamUrl,
-          error: errorMessage,
-          timestamp: Date.now(),
-        });
-      }
-    }
     })();
   };
 
-  if (typeof WebSocket !== "undefined") {
+  if (options?.preferWebSocket && typeof WebSocket !== "undefined") {
     try {
       onDiagnostics?.({
         phase: "connecting",
@@ -781,7 +818,12 @@ export function streamControl(
 
 // ==================== MCP Management ====================
 
-export type McpStatus = "connected" | "connecting" | "disconnected" | "error" | "disabled";
+export type McpStatus =
+  | "connected"
+  | "connecting"
+  | "disconnected"
+  | "error"
+  | "disabled";
 export type McpScope = "global" | "workspace";
 
 export interface McpTransport {
@@ -813,7 +855,10 @@ export interface McpServerState extends McpServerConfig {
 export interface ToolInfo {
   name: string;
   description: string;
-  source: "builtin" | { mcp: { id: string; name: string } } | { plugin: { id: string; name: string } };
+  source:
+    | "builtin"
+    | { mcp: { id: string; name: string } }
+    | { plugin: { id: string; name: string } };
   enabled: boolean;
 }
 
@@ -866,7 +911,10 @@ export interface UpdateMcpRequest {
   scope?: McpScope;
 }
 
-export async function updateMcp(id: string, data: UpdateMcpRequest): Promise<McpServerState> {
+export async function updateMcp(
+  id: string,
+  data: UpdateMcpRequest,
+): Promise<McpServerState> {
   return apiPatch(`/api/mcp/${id}`, data, "Failed to update MCP");
 }
 
@@ -883,9 +931,13 @@ export async function listTools(): Promise<ToolInfo[]> {
 // Toggle a tool
 export async function toggleTool(
   name: string,
-  enabled: boolean
+  enabled: boolean,
 ): Promise<void> {
-  return apiPost(`/api/tools/${encodeURIComponent(name)}/toggle`, { enabled }, "Failed to toggle tool");
+  return apiPost(
+    `/api/tools/${encodeURIComponent(name)}/toggle`,
+    { enabled },
+    "Failed to toggle tool",
+  );
 }
 
 // ==================== File System ====================
@@ -908,7 +960,7 @@ export function uploadFile(
   remotePath: string = "./context/",
   onProgress?: (progress: UploadProgress) => void,
   workspaceId?: string,
-  missionId?: string
+  missionId?: string,
 ): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -920,7 +972,7 @@ export function uploadFile(
       params.append("mission_id", missionId);
     }
     const url = apiUrl(`/api/fs/upload?${params}`);
-    
+
     // Track upload progress
     xhr.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable && onProgress) {
@@ -931,7 +983,7 @@ export function uploadFile(
         });
       }
     });
-    
+
     xhr.addEventListener("load", () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
@@ -940,26 +992,28 @@ export function uploadFile(
           reject(new Error("Invalid response from server"));
         }
       } else {
-        reject(new Error(`Upload failed: ${xhr.responseText || xhr.statusText}`));
+        reject(
+          new Error(`Upload failed: ${xhr.responseText || xhr.statusText}`),
+        );
       }
     });
-    
+
     xhr.addEventListener("error", () => {
       reject(new Error("Network error during upload"));
     });
-    
+
     xhr.addEventListener("abort", () => {
       reject(new Error("Upload cancelled"));
     });
-    
+
     xhr.open("POST", url);
-    
+
     // Add auth header using the same method as other API calls
     const headers = authHeader();
     if (headers.Authorization) {
       xhr.setRequestHeader("Authorization", headers.Authorization);
     }
-    
+
     const formData = new FormData();
     formData.append("file", file);
     xhr.send(formData);
@@ -979,18 +1033,27 @@ export async function uploadFileChunked(
   remotePath: string = "./context/",
   onProgress?: (progress: ChunkedUploadProgress) => void,
   workspaceId?: string,
-  missionId?: string
+  missionId?: string,
 ): Promise<UploadResult> {
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   const uploadId = `${file.name}-${file.size}-${Date.now()}`;
 
   // For small files, use regular upload
   if (totalChunks <= 1) {
-    return uploadFile(file, remotePath, onProgress ? (p) => onProgress({
-      ...p,
-      chunkIndex: 0,
-      totalChunks: 1,
-    }) : undefined, workspaceId, missionId);
+    return uploadFile(
+      file,
+      remotePath,
+      onProgress
+        ? (p) =>
+            onProgress({
+              ...p,
+              chunkIndex: 0,
+              totalChunks: 1,
+            })
+        : undefined,
+      workspaceId,
+      missionId,
+    );
   }
 
   let uploadedBytes = 0;
@@ -1006,7 +1069,14 @@ export async function uploadFileChunked(
     let retries = 3;
     while (retries > 0) {
       try {
-        await uploadChunk(chunkFile, remotePath, uploadId, i, totalChunks, workspaceId);
+        await uploadChunk(
+          chunkFile,
+          remotePath,
+          uploadId,
+          i,
+          totalChunks,
+          workspaceId,
+        );
         uploadedBytes += chunk.size;
 
         if (onProgress) {
@@ -1022,13 +1092,20 @@ export async function uploadFileChunked(
       } catch (err) {
         retries--;
         if (retries === 0) throw err;
-        await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+        await new Promise((r) => setTimeout(r, 1000)); // Wait 1s before retry
       }
     }
   }
 
   // Finalize the upload
-  return finalizeChunkedUpload(remotePath, uploadId, file.name, totalChunks, workspaceId, missionId);
+  return finalizeChunkedUpload(
+    remotePath,
+    uploadId,
+    file.name,
+    totalChunks,
+    workspaceId,
+    missionId,
+  );
 }
 
 async function uploadChunk(
@@ -1037,7 +1114,7 @@ async function uploadChunk(
   uploadId: string,
   chunkIndex: number,
   totalChunks: number,
-  workspaceId?: string
+  workspaceId?: string,
 ): Promise<void> {
   const formData = new FormData();
   formData.append("file", chunk);
@@ -1069,7 +1146,7 @@ async function finalizeChunkedUpload(
   fileName: string,
   totalChunks: number,
   workspaceId?: string,
-  missionId?: string
+  missionId?: string,
 ): Promise<UploadResult> {
   const body: Record<string, unknown> = {
     path: remotePath,
@@ -1270,18 +1347,30 @@ export async function syncLibrary(): Promise<void> {
 // Force sync (reset local to remote)
 // Use this when histories have diverged after a force push
 export async function forceSyncLibrary(): Promise<void> {
-  return libPost("/api/library/force-sync", undefined, "Failed to force sync library");
+  return libPost(
+    "/api/library/force-sync",
+    undefined,
+    "Failed to force sync library",
+  );
 }
 
 // Force push (overwrite remote with local)
 // Use this when you want to keep local changes and overwrite remote
 export async function forcePushLibrary(): Promise<void> {
-  return libPost("/api/library/force-push", undefined, "Failed to force push library");
+  return libPost(
+    "/api/library/force-push",
+    undefined,
+    "Failed to force push library",
+  );
 }
 
 // Commit changes
 export async function commitLibrary(message: string): Promise<void> {
-  return libPost("/api/library/commit", { message }, "Failed to commit library");
+  return libPost(
+    "/api/library/commit",
+    { message },
+    "Failed to commit library",
+  );
 }
 
 // Push changes
@@ -1296,7 +1385,7 @@ export async function getLibraryMcps(): Promise<Record<string, McpServerDef>> {
 
 // Save MCP servers
 export async function saveLibraryMcps(
-  servers: Record<string, McpServerDef>
+  servers: Record<string, McpServerDef>,
 ): Promise<void> {
   return libPut("/api/library/mcps", servers, "Failed to save MCPs");
 }
@@ -1308,29 +1397,39 @@ export async function listLibrarySkills(): Promise<SkillSummary[]> {
 
 // Get skill
 export async function getLibrarySkill(name: string): Promise<Skill> {
-  return libGet(`/api/library/skills/${encodeURIComponent(name)}`, "Failed to fetch skill");
+  return libGet(
+    `/api/library/skills/${encodeURIComponent(name)}`,
+    "Failed to fetch skill",
+  );
 }
 
 // Save skill
 export async function saveLibrarySkill(
   name: string,
-  content: string
+  content: string,
 ): Promise<void> {
-  return libPut(`/api/library/skills/${encodeURIComponent(name)}`, { content }, "Failed to save skill");
+  return libPut(
+    `/api/library/skills/${encodeURIComponent(name)}`,
+    { content },
+    "Failed to save skill",
+  );
 }
 
 // Delete skill
 export async function deleteLibrarySkill(name: string): Promise<void> {
-  return libDel(`/api/library/skills/${encodeURIComponent(name)}`, "Failed to delete skill");
+  return libDel(
+    `/api/library/skills/${encodeURIComponent(name)}`,
+    "Failed to delete skill",
+  );
 }
 
 // Get skill reference file (returns text, not JSON)
 export async function getSkillReference(
   skillName: string,
-  refPath: string
+  refPath: string,
 ): Promise<string> {
   const res = await apiFetch(
-    `/api/library/skills/${encodeURIComponent(skillName)}/references/${refPath}`
+    `/api/library/skills/${encodeURIComponent(skillName)}/references/${refPath}`,
   );
   await ensureLibraryResponse(res, "Failed to fetch reference file");
   return res.text();
@@ -1340,7 +1439,7 @@ export async function getSkillReference(
 export async function saveSkillReference(
   skillName: string,
   refPath: string,
-  content: string
+  content: string,
 ): Promise<void> {
   return libPut(
     `/api/library/skills/${encodeURIComponent(skillName)}/references/${refPath}`,
@@ -1352,7 +1451,7 @@ export async function saveSkillReference(
 // Delete skill reference file
 export async function deleteSkillReference(
   skillName: string,
-  refPath: string
+  refPath: string,
 ): Promise<void> {
   return libDel(
     `/api/library/skills/${encodeURIComponent(skillName)}/references/${refPath}`,
@@ -1365,10 +1464,13 @@ export async function importSkill(name: string, file: File): Promise<Skill> {
   const formData = new FormData();
   formData.append("file", file);
 
-  const res = await apiFetch(`/api/library/skills/import?name=${encodeURIComponent(name)}`, {
-    method: "POST",
-    body: formData,
-  });
+  const res = await apiFetch(
+    `/api/library/skills/import?name=${encodeURIComponent(name)}`,
+    {
+      method: "POST",
+      body: formData,
+    },
+  );
 
   if (!res.ok) {
     const text = await res.text();
@@ -1380,17 +1482,19 @@ export async function importSkill(name: string, file: File): Promise<Skill> {
 
 // Skills Registry (skills.sh) API
 
-export async function searchSkillsRegistry(query: string): Promise<RegistrySkillListing[]> {
+export async function searchSkillsRegistry(
+  query: string,
+): Promise<RegistrySkillListing[]> {
   return libGet(
     `/api/library/skill/registry/search?q=${encodeURIComponent(query)}`,
-    "Failed to search skills registry"
+    "Failed to search skills registry",
   );
 }
 
 export async function listRepoSkills(identifier: string): Promise<string[]> {
   return libGet(
     `/api/library/skill/registry/list/${encodeURIComponent(identifier)}`,
-    "Failed to list repo skills"
+    "Failed to list repo skills",
   );
 }
 
@@ -1400,12 +1504,21 @@ export interface InstallFromRegistryRequest {
   name?: string;
 }
 
-export async function installFromRegistry(request: InstallFromRegistryRequest): Promise<Skill> {
-  return libPost("/api/library/skill/registry/install", request, "Failed to install from registry");
+export async function installFromRegistry(
+  request: InstallFromRegistryRequest,
+): Promise<Skill> {
+  return libPost(
+    "/api/library/skill/registry/install",
+    request,
+    "Failed to install from registry",
+  );
 }
 
 // Validate skill name (matches backend pattern)
-export function validateSkillName(name: string): { valid: boolean; error?: string } {
+export function validateSkillName(name: string): {
+  valid: boolean;
+  error?: string;
+} {
   if (!name || name.length === 0) {
     return { valid: false, error: "Name cannot be empty" };
   }
@@ -1419,7 +1532,10 @@ export function validateSkillName(name: string): { valid: boolean; error?: strin
     return { valid: false, error: "Name cannot contain consecutive hyphens" };
   }
   if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name)) {
-    return { valid: false, error: "Name must be lowercase alphanumeric with single hyphens" };
+    return {
+      valid: false,
+      error: "Name must be lowercase alphanumeric with single hyphens",
+    };
   }
   return { valid: true };
 }
@@ -1454,20 +1570,30 @@ export async function getBuiltinCommands(): Promise<BuiltinCommandsResponse> {
 
 // Get command
 export async function getLibraryCommand(name: string): Promise<Command> {
-  return libGet(`/api/library/commands/${encodeURIComponent(name)}`, "Failed to fetch command");
+  return libGet(
+    `/api/library/commands/${encodeURIComponent(name)}`,
+    "Failed to fetch command",
+  );
 }
 
 // Save command
 export async function saveLibraryCommand(
   name: string,
-  content: string
+  content: string,
 ): Promise<void> {
-  return libPut(`/api/library/commands/${encodeURIComponent(name)}`, { content }, "Failed to save command");
+  return libPut(
+    `/api/library/commands/${encodeURIComponent(name)}`,
+    { content },
+    "Failed to save command",
+  );
 }
 
 // Delete command
 export async function deleteLibraryCommand(name: string): Promise<void> {
-  return libDel(`/api/library/commands/${encodeURIComponent(name)}`, "Failed to delete command");
+  return libDel(
+    `/api/library/commands/${encodeURIComponent(name)}`,
+    "Failed to delete command",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1481,20 +1607,30 @@ export async function listLibraryAgents(): Promise<LibraryAgentSummary[]> {
 
 // Get library agent
 export async function getLibraryAgent(name: string): Promise<LibraryAgent> {
-  return libGet(`/api/library/agent/${encodeURIComponent(name)}`, "Failed to fetch library agent");
+  return libGet(
+    `/api/library/agent/${encodeURIComponent(name)}`,
+    "Failed to fetch library agent",
+  );
 }
 
 // Save library agent
 export async function saveLibraryAgent(
   name: string,
-  agent: LibraryAgent
+  agent: LibraryAgent,
 ): Promise<void> {
-  return libPut(`/api/library/agent/${encodeURIComponent(name)}`, agent, "Failed to save library agent");
+  return libPut(
+    `/api/library/agent/${encodeURIComponent(name)}`,
+    agent,
+    "Failed to save library agent",
+  );
 }
 
 // Delete library agent
 export async function deleteLibraryAgent(name: string): Promise<void> {
-  return libDel(`/api/library/agent/${encodeURIComponent(name)}`, "Failed to delete library agent");
+  return libDel(
+    `/api/library/agent/${encodeURIComponent(name)}`,
+    "Failed to delete library agent",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1527,12 +1663,22 @@ export interface WorkspaceTemplate {
   config_profile?: string;
 }
 
-export async function listWorkspaceTemplates(): Promise<WorkspaceTemplateSummary[]> {
-  return libGet("/api/library/workspace-template", "Failed to fetch workspace templates");
+export async function listWorkspaceTemplates(): Promise<
+  WorkspaceTemplateSummary[]
+> {
+  return libGet(
+    "/api/library/workspace-template",
+    "Failed to fetch workspace templates",
+  );
 }
 
-export async function getWorkspaceTemplate(name: string): Promise<WorkspaceTemplate> {
-  return libGet(`/api/library/workspace-template/${encodeURIComponent(name)}`, "Failed to fetch workspace template");
+export async function getWorkspaceTemplate(
+  name: string,
+): Promise<WorkspaceTemplate> {
+  return libGet(
+    `/api/library/workspace-template/${encodeURIComponent(name)}`,
+    "Failed to fetch workspace template",
+  );
 }
 
 export async function saveWorkspaceTemplate(
@@ -1548,16 +1694,26 @@ export async function saveWorkspaceTemplate(
     shared_network?: boolean | null;
     tailscale_mode?: TailscaleMode | null;
     config_profile?: string;
-  }
+  },
 ): Promise<void> {
-  return libPut(`/api/library/workspace-template/${encodeURIComponent(name)}`, data, "Failed to save workspace template");
+  return libPut(
+    `/api/library/workspace-template/${encodeURIComponent(name)}`,
+    data,
+    "Failed to save workspace template",
+  );
 }
 
 export async function deleteWorkspaceTemplate(name: string): Promise<void> {
-  return libDel(`/api/library/workspace-template/${encodeURIComponent(name)}`, "Failed to delete workspace template");
+  return libDel(
+    `/api/library/workspace-template/${encodeURIComponent(name)}`,
+    "Failed to delete workspace template",
+  );
 }
 
-export async function renameWorkspaceTemplate(oldName: string, newName: string): Promise<void> {
+export async function renameWorkspaceTemplate(
+  oldName: string,
+  newName: string,
+): Promise<void> {
   // Get the existing template
   const template = await getWorkspaceTemplate(oldName);
   // Save with new name
@@ -1596,15 +1752,28 @@ export async function listInitScripts(): Promise<InitScriptSummary[]> {
 }
 
 export async function getInitScript(name: string): Promise<InitScript> {
-  return libGet(`/api/library/init-script/${encodeURIComponent(name)}`, "Failed to fetch init script");
+  return libGet(
+    `/api/library/init-script/${encodeURIComponent(name)}`,
+    "Failed to fetch init script",
+  );
 }
 
-export async function saveInitScript(name: string, content: string): Promise<void> {
-  return libPut(`/api/library/init-script/${encodeURIComponent(name)}`, { content }, "Failed to save init script");
+export async function saveInitScript(
+  name: string,
+  content: string,
+): Promise<void> {
+  return libPut(
+    `/api/library/init-script/${encodeURIComponent(name)}`,
+    { content },
+    "Failed to save init script",
+  );
 }
 
 export async function deleteInitScript(name: string): Promise<void> {
-  return libDel(`/api/library/init-script/${encodeURIComponent(name)}`, "Failed to delete init script");
+  return libDel(
+    `/api/library/init-script/${encodeURIComponent(name)}`,
+    "Failed to delete init script",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1646,7 +1815,7 @@ export async function renameLibraryItem(
   itemType: LibraryItemType,
   oldName: string,
   newName: string,
-  dryRun: boolean = false
+  dryRun: boolean = false,
 ): Promise<RenameResult> {
   return libPost(
     `/api/library/rename/${itemType}/${encodeURIComponent(oldName)}`,
@@ -1661,7 +1830,11 @@ export async function renameLibraryItem(
 
 // Migrate library structure to new format
 export async function migrateLibrary(): Promise<MigrationReport> {
-  return libPost("/api/library/migrate", undefined, "Failed to migrate library");
+  return libPost(
+    "/api/library/migrate",
+    undefined,
+    "Failed to migrate library",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1688,12 +1861,20 @@ export interface TestConnectionResponse {
 
 // List all OpenCode connections
 export async function listOpenCodeConnections(): Promise<OpenCodeConnection[]> {
-  return apiGet("/api/opencode/connections", "Failed to list OpenCode connections");
+  return apiGet(
+    "/api/opencode/connections",
+    "Failed to list OpenCode connections",
+  );
 }
 
 // Get connection by ID
-export async function getOpenCodeConnection(id: string): Promise<OpenCodeConnection> {
-  return apiGet(`/api/opencode/connections/${id}`, "Failed to get OpenCode connection");
+export async function getOpenCodeConnection(
+  id: string,
+): Promise<OpenCodeConnection> {
+  return apiGet(
+    `/api/opencode/connections/${id}`,
+    "Failed to get OpenCode connection",
+  );
 }
 
 // Create new connection
@@ -1704,7 +1885,11 @@ export async function createOpenCodeConnection(data: {
   permissive?: boolean;
   enabled?: boolean;
 }): Promise<OpenCodeConnection> {
-  return apiPost("/api/opencode/connections", data, "Failed to create OpenCode connection");
+  return apiPost(
+    "/api/opencode/connections",
+    data,
+    "Failed to create OpenCode connection",
+  );
 }
 
 // Update connection
@@ -1716,24 +1901,43 @@ export async function updateOpenCodeConnection(
     agent?: string | null;
     permissive?: boolean;
     enabled?: boolean;
-  }
+  },
 ): Promise<OpenCodeConnection> {
-  return apiPut(`/api/opencode/connections/${id}`, data, "Failed to update OpenCode connection");
+  return apiPut(
+    `/api/opencode/connections/${id}`,
+    data,
+    "Failed to update OpenCode connection",
+  );
 }
 
 // Delete connection
 export async function deleteOpenCodeConnection(id: string): Promise<void> {
-  return apiDel(`/api/opencode/connections/${id}`, "Failed to delete OpenCode connection");
+  return apiDel(
+    `/api/opencode/connections/${id}`,
+    "Failed to delete OpenCode connection",
+  );
 }
 
 // Test connection
-export async function testOpenCodeConnection(id: string): Promise<TestConnectionResponse> {
-  return apiPost(`/api/opencode/connections/${id}/test`, undefined, "Failed to test OpenCode connection");
+export async function testOpenCodeConnection(
+  id: string,
+): Promise<TestConnectionResponse> {
+  return apiPost(
+    `/api/opencode/connections/${id}/test`,
+    undefined,
+    "Failed to test OpenCode connection",
+  );
 }
 
 // Set default connection
-export async function setDefaultOpenCodeConnection(id: string): Promise<OpenCodeConnection> {
-  return apiPost(`/api/opencode/connections/${id}/default`, undefined, "Failed to set default OpenCode connection");
+export async function setDefaultOpenCodeConnection(
+  id: string,
+): Promise<OpenCodeConnection> {
+  return apiPost(
+    `/api/opencode/connections/${id}/default`,
+    undefined,
+    "Failed to set default OpenCode connection",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1746,8 +1950,14 @@ export async function getOpenCodeSettings(): Promise<Record<string, unknown>> {
 }
 
 // Update OpenCode settings (oh-my-opencode.json)
-export async function updateOpenCodeSettings(settings: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return apiPut("/api/opencode/settings", settings, "Failed to update OpenCode settings");
+export async function updateOpenCodeSettings(
+  settings: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  return apiPut(
+    "/api/opencode/settings",
+    settings,
+    "Failed to update OpenCode settings",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1760,27 +1970,49 @@ export async function getOpenCodeConfig(): Promise<Record<string, unknown>> {
 }
 
 // Update OpenCode config (opencode.json)
-export async function updateOpenCodeConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return apiPut("/api/opencode/config", config, "Failed to update OpenCode config");
+export async function updateOpenCodeConfig(
+  config: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  return apiPut(
+    "/api/opencode/config",
+    config,
+    "Failed to update OpenCode config",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Claude Code Host Config API
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function getClaudeCodeHostConfig(): Promise<Record<string, unknown>> {
-  return apiGet("/api/claudecode/config", "Failed to get Claude Code host config");
+export async function getClaudeCodeHostConfig(): Promise<
+  Record<string, unknown>
+> {
+  return apiGet(
+    "/api/claudecode/config",
+    "Failed to get Claude Code host config",
+  );
 }
 
 export async function updateClaudeCodeHostConfig(
-  config: Record<string, unknown>
+  config: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  return apiPut("/api/claudecode/config", config, "Failed to update Claude Code host config");
+  return apiPut(
+    "/api/claudecode/config",
+    config,
+    "Failed to update Claude Code host config",
+  );
 }
 
 // Restart OpenCode service (to apply settings changes)
-export async function restartOpenCodeService(): Promise<{ success: boolean; message: string }> {
-  return apiPost("/api/opencode/restart", undefined, "Failed to restart OpenCode service");
+export async function restartOpenCodeService(): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  return apiPost(
+    "/api/opencode/restart",
+    undefined,
+    "Failed to restart OpenCode service",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1788,13 +2020,24 @@ export async function restartOpenCodeService(): Promise<{ success: boolean; mess
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Get OpenCode settings from Library (oh-my-opencode.json)
-export async function getLibraryOpenCodeSettings(): Promise<Record<string, unknown>> {
-  return apiGet("/api/library/opencode/settings", "Failed to get Library OpenCode settings");
+export async function getLibraryOpenCodeSettings(): Promise<
+  Record<string, unknown>
+> {
+  return apiGet(
+    "/api/library/opencode/settings",
+    "Failed to get Library OpenCode settings",
+  );
 }
 
 // Save OpenCode settings to Library and sync to system
-export async function saveLibraryOpenCodeSettings(settings: Record<string, unknown>): Promise<void> {
-  return apiPut("/api/library/opencode/settings", settings, "Failed to save Library OpenCode settings");
+export async function saveLibraryOpenCodeSettings(
+  settings: Record<string, unknown>,
+): Promise<void> {
+  return apiPut(
+    "/api/library/opencode/settings",
+    settings,
+    "Failed to save Library OpenCode settings",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1809,7 +2052,10 @@ export interface SandboxedConfig {
 // Get sandboxed.sh config from Library
 export async function getSandboxedConfig(): Promise<SandboxedConfig> {
   try {
-    return await apiGet("/api/library/sandboxed-sh/config", "Failed to get sandboxed.sh config");
+    return await apiGet(
+      "/api/library/sandboxed-sh/config",
+      "Failed to get sandboxed.sh config",
+    );
   } catch {
     // Return default config if endpoint doesn't exist (not yet implemented)
     return { hidden_agents: [], default_agent: null };
@@ -1817,14 +2063,23 @@ export async function getSandboxedConfig(): Promise<SandboxedConfig> {
 }
 
 // Save sandboxed.sh config to Library
-export async function saveSandboxedConfig(config: SandboxedConfig): Promise<void> {
-  return apiPut("/api/library/sandboxed-sh/config", config, "Failed to save sandboxed.sh config");
+export async function saveSandboxedConfig(
+  config: SandboxedConfig,
+): Promise<void> {
+  return apiPut(
+    "/api/library/sandboxed-sh/config",
+    config,
+    "Failed to save sandboxed.sh config",
+  );
 }
 
 // Get visible agents (filtered by sandboxed.sh config)
 export async function getVisibleAgents(): Promise<unknown> {
   try {
-    return await apiGet("/api/library/sandboxed-sh/agents", "Failed to get visible agents");
+    return await apiGet(
+      "/api/library/sandboxed-sh/agents",
+      "Failed to get visible agents",
+    );
   } catch {
     // Return empty array if endpoint doesn't exist (not yet implemented)
     return [];
@@ -1840,14 +2095,21 @@ export interface ClaudeCodeConfig {
 
 // Get Claude Code config from Library
 export async function getClaudeCodeConfig(): Promise<ClaudeCodeConfig> {
-  return apiGet("/api/library/claudecode/config", "Failed to get Claude Code config");
+  return apiGet(
+    "/api/library/claudecode/config",
+    "Failed to get Claude Code config",
+  );
 }
 
 // Save Claude Code config to Library
 export async function saveClaudeCodeConfig(
-  config: ClaudeCodeConfig
+  config: ClaudeCodeConfig,
 ): Promise<void> {
-  return apiPut("/api/library/claudecode/config", config, "Failed to save Claude Code config");
+  return apiPut(
+    "/api/library/claudecode/config",
+    config,
+    "Failed to save Claude Code config",
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1877,62 +2139,82 @@ export interface ConfigProfile {
 
 // List all config profiles
 export async function listConfigProfiles(): Promise<ConfigProfileSummary[]> {
-  return apiGet("/api/library/config-profile", "Failed to list config profiles");
+  return apiGet(
+    "/api/library/config-profile",
+    "Failed to list config profiles",
+  );
 }
 
 // Create a new config profile
 export async function createConfigProfile(
   name: string,
-  baseProfile?: string
+  baseProfile?: string,
 ): Promise<ConfigProfile> {
   return apiPost(
     "/api/library/config-profile",
     { name, base_profile: baseProfile },
-    "Failed to create config profile"
+    "Failed to create config profile",
   );
 }
 
 // Get a config profile by name
 export async function getConfigProfile(name: string): Promise<ConfigProfile> {
-  return apiGet(`/api/library/config-profile/${encodeURIComponent(name)}`, "Failed to get config profile");
+  return apiGet(
+    `/api/library/config-profile/${encodeURIComponent(name)}`,
+    "Failed to get config profile",
+  );
 }
 
 // Save a config profile
-export async function saveConfigProfile(name: string, profile: ConfigProfile): Promise<void> {
-  return apiPut(`/api/library/config-profile/${encodeURIComponent(name)}`, profile, "Failed to save config profile");
+export async function saveConfigProfile(
+  name: string,
+  profile: ConfigProfile,
+): Promise<void> {
+  return apiPut(
+    `/api/library/config-profile/${encodeURIComponent(name)}`,
+    profile,
+    "Failed to save config profile",
+  );
 }
 
 // Delete a config profile
 export async function deleteConfigProfile(name: string): Promise<void> {
-  return apiDel(`/api/library/config-profile/${encodeURIComponent(name)}`, "Failed to delete config profile");
+  return apiDel(
+    `/api/library/config-profile/${encodeURIComponent(name)}`,
+    "Failed to delete config profile",
+  );
 }
 
 // Get OpenCode settings for a specific profile
-export async function getLibraryOpenCodeSettingsForProfile(profile: string): Promise<Record<string, unknown>> {
+export async function getLibraryOpenCodeSettingsForProfile(
+  profile: string,
+): Promise<Record<string, unknown>> {
   return apiGet(
     `/api/library/config-profile/${encodeURIComponent(profile)}/opencode/settings`,
-    "Failed to get OpenCode settings for profile"
+    "Failed to get OpenCode settings for profile",
   );
 }
 
 // Save OpenCode settings for a specific profile
 export async function saveLibraryOpenCodeSettingsForProfile(
   profile: string,
-  settings: Record<string, unknown>
+  settings: Record<string, unknown>,
 ): Promise<void> {
   return apiPut(
     `/api/library/config-profile/${encodeURIComponent(profile)}/opencode/settings`,
     settings,
-    "Failed to save OpenCode settings for profile"
+    "Failed to save OpenCode settings for profile",
   );
 }
 
 // Get sandboxed.sh config for a specific profile
-export async function getSandboxedConfigForProfile(profile: string): Promise<SandboxedConfig> {
+export async function getSandboxedConfigForProfile(
+  profile: string,
+): Promise<SandboxedConfig> {
   try {
     return await apiGet(
       `/api/library/config-profile/${encodeURIComponent(profile)}/sandboxed-sh/config`,
-      "Failed to get sandboxed.sh config for profile"
+      "Failed to get sandboxed.sh config for profile",
     );
   } catch {
     // Return default config if endpoint doesn't exist (not yet implemented)
@@ -1943,53 +2225,64 @@ export async function getSandboxedConfigForProfile(profile: string): Promise<San
 // Save sandboxed.sh config for a specific profile
 export async function saveSandboxedConfigForProfile(
   profile: string,
-  config: SandboxedConfig
+  config: SandboxedConfig,
 ): Promise<void> {
   return apiPut(
     `/api/library/config-profile/${encodeURIComponent(profile)}/sandboxed-sh/config`,
     config,
-    "Failed to save sandboxed.sh config for profile"
+    "Failed to save sandboxed.sh config for profile",
   );
 }
 
 // Get Claude Code config for a specific profile
-export async function getClaudeCodeConfigForProfile(profile: string): Promise<ClaudeCodeConfig> {
+export async function getClaudeCodeConfigForProfile(
+  profile: string,
+): Promise<ClaudeCodeConfig> {
   return apiGet(
     `/api/library/config-profile/${encodeURIComponent(profile)}/claudecode/config`,
-    "Failed to get Claude Code config for profile"
+    "Failed to get Claude Code config for profile",
   );
 }
 
 // Save Claude Code config for a specific profile
 export async function saveClaudeCodeConfigForProfile(
   profile: string,
-  config: ClaudeCodeConfig
+  config: ClaudeCodeConfig,
 ): Promise<void> {
   return apiPut(
     `/api/library/config-profile/${encodeURIComponent(profile)}/claudecode/config`,
     config,
-    "Failed to save Claude Code config for profile"
+    "Failed to save Claude Code config for profile",
   );
 }
 
 // List all files in a config profile
-export async function listConfigProfileFiles(profile: string): Promise<string[]> {
+export async function listConfigProfileFiles(
+  profile: string,
+): Promise<string[]> {
   return apiGet(
     `/api/library/config-profile/${encodeURIComponent(profile)}/files`,
-    "Failed to list config profile files"
+    "Failed to list config profile files",
   );
 }
 
 // Get a specific file from a config profile
-export async function getConfigProfileFile(profile: string, filePath: string): Promise<string> {
+export async function getConfigProfileFile(
+  profile: string,
+  filePath: string,
+): Promise<string> {
   const response = await fetch(
-    apiUrl(`/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`),
+    apiUrl(
+      `/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`,
+    ),
     {
       headers: authHeader(),
-    }
+    },
   );
   if (!response.ok) {
-    throw new Error(`Failed to get config profile file: ${response.statusText}`);
+    throw new Error(
+      `Failed to get config profile file: ${response.statusText}`,
+    );
   }
   return response.text();
 }
@@ -1998,10 +2291,12 @@ export async function getConfigProfileFile(profile: string, filePath: string): P
 export async function saveConfigProfileFile(
   profile: string,
   filePath: string,
-  content: string
+  content: string,
 ): Promise<void> {
   const response = await fetch(
-    apiUrl(`/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`),
+    apiUrl(
+      `/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`,
+    ),
     {
       method: "PUT",
       headers: {
@@ -2009,51 +2304,66 @@ export async function saveConfigProfileFile(
         "Content-Type": "text/plain",
       },
       body: content,
-    }
+    },
   );
   if (!response.ok) {
-    throw new Error(`Failed to save config profile file: ${response.statusText}`);
+    throw new Error(
+      `Failed to save config profile file: ${response.statusText}`,
+    );
   }
 }
 
 // Delete a specific file from a config profile
 export async function deleteConfigProfileFile(
   profile: string,
-  filePath: string
+  filePath: string,
 ): Promise<void> {
   const response = await fetch(
-    apiUrl(`/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`),
+    apiUrl(
+      `/api/library/config-profile/${encodeURIComponent(profile)}/file/${filePath}`,
+    ),
     {
       method: "DELETE",
       headers: authHeader(),
-    }
+    },
   );
   if (!response.ok) {
-    throw new Error(`Failed to delete config profile file: ${response.statusText}`);
+    throw new Error(
+      `Failed to delete config profile file: ${response.statusText}`,
+    );
   }
 }
 
 // List default files for a harness from the library
-export async function listHarnessDefaultFiles(harness: string): Promise<string[]> {
+export async function listHarnessDefaultFiles(
+  harness: string,
+): Promise<string[]> {
   return apiGet(
     `/api/library/harness-default/${encodeURIComponent(harness)}`,
-    "Failed to list harness default files"
+    "Failed to list harness default files",
   );
 }
 
 // Get a harness default file from the library
-export async function getHarnessDefaultFile(harness: string, fileName: string): Promise<string> {
+export async function getHarnessDefaultFile(
+  harness: string,
+  fileName: string,
+): Promise<string> {
   const response = await fetch(
-    apiUrl(`/api/library/harness-default/${encodeURIComponent(harness)}/${fileName}`),
+    apiUrl(
+      `/api/library/harness-default/${encodeURIComponent(harness)}/${fileName}`,
+    ),
     {
       headers: authHeader(),
-    }
+    },
   );
   if (!response.ok) {
     if (response.status === 404) {
       throw new Error(`Harness default file not found: ${harness}/${fileName}`);
     }
-    throw new Error(`Failed to get harness default file: ${response.statusText}`);
+    throw new Error(
+      `Failed to get harness default file: ${response.statusText}`,
+    );
   }
   return response.text();
 }
@@ -2062,10 +2372,12 @@ export async function getHarnessDefaultFile(harness: string, fileName: string): 
 export async function saveHarnessDefaultFile(
   harness: string,
   fileName: string,
-  content: string
+  content: string,
 ): Promise<void> {
   const response = await fetch(
-    apiUrl(`/api/library/harness-default/${encodeURIComponent(harness)}/${fileName}`),
+    apiUrl(
+      `/api/library/harness-default/${encodeURIComponent(harness)}/${fileName}`,
+    ),
     {
       method: "PUT",
       headers: {
@@ -2073,10 +2385,12 @@ export async function saveHarnessDefaultFile(
         "Content-Type": "text/plain",
       },
       body: content,
-    }
+    },
   );
   if (!response.ok) {
-    throw new Error(`Failed to save harness default file: ${response.statusText}`);
+    throw new Error(
+      `Failed to save harness default file: ${response.statusText}`,
+    );
   }
 }
 
@@ -2095,7 +2409,7 @@ export interface SecretsStatus {
 
 export interface EncryptionStatus {
   key_available: boolean;
-  key_source: 'environment' | 'file' | null;
+  key_source: "environment" | "file" | null;
   key_file_path: string | null;
 }
 
@@ -2108,26 +2422,37 @@ export interface RegistryInfo {
 
 export interface SecretInfo {
   key: string;
-  secret_type: 'oauth_access_token' | 'oauth_refresh_token' | 'api_key' | 'password' | 'generic' | null;
+  secret_type:
+    | "oauth_access_token"
+    | "oauth_refresh_token"
+    | "api_key"
+    | "password"
+    | "generic"
+    | null;
   expires_at: number | null;
   labels: Record<string, string>;
   is_expired: boolean;
 }
 
 export interface SecretMetadata {
-  type?: 'oauth_access_token' | 'oauth_refresh_token' | 'api_key' | 'password' | 'generic';
+  type?:
+    | "oauth_access_token"
+    | "oauth_refresh_token"
+    | "api_key"
+    | "password"
+    | "generic";
   expires_at?: number;
   labels?: Record<string, string>;
 }
 
 // Get secrets status
 export async function getSecretsStatus(): Promise<SecretsStatus> {
-  return apiGet('/api/secrets/status', 'Failed to get secrets status');
+  return apiGet("/api/secrets/status", "Failed to get secrets status");
 }
 
 // Get encryption status (for skill content encryption)
 export async function getEncryptionStatus(): Promise<EncryptionStatus> {
-  return apiGet('/api/secrets/encryption', 'Failed to get encryption status');
+  return apiGet("/api/secrets/encryption", "Failed to get encryption status");
 }
 
 // Get private key (hex-encoded)
@@ -2137,7 +2462,7 @@ export interface PrivateKeyResponse {
 }
 
 export async function getPrivateKey(): Promise<PrivateKeyResponse> {
-  return apiGet('/api/secrets/encryption/key', 'Failed to get private key');
+  return apiGet("/api/secrets/encryption/key", "Failed to get private key");
 }
 
 // Set/update private key
@@ -2148,54 +2473,80 @@ export interface SetPrivateKeyResponse {
   failed_count: number;
 }
 
-export async function setPrivateKey(keyHex: string): Promise<SetPrivateKeyResponse> {
-  return apiPut('/api/secrets/encryption/key', { key_hex: keyHex }, 'Failed to set private key');
+export async function setPrivateKey(
+  keyHex: string,
+): Promise<SetPrivateKeyResponse> {
+  return apiPut(
+    "/api/secrets/encryption/key",
+    { key_hex: keyHex },
+    "Failed to set private key",
+  );
 }
 
 // Initialize secrets system
-export async function initializeSecrets(keyId: string = 'default'): Promise<{ key_id: string; message: string }> {
-  return apiPost('/api/secrets/initialize', { key_id: keyId }, 'Failed to initialize secrets');
+export async function initializeSecrets(
+  keyId: string = "default",
+): Promise<{ key_id: string; message: string }> {
+  return apiPost(
+    "/api/secrets/initialize",
+    { key_id: keyId },
+    "Failed to initialize secrets",
+  );
 }
 
 // Unlock secrets with passphrase
 export async function unlockSecrets(passphrase: string): Promise<void> {
-  const res = await apiFetch('/api/secrets/unlock', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+  const res = await apiFetch("/api/secrets/unlock", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ passphrase }),
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || 'Invalid passphrase');
+    throw new Error(text || "Invalid passphrase");
   }
 }
 
 // Lock secrets
 export async function lockSecrets(): Promise<void> {
-  return apiPost('/api/secrets/lock', undefined, 'Failed to lock secrets');
+  return apiPost("/api/secrets/lock", undefined, "Failed to lock secrets");
 }
 
 // List registries
 export async function listSecretRegistries(): Promise<RegistryInfo[]> {
-  return apiGet('/api/secrets/registries', 'Failed to list registries');
+  return apiGet("/api/secrets/registries", "Failed to list registries");
 }
 
 // List secrets in a registry
 export async function listSecrets(registryName: string): Promise<SecretInfo[]> {
-  return apiGet(`/api/secrets/registries/${encodeURIComponent(registryName)}`, 'Failed to list secrets');
+  return apiGet(
+    `/api/secrets/registries/${encodeURIComponent(registryName)}`,
+    "Failed to list secrets",
+  );
 }
 
 // Get secret metadata (not the value)
-export async function getSecretInfo(registryName: string, key: string): Promise<SecretInfo> {
-  return apiGet(`/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`, 'Failed to get secret info');
+export async function getSecretInfo(
+  registryName: string,
+  key: string,
+): Promise<SecretInfo> {
+  return apiGet(
+    `/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`,
+    "Failed to get secret info",
+  );
 }
 
 // Reveal (decrypt) a secret value
-export async function revealSecret(registryName: string, key: string): Promise<string> {
-  const res = await apiFetch(`/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}/reveal`);
+export async function revealSecret(
+  registryName: string,
+  key: string,
+): Promise<string> {
+  const res = await apiFetch(
+    `/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}/reveal`,
+  );
   if (!res.ok) {
-    if (res.status === 401) throw new Error('Secrets are locked');
-    throw new Error('Failed to reveal secret');
+    if (res.status === 401) throw new Error("Secrets are locked");
+    throw new Error("Failed to reveal secret");
   }
   const data = await res.json();
   return data.value;
@@ -2206,34 +2557,52 @@ export async function setSecret(
   registryName: string,
   key: string,
   value: string,
-  metadata?: SecretMetadata
+  metadata?: SecretMetadata,
 ): Promise<void> {
-  const res = await apiFetch(`/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ value, metadata }),
-  });
+  const res = await apiFetch(
+    `/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value, metadata }),
+    },
+  );
   if (!res.ok) {
-    if (res.status === 401) throw new Error('Secrets are locked');
-    throw new Error('Failed to set secret');
+    if (res.status === 401) throw new Error("Secrets are locked");
+    throw new Error("Failed to set secret");
   }
 }
 
 // Delete a secret
-export async function deleteSecret(registryName: string, key: string): Promise<void> {
-  return apiDel(`/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`, 'Failed to delete secret');
+export async function deleteSecret(
+  registryName: string,
+  key: string,
+): Promise<void> {
+  return apiDel(
+    `/api/secrets/registries/${encodeURIComponent(registryName)}/${encodeURIComponent(key)}`,
+    "Failed to delete secret",
+  );
 }
 
 // Delete a registry
-export async function deleteSecretRegistry(registryName: string): Promise<void> {
-  return apiDel(`/api/secrets/registries/${encodeURIComponent(registryName)}`, 'Failed to delete registry');
+export async function deleteSecretRegistry(
+  registryName: string,
+): Promise<void> {
+  return apiDel(
+    `/api/secrets/registries/${encodeURIComponent(registryName)}`,
+    "Failed to delete registry",
+  );
 }
 
 // ============================================================
 // Desktop Session Management
 // ============================================================
 
-export type DesktopSessionStatus = 'active' | 'orphaned' | 'stopped' | 'unknown';
+export type DesktopSessionStatus =
+  | "active"
+  | "orphaned"
+  | "stopped"
+  | "unknown";
 
 export interface DesktopSessionDetail {
   display: string;
@@ -2259,22 +2628,24 @@ export interface OperationResponse {
 
 // List all desktop sessions
 export async function listDesktopSessions(): Promise<DesktopSessionDetail[]> {
-  const res = await apiFetch('/api/desktop/sessions');
-  if (!res.ok) throw new Error('Failed to list desktop sessions');
+  const res = await apiFetch("/api/desktop/sessions");
+  if (!res.ok) throw new Error("Failed to list desktop sessions");
   const data: ListSessionsResponse = await res.json();
   return data.sessions;
 }
 
 // Close a desktop session
-export async function closeDesktopSession(display: string): Promise<OperationResponse> {
+export async function closeDesktopSession(
+  display: string,
+): Promise<OperationResponse> {
   // Remove leading colon for URL path
-  const displayNum = display.replace(/^:/, '');
+  const displayNum = display.replace(/^:/, "");
   const res = await apiFetch(`/api/desktop/sessions/:${displayNum}/close`, {
-    method: 'POST',
+    method: "POST",
   });
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(err || 'Failed to close desktop session');
+    throw new Error(err || "Failed to close desktop session");
   }
   return res.json();
 }
@@ -2282,36 +2653,51 @@ export async function closeDesktopSession(display: string): Promise<OperationRes
 // Extend keep-alive for a desktop session
 export async function keepAliveDesktopSession(
   display: string,
-  extensionSecs: number = 7200
+  extensionSecs: number = 7200,
 ): Promise<OperationResponse> {
-  const displayNum = display.replace(/^:/, '');
-  const res = await apiFetch(`/api/desktop/sessions/:${displayNum}/keep-alive`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ extension_secs: extensionSecs }),
-  });
+  const displayNum = display.replace(/^:/, "");
+  const res = await apiFetch(
+    `/api/desktop/sessions/:${displayNum}/keep-alive`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ extension_secs: extensionSecs }),
+    },
+  );
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(err || 'Failed to extend keep-alive');
+    throw new Error(err || "Failed to extend keep-alive");
   }
   return res.json();
 }
 
 // Close all orphaned desktop sessions
 export async function cleanupOrphanedDesktopSessions(): Promise<OperationResponse> {
-  return apiPost('/api/desktop/sessions/cleanup', undefined, 'Failed to cleanup orphaned sessions');
+  return apiPost(
+    "/api/desktop/sessions/cleanup",
+    undefined,
+    "Failed to cleanup orphaned sessions",
+  );
 }
 
 // Remove all stopped desktop session records from storage
 export async function cleanupStoppedDesktopSessions(): Promise<OperationResponse> {
-  return apiPost('/api/desktop/sessions/cleanup-stopped', undefined, 'Failed to cleanup stopped sessions');
+  return apiPost(
+    "/api/desktop/sessions/cleanup-stopped",
+    undefined,
+    "Failed to cleanup stopped sessions",
+  );
 }
 
 // ============================================
 // System Components API
 // ============================================
 
-export type ComponentStatus = 'ok' | 'update_available' | 'not_installed' | 'error';
+export type ComponentStatus =
+  | "ok"
+  | "update_available"
+  | "not_installed"
+  | "error";
 
 export interface ComponentInfo {
   name: string;
@@ -2328,14 +2714,14 @@ export interface SystemComponentsResponse {
 }
 
 export interface UpdateProgressEvent {
-  event_type: 'log' | 'progress' | 'complete' | 'error';
+  event_type: "log" | "progress" | "complete" | "error";
   message: string;
   progress: number | null;
 }
 
 // Get all system components and their versions
 export async function getSystemComponents(): Promise<SystemComponentsResponse> {
-  return apiGet('/api/system/components', 'Failed to get system components');
+  return apiGet("/api/system/components", "Failed to get system components");
 }
 
 // Shared helper for streaming system component operations via SSE
@@ -2344,13 +2730,13 @@ async function streamComponentOperation(
   operationName: string,
   onProgress: (event: UpdateProgressEvent) => void,
   onComplete: () => void,
-  onError: (error: string) => void
+  onError: (error: string) => void,
 ): Promise<void> {
   try {
     const res = await apiFetch(url, {
-      method: 'POST',
+      method: "POST",
       headers: {
-        'Accept': 'text/event-stream',
+        Accept: "text/event-stream",
       },
     });
 
@@ -2361,13 +2747,13 @@ async function streamComponentOperation(
     }
 
     if (!res.body) {
-      onError('No response body');
+      onError("No response body");
       return;
     }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = '';
+    let buffer = "";
 
     while (true) {
       const { done, value } = await reader.read();
@@ -2376,25 +2762,25 @@ async function streamComponentOperation(
       buffer += decoder.decode(value, { stream: true });
 
       // Parse SSE events from buffer
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // Keep incomplete line in buffer
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || ""; // Keep incomplete line in buffer
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
+        if (line.startsWith("data: ")) {
           const jsonData = line.slice(6);
           try {
             const data: UpdateProgressEvent = JSON.parse(jsonData);
             onProgress(data);
 
-            if (data.event_type === 'complete') {
+            if (data.event_type === "complete") {
               onComplete();
               return;
-            } else if (data.event_type === 'error') {
+            } else if (data.event_type === "error") {
               onError(data.message);
               return;
             }
           } catch (e) {
-            console.error('Failed to parse SSE event:', e, jsonData);
+            console.error("Failed to parse SSE event:", e, jsonData);
           }
         }
       }
@@ -2403,7 +2789,7 @@ async function streamComponentOperation(
     // Stream ended without explicit completion
     onComplete();
   } catch (e) {
-    onError(e instanceof Error ? e.message : 'Unknown error');
+    onError(e instanceof Error ? e.message : "Unknown error");
   }
 }
 
@@ -2414,15 +2800,17 @@ export async function updateSystemComponent(
   onProgress: (event: UpdateProgressEvent) => void,
   onComplete: () => void,
   onError: (error: string) => void,
-  workspaceId?: string
+  workspaceId?: string,
 ): Promise<void> {
-  const qs = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : '';
+  const qs = workspaceId
+    ? `?workspace_id=${encodeURIComponent(workspaceId)}`
+    : "";
   return streamComponentOperation(
     `/api/system/components/${name}/update${qs}`,
-    'update',
+    "update",
     onProgress,
     onComplete,
-    onError
+    onError,
   );
 }
 
@@ -2430,8 +2818,8 @@ export async function updateSystemComponent(
 export interface WorkspaceComponentInfo {
   workspace_id: string;
   workspace_name: string;
-  workspace_type: 'host' | 'container';
-  workspace_status: 'pending' | 'building' | 'ready' | 'error';
+  workspace_type: "host" | "container";
+  workspace_status: "pending" | "building" | "ready" | "error";
   version: string | null;
   in_sync: boolean;
   note?: string;
@@ -2452,7 +2840,10 @@ export interface ComponentsByWorkspaceResponse {
 
 // Fetch per-workspace component info (host + each workspace's installed version).
 export async function getComponentsByWorkspace(): Promise<ComponentsByWorkspaceResponse> {
-  return apiGet('/api/system/components/by-workspace', 'Failed to get per-workspace components');
+  return apiGet(
+    "/api/system/components/by-workspace",
+    "Failed to get per-workspace components",
+  );
 }
 
 // Uninstall a system component (streams progress via SSE)
@@ -2460,14 +2851,14 @@ export async function uninstallSystemComponent(
   name: string,
   onProgress: (event: UpdateProgressEvent) => void,
   onComplete: () => void,
-  onError: (error: string) => void
+  onError: (error: string) => void,
 ): Promise<void> {
   return streamComponentOperation(
     `/api/system/components/${name}/uninstall`,
-    'uninstall',
+    "uninstall",
     onProgress,
     onComplete,
-    onError
+    onError,
   );
 }
 
@@ -2491,52 +2882,52 @@ export interface UpdateLibraryRemoteResponse {
 
 // Get all settings
 export async function getSettings(): Promise<SettingsResponse> {
-  return apiGet('/api/settings', 'Failed to get settings');
+  return apiGet("/api/settings", "Failed to get settings");
 }
 
 export async function updateSettings(
-  settings: Partial<SettingsResponse>
+  settings: Partial<SettingsResponse>,
 ): Promise<SettingsResponse> {
-  const res = await apiFetch('/api/settings', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+  const res = await apiFetch("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(settings),
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || 'Failed to update settings');
+    throw new Error(text || "Failed to update settings");
   }
   return res.json();
 }
 
 // Update the library remote URL
 export async function updateLibraryRemote(
-  libraryRemote: string | null
+  libraryRemote: string | null,
 ): Promise<UpdateLibraryRemoteResponse> {
-  const res = await apiFetch('/api/settings/library-remote', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+  const res = await apiFetch("/api/settings/library-remote", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ library_remote: libraryRemote }),
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || 'Failed to update library remote');
+    throw new Error(text || "Failed to update library remote");
   }
   return res.json();
 }
 
 // Update the RTK enabled setting
 export async function updateRtkEnabled(
-  rtkEnabled: boolean
+  rtkEnabled: boolean,
 ): Promise<{ rtk_enabled: boolean; previous_value: boolean | null }> {
-  const res = await apiFetch('/api/settings/rtk-enabled', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+  const res = await apiFetch("/api/settings/rtk-enabled", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ rtk_enabled: rtkEnabled }),
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || 'Failed to update RTK setting');
+    throw new Error(text || "Failed to update RTK setting");
   }
   return res.json();
 }
@@ -2568,34 +2959,47 @@ export interface BackendConfig {
 
 // List all available backends
 export async function listBackends(): Promise<Backend[]> {
-  return apiGet('/api/backends', 'Failed to list backends');
+  return apiGet("/api/backends", "Failed to list backends");
 }
 
 // Get a specific backend
 export async function getBackend(id: string): Promise<Backend> {
-  return apiGet(`/api/backends/${encodeURIComponent(id)}`, 'Failed to get backend');
+  return apiGet(
+    `/api/backends/${encodeURIComponent(id)}`,
+    "Failed to get backend",
+  );
 }
 
 // List agents for a specific backend
-export async function listBackendAgents(backendId: string): Promise<BackendAgent[]> {
-  return apiGet(`/api/backends/${encodeURIComponent(backendId)}/agents`, 'Failed to list backend agents');
+export async function listBackendAgents(
+  backendId: string,
+): Promise<BackendAgent[]> {
+  return apiGet(
+    `/api/backends/${encodeURIComponent(backendId)}/agents`,
+    "Failed to list backend agents",
+  );
 }
 
 // Get backend configuration
-export async function getBackendConfig(backendId: string): Promise<BackendConfig> {
-  return apiGet(`/api/backends/${encodeURIComponent(backendId)}/config`, 'Failed to get backend config');
+export async function getBackendConfig(
+  backendId: string,
+): Promise<BackendConfig> {
+  return apiGet(
+    `/api/backends/${encodeURIComponent(backendId)}/config`,
+    "Failed to get backend config",
+  );
 }
 
 // Update backend configuration
 export async function updateBackendConfig(
   backendId: string,
   settings: Record<string, unknown>,
-  options?: { enabled?: boolean }
+  options?: { enabled?: boolean },
 ): Promise<{ ok: boolean; message?: string }> {
   return apiPut(
     `/api/backends/${encodeURIComponent(backendId)}/config`,
     { settings, enabled: options?.enabled },
-    'Failed to update backend config',
+    "Failed to update backend config",
   );
 }
 
@@ -2612,12 +3016,12 @@ export interface RestoreBackupResponse {
 
 // Download settings backup
 export async function downloadBackup(): Promise<void> {
-  const res = await apiFetch('/api/settings/backup');
-  if (!res.ok) throw new Error('Failed to download backup');
+  const res = await apiFetch("/api/settings/backup");
+  if (!res.ok) throw new Error("Failed to download backup");
 
   // Get filename from Content-Disposition header or use default
-  const contentDisposition = res.headers.get('Content-Disposition');
-  let filename = 'sandboxed-backup.zip';
+  const contentDisposition = res.headers.get("Content-Disposition");
+  let filename = "sandboxed-backup.zip";
   if (contentDisposition) {
     const match = contentDisposition.match(/filename="([^"]+)"/);
     if (match) filename = match[1];
@@ -2626,7 +3030,7 @@ export async function downloadBackup(): Promise<void> {
   // Convert response to blob and trigger download
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
+  const a = document.createElement("a");
   a.href = url;
   a.download = filename;
   document.body.appendChild(a);
@@ -2636,18 +3040,20 @@ export async function downloadBackup(): Promise<void> {
 }
 
 // Restore settings from backup file
-export async function restoreBackup(file: File): Promise<RestoreBackupResponse> {
+export async function restoreBackup(
+  file: File,
+): Promise<RestoreBackupResponse> {
   const formData = new FormData();
-  formData.append('backup', file);
+  formData.append("backup", file);
 
-  const res = await apiFetch('/api/settings/restore', {
-    method: 'POST',
+  const res = await apiFetch("/api/settings/restore", {
+    method: "POST",
     body: formData,
   });
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || 'Failed to restore backup');
+    throw new Error(text || "Failed to restore backup");
   }
 
   return res.json();

@@ -139,6 +139,7 @@ export function eventsToItemsImpl(
   } | null = null;
   let lastAssistantTimestamp = 0;
   const missionActive = mission?.status === "active";
+  const isGoalMode = mission?.goal_mode === true;
 
   const finalizePendingThinking = (endTime: number) => {
     if (currentThinkingIdx !== null) {
@@ -155,6 +156,30 @@ export function eventsToItemsImpl(
       }
       currentThinkingIdx = null;
     }
+  };
+
+  const pushGoalDeliverable = (event: StoredEvent, timestamp: number) => {
+    const content = event.content.trim();
+    if (!content) return;
+    const alreadyHasAssistant = items.some(
+      (item) => item.kind === "assistant" && item.content.trim() === content,
+    );
+    if (alreadyHasAssistant) return;
+    const itemId = event.event_id
+      ? `goal-deliverable-${event.event_id}`
+      : `goal-deliverable-${event.id}`;
+    if (seenEventIds.has(itemId)) return;
+    seenEventIds.add(itemId);
+    items.push({
+      kind: "assistant",
+      id: itemId,
+      content,
+      success: true,
+      costCents: 0,
+      costSource: "unknown",
+      model: null,
+      timestamp,
+    });
   };
 
   for (const event of events) {
@@ -260,7 +285,9 @@ export function eventsToItemsImpl(
                   ? Math.max(0, Math.min(op.pos, content.length))
                   : content.length;
               content =
-                content.slice(0, pos) + String(op.text ?? "") + content.slice(pos);
+                content.slice(0, pos) +
+                String(op.text ?? "") +
+                content.slice(pos);
             } else if (op.type === "replace") {
               const range = Array.isArray(op.range) ? op.range : [];
               const start =
@@ -272,7 +299,9 @@ export function eventsToItemsImpl(
                   ? Math.max(start, Math.min(range[1], content.length))
                   : content.length;
               content =
-                content.slice(0, start) + String(op.text ?? "") + content.slice(end);
+                content.slice(0, start) +
+                String(op.text ?? "") +
+                content.slice(end);
             } else if (op.type === "finalize") {
               finalized = true;
             }
@@ -287,6 +316,8 @@ export function eventsToItemsImpl(
       case "thinking": {
         const meta = event.metadata || {};
         const isDone = meta.done === true;
+        const isGoalDeliverable =
+          isGoalMode && isDone && meta.goal_role === "deliverable";
         const content = event.content || "";
 
         if (currentThinkingIdx !== null) {
@@ -327,19 +358,26 @@ export function eventsToItemsImpl(
             if (isDone) {
               currentThinkingIdx = null;
             }
+            if (isGoalDeliverable) {
+              pushGoalDeliverable(event, timestamp);
+            }
           }
         } else {
           const newIdx = items.length;
-          items.push({
-            kind: "thinking",
-            id: `event-${event.id}`,
-            content,
-            done: isDone,
-            startTime: timestamp,
-            endTime: isDone ? timestamp : undefined,
-          });
+          if (!isGoalDeliverable) {
+            items.push({
+              kind: "thinking",
+              id: `event-${event.id}`,
+              content,
+              done: isDone,
+              startTime: timestamp,
+              endTime: isDone ? timestamp : undefined,
+            });
+          }
           if (!isDone) {
             currentThinkingIdx = newIdx;
+          } else if (isGoalDeliverable) {
+            pushGoalDeliverable(event, timestamp);
           }
         }
         break;

@@ -84,6 +84,48 @@ final class ModelTests: XCTestCase {
         XCTAssertFalse(MissionStatus.completed.canResume)
     }
 
+    func testMissionDecodesGoalModeFields() throws {
+        let json = """
+        {
+            "id": "mission-id",
+            "status": "active",
+            "title": "Goal mission",
+            "history": [],
+            "resumable": false,
+            "agent": "codex",
+            "backend": "codex",
+            "goal_mode": true,
+            "goal_objective": "Ship the feature",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }
+        """.data(using: .utf8)!
+
+        let mission = try JSONDecoder().decode(Mission.self, from: json)
+
+        XCTAssertTrue(mission.goalMode)
+        XCTAssertEqual(mission.goalObjective, "Ship the feature")
+    }
+
+    func testMissionDefaultsGoalModeFields() throws {
+        let json = """
+        {
+            "id": "mission-id",
+            "status": "completed",
+            "title": "Regular mission",
+            "history": [],
+            "resumable": false,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }
+        """.data(using: .utf8)!
+
+        let mission = try JSONDecoder().decode(Mission.self, from: json)
+
+        XCTAssertFalse(mission.goalMode)
+        XCTAssertNil(mission.goalObjective)
+    }
+
     // MARK: - FileEntry Tests
 
     func testFileEntryDecoding() throws {

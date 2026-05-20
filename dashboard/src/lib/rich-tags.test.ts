@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { parseRichTags, transformRichTags, hasPartialRichTag } from "./rich-tags";
+import {
+  parseRichTags,
+  stripRichFileTagsByName,
+  transformRichTags,
+  hasPartialRichTag,
+} from "./rich-tags";
 
 describe("parseRichTags", () => {
   it("parses an image tag", () => {
@@ -41,6 +46,13 @@ describe("parseRichTags", () => {
   it("skips tags without path attribute", () => {
     const tags = parseRichTags('<image alt="no path" />');
     expect(tags).toEqual([]);
+  });
+
+  it("parses single-quoted and paired rich tags", () => {
+    const tags = parseRichTags("<file path='./roadmap.md' name='Roadmap'></file>");
+    expect(tags).toEqual([
+      { type: "file", path: "./roadmap.md", alt: undefined, name: "Roadmap" },
+    ]);
   });
 });
 
@@ -84,6 +96,29 @@ describe("transformRichTags", () => {
   it("URI-encodes paths with spaces", () => {
     const result = transformRichTags('<image path="./my chart.png" />');
     expect(result).toContain("sandboxed-image://.%2Fmy%20chart.png");
+  });
+
+  it("transforms paired rich tags", () => {
+    const result = transformRichTags("<file path='./report.md' name='Report'></file>");
+    expect(result).toBe("[Report](sandboxed-file://.%2Freport.md)");
+  });
+});
+
+describe("stripRichFileTagsByName", () => {
+  it("removes duplicate file tags by display name", () => {
+    const result = stripRichFileTagsByName(
+      'Here\n<file path="./roadmap.md" name="Roadmap" />',
+      ["Roadmap"],
+    );
+    expect(result).toBe("Here\n");
+  });
+
+  it("removes duplicate paired file tags by basename", () => {
+    const result = stripRichFileTagsByName(
+      "Here\n<file path='./roadmap.md'></file>",
+      ["roadmap.md"],
+    );
+    expect(result).toBe("Here\n");
   });
 });
 

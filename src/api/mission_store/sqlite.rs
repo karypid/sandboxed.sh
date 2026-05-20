@@ -478,6 +478,7 @@ CREATE TABLE IF NOT EXISTS mission_events (
 
 CREATE INDEX IF NOT EXISTS idx_events_mission ON mission_events(mission_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_events_type ON mission_events(mission_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_events_mission_type_sequence ON mission_events(mission_id, event_type, sequence);
 CREATE INDEX IF NOT EXISTS idx_events_tool_call ON mission_events(tool_call_id) WHERE tool_call_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);
 -- Stale-mission detection takes MAX(timestamp) per mission. Sequence ordering
@@ -1128,6 +1129,7 @@ impl SqliteMissionStore {
         // Add performance indexes if they don't exist (idempotent)
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_missions_status_updated ON missions(status, updated_at);
+             CREATE INDEX IF NOT EXISTS idx_events_mission_type_sequence ON mission_events(mission_id, event_type, sequence);
              CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);
              CREATE INDEX IF NOT EXISTS idx_events_mission_timestamp ON mission_events(mission_id, timestamp DESC);",
         )
@@ -3840,6 +3842,61 @@ impl MissionStore for SqliteMissionStore {
             };
 
             Ok(count as usize)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn count_events_by_type(
+        &self,
+        mission_id: Uuid,
+        event_types: Option<&[&str]>,
+    ) -> Result<HashMap<String, usize>, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let types: Option<Vec<String>> =
+            event_types.map(|t| t.iter().map(|s| s.to_string()).collect());
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let query = if types.is_some() {
+                "SELECT event_type, COUNT(*)
+                 FROM mission_events
+                 WHERE mission_id = ?1 AND event_type IN (SELECT value FROM json_each(?2))
+                 GROUP BY event_type"
+            } else {
+                "SELECT event_type, COUNT(*)
+                 FROM mission_events
+                 WHERE mission_id = ?1
+                 GROUP BY event_type"
+            };
+
+            let mut counts = HashMap::new();
+            if let Some(types) = types {
+                let types_json = serde_json::to_string(&types).unwrap_or_else(|_| "[]".to_string());
+                let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&mid, &types_json], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(|e| e.to_string())?;
+                for row in rows {
+                    let (event_type, count) = row.map_err(|e| e.to_string())?;
+                    counts.insert(event_type, count as usize);
+                }
+            } else {
+                let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![&mid], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(|e| e.to_string())?;
+                for row in rows {
+                    let (event_type, count) = row.map_err(|e| e.to_string())?;
+                    counts.insert(event_type, count as usize);
+                }
+            }
+            Ok(counts)
         })
         .await
         .map_err(|e| e.to_string())?

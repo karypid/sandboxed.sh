@@ -7,8 +7,10 @@
  * rendered by react-markdown.
  */
 
-// Matches self-closing <image .../> and <file .../> tags
-const TAG_RE = /<(image|file)\s+([^>]*?)\s*\/>/gi;
+// Matches self-closing <image .../>/<file .../> tags and paired
+// <file ...></file> tags. Agents vary the exact XML-ish spelling while
+// streaming, so keep this parser deliberately small but permissive.
+const TAG_RE = /<(image|file)\s+([^>]*?)(?:\/\s*>|>\s*<\/\1\s*>)/gi;
 
 // Matches a partial (unclosed) tag at the end of streaming content
 const PARTIAL_TAG_RE = /<(?:image|file)(?:\s+[^>]*)?$/i;
@@ -23,10 +25,10 @@ interface RichTag {
 /** Extract attribute values from a tag's attribute string. */
 function parseAttrs(attrStr: string): Record<string, string> {
   const attrs: Record<string, string> = {};
-  const attrRe = /(\w+)\s*=\s*"([^"]*)"/g;
+  const attrRe = /(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
   let m: RegExpExecArray | null;
   while ((m = attrRe.exec(attrStr)) !== null) {
-    attrs[m[1]] = m[2];
+    attrs[m[1]] = m[2] ?? m[3] ?? "";
   }
   return attrs;
 }
@@ -69,6 +71,23 @@ export function transformRichTags(content: string): string {
       const name = attrs.name || attrs.path.split("/").pop() || "file";
       return `[${name}](sandboxed-file://${encodedPath})`;
     }
+  });
+}
+
+/** Remove file rich tags whose display name or basename is already rendered elsewhere. */
+export function stripRichFileTagsByName(
+  content: string,
+  names: Iterable<string>,
+): string {
+  const nameSet = new Set([...names].filter(Boolean));
+  if (nameSet.size === 0) return content;
+
+  return content.replace(TAG_RE, (match, tagType: string, attrStr: string) => {
+    if (tagType.toLowerCase() !== "file") return match;
+    const attrs = parseAttrs(attrStr);
+    const basename = attrs.path?.split("/").pop() ?? "";
+    const displayName = attrs.name || basename;
+    return nameSet.has(displayName) || nameSet.has(basename) ? "" : match;
   });
 }
 
