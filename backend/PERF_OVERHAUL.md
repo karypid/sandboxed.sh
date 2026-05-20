@@ -26,10 +26,10 @@ verity fixture missions.
 | P2 | #15 split ControlView | ✅ implemented in this branch (slice stores) |
 | P2 | #16 worker reducer | ✅ implemented in this branch |
 | P3 | #17 delta summarization | ✅ implemented in this branch |
-| P3 | #18 since_seq cursors | ⏸ deferred — backend, large |
-| P3 | #19 WS migration | ✅ implemented in this branch |
-| P3 | #20 per-mission channels | ⏸ deferred — backend, medium |
-| P3 | #21 backend text_delta backpressure | ⏸ deferred — backend, medium |
+| P3 | #18 since_seq/before_seq cursors | ✅ implemented in this branch |
+| P3 | #19 WS migration | ✅ implemented in this branch (opt-in client path) |
+| P3 | #20 per-mission channels | ✅ implemented in this branch |
+| P3 | #21 backend text_delta backpressure | ✅ implemented in this branch (`text_op` + lag recovery) |
 | P4 | #22 live `text_op` protocol | ✅ implemented in this branch |
 | P4 | #23 canonical assistant rows | ✅ implemented in this branch |
 | P4 | #24 tool-output truncation | ⏸ deferred — backend, medium |
@@ -60,6 +60,8 @@ optimisations, not bug fixes.
 | --- | --- |
 | P2-#11/#12 virtualization | `dashboard/tests/control-perf.spec.ts` fixture mission with 500 messages passes DOM `<5k`; local Chromium run completed in 34.0s. |
 | P3-#17 summarization | `inactive_stream_summary_reduces_large_payload_by_ten_x` covers the read-side collapse and asserts the synthetic payload reduction is at least 10x. |
+| P3-#18/#20 cursors and channels | `/events` uses `since_seq`/`before_seq`; `/snapshot` reads the latest tail through `get_events_before`; SSE/WS use per-mission broadcast channels when `mission=<uuid>` is set. |
+| P3-#21 stream pressure | Live control streams always convert cumulative `text_delta` to `text_op` and emit `stream_lagged` for client catch-up instead of fatal error rows. |
 | P4-#22 live deltas | `text_op_stream_transform_converts_cumulative_delta_to_insert_then_replace` and `text_op_stream_transform_finalizes_before_assistant_message` cover the transport conversion path. |
 | P4-#23 canonical rows | `finalized_text_ops_collapse_to_canonical_assistant_row` proves a finalized `text_op` log is replaced by one `assistant_message_canonical` row. |
 | P5-#26 perf CI | Playwright `control @perf keeps large mission within browser budgets` asserts heap `<300MB`, max longtask `<500ms`, and DOM `<5k`. |
@@ -86,9 +88,7 @@ iOS simulator smoke evidence:
   `loadMission`; mission first paint now uses one snapshot payload and the
   fixture rendered after rebuild/reinstall.
 
-## Deferred items, with reasoning
-
-These are intentional decisions to stop work, not abandoned TODOs.
+## Implementation notes
 
 ### P2-#11/12: virtualize chat list + thoughts sheet
 
@@ -121,9 +121,22 @@ P3-#17 adds a pure read-side summarization pass for inactive missions:
 `updated_at` is older than five minutes. Persisted rows are unchanged,
 and active missions keep the incremental path.
 
-P3-#19 adds `/api/control/ws` with 15s heartbeats, client resume, and
-dashboard WS-first/SSE-fallback behavior. P3-#18, #20, and #21 remain
-deferred follow-ups.
+P3-#18 keeps `/events` on sequence cursors: `since_seq` for reconnect
+and `before_seq` for backwards pagination. The endpoint no longer
+advertises offset/latest pagination, and `/snapshot` fetches the initial
+tail via `get_events_before(i64::MAX, limit)`.
+
+P3-#19 adds `/api/control/ws` with 15s heartbeats and client resume. The
+dashboard keeps WS opt-in because browser WebSockets still need JWT
+subprotocol auth before they can replace SSE by default.
+
+P3-#20 uses per-mission broadcast channels when `mission=<uuid>` is set.
+Connection-scoped `status`, `stream_lagged`, and FIDO events still flow
+from the global channel.
+
+P3-#21 is handled by converting cumulative `text_delta` buffers to
+`text_op` on live transports and by emitting `stream_lagged` so clients
+recover through `since_seq` instead of surfacing fatal stream errors.
 
 ### P4-#22..#24: content model changes
 
