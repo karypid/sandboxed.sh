@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useMemo, useRef, useEffect, useState } from "react";
+import { memo, useMemo, useEffect, useState } from "react";
 import { MarkdownContent } from "./markdown-content";
 import { cn } from "@/lib/utils";
 import { hasPartialRichTag } from "@/lib/rich-tags";
@@ -45,9 +45,9 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
     return parts.filter(p => p.trim());
   }, [content]);
 
-  // Track when the last block was updated for stabilization
-  const lastUpdateRef = useRef<number>(Date.now());
-  const [lastBlockStable, setLastBlockStable] = useState(false);
+  const [stableStreamingBlock, setStableStreamingBlock] = useState<
+    string | null
+  >(null);
 
   // Get stable blocks (all except the last one during streaming)
   const stableBlocks = useMemo(() => {
@@ -71,20 +71,15 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
 
   // Stabilization timer for the last block
   useEffect(() => {
-    if (!isStreaming || !streamingBlock) {
-      setLastBlockStable(false);
-      return;
-    }
-
-    lastUpdateRef.current = Date.now();
-    setLastBlockStable(false);
+    if (!isStreaming || !streamingBlock) return;
 
     const timer = setTimeout(() => {
-      setLastBlockStable(true);
+      setStableStreamingBlock(streamingBlock);
     }, stabilizeDelay);
 
     return () => clearTimeout(timer);
   }, [streamingBlock, isStreaming, stabilizeDelay]);
+  const lastBlockStable = stableStreamingBlock === streamingBlock;
 
   // When not streaming, render everything as markdown
   if (!isStreaming) {

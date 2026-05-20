@@ -199,8 +199,10 @@ export function WorkerPeekModal({
   onOpenFull,
 }: WorkerPeekModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
-  const [events, setEvents] = useState<StoredEvent[] | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [eventsState, setEventsState] = useState<{
+    missionId: string;
+    events: StoredEvent[] | null;
+  }>({ missionId: mission.id, events: null });
   const status = getStatusBadge(mission, runningInfo);
 
   const title = mission.title?.trim() || getMissionShortName(mission.id);
@@ -211,23 +213,22 @@ export function WorkerPeekModal({
   // Fetch events on mount
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
     getMissionEvents(mission.id, {
       types: ['user_message', 'assistant_message', 'tool_call', 'tool_result'],
       limit: 100,
     })
       .then((result) => {
-        if (!cancelled) setEvents(result);
+        if (!cancelled) setEventsState({ missionId: mission.id, events: result });
       })
       .catch((err) => {
         console.error('Failed to fetch worker events:', err);
-        if (!cancelled) setEvents([]);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setEventsState({ missionId: mission.id, events: [] });
       });
     return () => { cancelled = true; };
   }, [mission.id]);
+  const events =
+    eventsState.missionId === mission.id ? eventsState.events : null;
+  const loading = events === null;
 
   // Parse messages from events, falling back to mission.history
   const messages = useMemo(() => {

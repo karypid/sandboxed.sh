@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import useSWR from 'swr';
 import {
   listTelegramBots,
@@ -111,7 +111,7 @@ export default function TelegramSettingsPage() {
   const [creating, setCreating] = useState(false);
 
   // Model selector options helper
-  const getModelOptionsForBackend = (backend: string) => {
+  const getModelOptionsForBackend = useCallback((backend: string) => {
     const allowlist =
       backend === 'claudecode' ? new Set(['anthropic']) :
       backend === 'codex' ? new Set(['openai']) :
@@ -128,13 +128,13 @@ export default function TelegramSettingsPage() {
       if (allowlist && !allowlist.has(provider.id)) continue;
       for (const model of provider.models) {
         const value = backend === 'opencode' ? `${provider.id}/${model.id}` : model.id;
-        options.push({ value, label: `${provider.name} — ${model.name}`, description: model.description });
+        options.push({ value, label: `${provider.name} · ${model.name}`, description: model.description });
       }
     }
     return options;
-  };
+  }, [backendModelOptions, providersResponse]);
 
-  const modelOptions = useMemo(() => getModelOptionsForBackend(createBackend), [backendModelOptions, providersResponse, createBackend]);
+  const modelOptions = useMemo(() => getModelOptionsForBackend(createBackend), [getModelOptionsForBackend, createBackend]);
 
   // Edit dialog
   const [editingBot, setEditingBot] = useState<TelegramChannel | null>(null);
@@ -147,7 +147,7 @@ export default function TelegramSettingsPage() {
   const [editConfigProfile, setEditConfigProfile] = useState('');
   const [saving, setSaving] = useState(false);
 
-  const editModelOptions = useMemo(() => getModelOptionsForBackend(editBackend || 'claudecode'), [backendModelOptions, providersResponse, editBackend]);
+  const editModelOptions = useMemo(() => getModelOptionsForBackend(editBackend || 'claudecode'), [getModelOptionsForBackend, editBackend]);
 
   const loadChats = async (botId: string) => {
     if (chatsByBot[botId]) return; // already loaded
@@ -886,14 +886,14 @@ export default function TelegramSettingsPage() {
                   {(() => {
                     const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string }>>();
                     for (const option of modelOptions) {
-                      const providerName = option.label.split(' — ')[0] || 'Other';
+                      const providerName = option.label.split(/\s[—·]\s/)[0] || 'Other';
                       if (!groupedOptions.has(providerName)) groupedOptions.set(providerName, []);
                       groupedOptions.get(providerName)!.push(option);
                     }
                     return Array.from(groupedOptions.entries()).map(([providerName, options]) => (
                       <optgroup key={providerName} label={providerName}>
                         {options.map((option) => {
-                          const modelName = option.label.split(' — ')[1] || option.label;
+                          const modelName = option.label.split(/\s[—·]\s/)[1] || option.label;
                           const displayText = option.description ? `${modelName} - ${option.description}` : modelName;
                           return (
                             <option key={option.value} value={option.value}>{displayText}</option>
@@ -1065,14 +1065,14 @@ export default function TelegramSettingsPage() {
                   {(() => {
                     const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string }>>();
                     for (const option of editModelOptions) {
-                      const providerName = option.label.split(' — ')[0] || 'Other';
+                      const providerName = option.label.split(/\s[—·]\s/)[0] || 'Other';
                       if (!groupedOptions.has(providerName)) groupedOptions.set(providerName, []);
                       groupedOptions.get(providerName)!.push(option);
                     }
                     return Array.from(groupedOptions.entries()).map(([providerName, options]) => (
                       <optgroup key={providerName} label={providerName}>
                         {options.map((option) => {
-                          const modelName = option.label.split(' — ')[1] || option.label;
+                          const modelName = option.label.split(/\s[—·]\s/)[1] || option.label;
                           const displayText = option.description ? `${modelName} - ${option.description}` : modelName;
                           return (
                             <option key={option.value} value={option.value}>{displayText}</option>

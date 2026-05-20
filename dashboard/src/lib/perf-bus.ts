@@ -82,12 +82,10 @@ class PerfBus {
   time<T>(name: string, fn: () => T): T {
     if (!this.enabled) return fn();
     const t0 = performance.now();
-    // eslint-disable-next-line no-console
     console.time(name);
     try {
       return fn();
     } finally {
-      // eslint-disable-next-line no-console
       console.timeEnd(name);
       this.recordReducer(name, performance.now() - t0);
     }

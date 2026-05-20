@@ -5,16 +5,13 @@ import { createRoot } from "react-dom/client";
 import Markdown, { Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { LazyCodeBlock } from "./lazy-code-block";
-import { Copy, Check, Download, Image, X, FileText, File, FileCode, FileArchive } from "lucide-react";
+import { Copy, Check, Download, Image as ImageIcon, X, FileText, File, FileCode, FileArchive } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import { transformRichTags } from "@/lib/rich-tags";
 import {
-  IMAGE_EXTENSIONS,
   FILE_EXTENSIONS,
-  CODE_EXTENSIONS,
-  ARCHIVE_EXTENSIONS,
   isMarkdownFile,
   isTextPreviewableFile,
   isImageFile,
@@ -151,7 +148,7 @@ function isFilePath(str: string): boolean {
 }
 
 function getFileIcon(path: string) {
-  if (isImageFile(path)) return Image;
+  if (isImageFile(path)) return ImageIcon;
   if (isCodeFile(path)) return FileCode;
   if (isArchiveFile(path)) return FileArchive;
   if (path.toLowerCase().endsWith(".txt") || path.toLowerCase().endsWith(".md") || path.toLowerCase().endsWith(".log")) return FileText;
@@ -459,7 +456,7 @@ function FilePreviewModalContent({
                 {error && !loading && (
                   <div className="flex flex-col items-center justify-center gap-3 py-8">
                     <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-red-500/10">
-                      <Image className="h-6 w-6 text-red-400" />
+                      <ImageIcon className="h-6 w-6 text-red-400" />
                     </div>
                     <span className="text-sm text-white/50">{error}</span>
                   </div>
@@ -738,7 +735,7 @@ function InlineImagePreview({
         style={placeholderStyle}
         title={error}
       >
-        <Image className="h-4 w-4" />
+        <ImageIcon className="h-4 w-4" />
         <span className="truncate max-w-[260px]">{error}</span>
       </span>
     );
@@ -917,7 +914,7 @@ export const MarkdownContent = memo(function MarkdownContent({
         );
       }
       // Default img rendering
-      // eslint-disable-next-line @next/next/no-img-element, jsx-a11y/alt-text
+      // eslint-disable-next-line @next/next/no-img-element
       return <img src={srcStr} alt={alt} {...props} className="max-w-full rounded" />;
     },
     a({ href, children, ...props }) {
@@ -1085,8 +1082,8 @@ export function LazyMarkdownContent(props: MarkdownContentProps) {
     if (typeof IntersectionObserver === "undefined") {
       // Older browser — just upgrade immediately. CSS content-visibility
       // already provides the bulk of the win on the chat list.
-      setVisible(true);
-      return;
+      const timer = window.setTimeout(() => setVisible(true), 0);
+      return () => window.clearTimeout(timer);
     }
     const observer = new IntersectionObserver(
       (entries) => {

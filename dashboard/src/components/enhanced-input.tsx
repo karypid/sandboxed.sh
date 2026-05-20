@@ -350,7 +350,7 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
           const firstSentence = bestMatch.description?.split('.')[0] ?? '';
           const truncated = firstSentence.substring(0, 40);
           const hint = bestMatch.description
-            ? ` — ${truncated}${firstSentence.length > 40 ? '…' : ''}`
+            ? `: ${truncated}${firstSentence.length > 40 ? '…' : ''}`
             : '';
           setGhostText(remaining + hint);
         } else {
@@ -388,7 +388,7 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
             const bestMatch = prefixMatches[0];
             const remaining = bestMatch.substring(searchTerm.length);
             const desc = getAgentDescription(bestMatch);
-            const hint = desc ? ` — ${desc.substring(0, 30)}${desc.length > 30 ? '…' : ''}` : '';
+            const hint = desc ? `: ${desc.substring(0, 30)}${desc.length > 30 ? '…' : ''}` : '';
             setGhostText(remaining + hint);
           } else {
             setGhostText('');

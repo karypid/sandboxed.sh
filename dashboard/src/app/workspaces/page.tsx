@@ -19,9 +19,7 @@ import {
   CONTAINER_DISTROS,
   type Workspace,
   type ContainerDistro,
-  type WorkspaceTemplateSummary,
   type ConfigProfileSummary,
-  type SkillSummary,
   type WorkspaceDebugInfo,
   type InitLogResponse,
   type TailscaleMode,
@@ -192,16 +190,19 @@ export default function WorkspacesPage() {
     }
   }, [newWorkspaceTemplate]);
 
+  const selectedWorkspaceId = selectedWorkspace?.id;
+  const selectedWorkspaceStatus = selectedWorkspace?.status;
+
   // Poll build progress when workspace is building, or fetch logs on error
   useEffect(() => {
-    if (!selectedWorkspace) {
+    if (!selectedWorkspaceId || !selectedWorkspaceStatus) {
       setBuildDebug(null);
       setBuildLog(null);
       return;
     }
 
-    const isBuilding = selectedWorkspace.status === 'building';
-    const hasError = selectedWorkspace.status === 'error';
+    const isBuilding = selectedWorkspaceStatus === 'building';
+    const hasError = selectedWorkspaceStatus === 'error';
 
     // Clear state when transitioning to ready or other non-error states
     if (!isBuilding && !hasError) {
@@ -220,8 +221,8 @@ export default function WorkspacesPage() {
     const fetchBuildInfo = async () => {
       try {
         const [debug, log] = await Promise.all([
-          getWorkspaceDebug(selectedWorkspace.id).catch(() => null),
-          getWorkspaceInitLog(selectedWorkspace.id).catch(() => null),
+          getWorkspaceDebug(selectedWorkspaceId).catch(() => null),
+          getWorkspaceInitLog(selectedWorkspaceId).catch(() => null),
         ]);
         if (cancelled) return;
         if (debug) setBuildDebug(debug);
@@ -229,9 +230,9 @@ export default function WorkspacesPage() {
 
         // Only poll for status updates when building (not when already in error state)
         if (isBuilding) {
-          const updated = await getWorkspace(selectedWorkspace.id);
+          const updated = await getWorkspace(selectedWorkspaceId);
           if (cancelled) return;
-          if (updated.status !== selectedWorkspace.status) {
+          if (updated.status !== selectedWorkspaceStatus) {
             setSelectedWorkspace(updated);
             await mutateWorkspaces();
           }
@@ -256,7 +257,7 @@ export default function WorkspacesPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedWorkspace?.id, selectedWorkspace?.status]);
+  }, [mutateWorkspaces, selectedWorkspaceId, selectedWorkspaceStatus]);
 
   // Auto-scroll build log to bottom when new content arrives
   useEffect(() => {

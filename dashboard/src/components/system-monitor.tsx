@@ -564,7 +564,6 @@ function ViewSelector({
 export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorProps) {
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
-  const [cpuHistory, setCpuHistory] = useState<number[]>([]);
   const [coreHistories, setCoreHistories] = useState<number[][]>([]);
   const [memoryHistory, setMemoryHistory] = useState<number[]>([]);
   const [networkRxHistory, setNetworkRxHistory] = useState<number[]>([]);
@@ -625,9 +624,6 @@ export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorPro
             if (historyData.length > 0) {
               // Set the latest metrics
               setMetrics(historyData[historyData.length - 1]);
-
-              // Populate histories from snapshot
-              setCpuHistory(historyData.map((m) => m.cpu_percent));
 
               // Build per-core histories
               const coreCount = historyData[0]?.cpu_cores?.length || 0;
@@ -700,12 +696,6 @@ export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorPro
           const data: SystemMetrics = parsed;
           setMetrics(data);
 
-          // Update CPU history
-          setCpuHistory((prev) => {
-            const next = [...prev, data.cpu_percent];
-            return next.slice(-maxHistory);
-          });
-
           // Update per-core histories
           setCoreHistories((prev) => {
             const newHistories = data.cpu_cores.map((corePercent, idx) => {
@@ -751,9 +741,10 @@ export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorPro
 
   // Connect on mount
   useEffect(() => {
-    connect();
+    const timer = window.setTimeout(connect, 0);
 
     return () => {
+      window.clearTimeout(timer);
       connectionIdRef.current += 1;
       wsRef.current?.close();
     };
@@ -772,8 +763,10 @@ export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorPro
   // Reset view target if the selected container disappears
   useEffect(() => {
     if (viewTarget !== "host" && !containerHistories.has(viewTarget)) {
-      setViewTarget("host");
+      const timer = window.setTimeout(() => setViewTarget("host"), 0);
+      return () => window.clearTimeout(timer);
     }
+    return undefined;
   }, [viewTarget, containerHistories]);
 
   // Calculate max for network chart

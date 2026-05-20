@@ -593,6 +593,11 @@ export function MissionAutomationsDialog({
     }
   }, [open, onClose, pendingDelete]);
 
+  const iterationProgress = useMemo(
+    () => getIterationProgressByAutomation(executions),
+    [executions]
+  );
+
   if (!open) return null;
 
   // -- Handlers --
@@ -611,7 +616,7 @@ export function MissionAutomationsDialog({
       setCreating(true);
       try {
         await postControlMessage(`/goal ${objective}`, { mission_id: missionId });
-        toast.success('Goal loop started — row will appear once the harness reports progress');
+        toast.success('Goal loop started. The row will appear once the harness reports progress');
         setNativeLoopObjective('');
         // Re-fetch automations shortly so the new row shows up without a
         // manual refresh. The observer runs asynchronously, so wait a beat.
@@ -880,11 +885,6 @@ export function MissionAutomationsDialog({
   const showLoadingPlaceholder = !!missionId && (!isMissionDataReady || (loading && !hasLoaded));
   const visibleAutomations = isMissionDataReady ? automations : [];
   const visibleError = isMissionDataReady ? error : null;
-  const iterationProgress = useMemo(
-    () => getIterationProgressByAutomation(executions),
-    [executions]
-  );
-
   const selectClass =
     'rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer';
   const selectStyle = {
@@ -1112,7 +1112,7 @@ export function MissionAutomationsDialog({
                               <code className="text-indigo-400/60">&lt;{b}/&gt;</code>
                             </span>
                           ))}
-                          {' '}— these are substituted automatically.
+                          {' '}These are substituted automatically.
                         </span>
                       </div>
                     )}

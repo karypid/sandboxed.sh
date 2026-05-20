@@ -237,7 +237,6 @@ function WorkerCard({
 export function WorkerPanel({
   childMissions,
   runningMissions,
-  bossMissionId,
   viewingMissionId,
   onSelectWorker,
   onClose,

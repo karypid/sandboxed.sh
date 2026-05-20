@@ -59,10 +59,7 @@ function getWorkspaceLabel(
   return null;
 }
 
-function getMissionDisplayName(
-  mission: Mission,
-  _workspaceNameById?: Record<string, string>
-): string {
+function getMissionDisplayName(mission: Mission): string {
   // Use title as primary name when available, fall back to animal codename
   const title = mission.title?.trim();
   if (title) {
@@ -500,12 +497,13 @@ export function missionSearchRelevanceScore(
       ? queryTerms.phraseQueries
       : [queryTerms.normalizedCoreQuery || queryTerms.normalizedQuery];
 
-  const displayName = getMissionDisplayName(mission, workspaceNameById);
+  const displayName = getMissionDisplayName(mission);
   const title = getMissionCardTitle(mission) ?? '';
   const shortDescription = mission.short_description?.trim() ?? '';
+  const workspaceLabel = getWorkspaceLabel(mission, workspaceNameById) ?? '';
   const backend = mission.backend?.trim() ?? '';
   const status = mission.status ?? '';
-  const combined = `${displayName} ${getMissionSearchText(mission)}`;
+  const combined = `${displayName} ${workspaceLabel} ${getMissionSearchText(mission)}`;
 
   const normalizedCombined = normalizeMetadataText(combined);
   if (!normalizedCombined) return 0;
@@ -514,6 +512,7 @@ export function missionSearchRelevanceScore(
     { weight: 5, tokens: tokenSetFromText(displayName) },
     { weight: 8, tokens: tokenSetFromText(title) },
     { weight: 7, tokens: tokenSetFromText(shortDescription) },
+    { weight: 3, tokens: tokenSetFromText(workspaceLabel) },
     { weight: 3, tokens: tokenSetFromText(backend) },
     { weight: 2, tokens: tokenSetFromText(status) },
     { weight: 1, tokens: tokenSetFromText(combined) },
@@ -1001,9 +1000,6 @@ export function MissionSwitcher({
 
   if (!open) return null;
 
-  const hasCurrent =
-    currentMissionId && !runningMissionIds.has(currentMissionId);
-
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]">
       {/* Backdrop */}
@@ -1138,7 +1134,7 @@ export function MissionSwitcher({
                         <div className="flex items-center gap-2">
                           <span className={cn("font-medium truncate", isWorkerItem ? "text-[13px]" : "text-sm")}>
                             {mission
-                              ? getMissionDisplayName(mission, workspaceNameById)
+                              ? getMissionDisplayName(mission)
                               : getMissionShortName(item.id)}
                           </span>
                           {mission && (() => {

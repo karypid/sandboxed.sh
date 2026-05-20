@@ -111,7 +111,7 @@ export default function LLMSettingsPage() {
         setTestResult(sample);
         toast.success('LLM connection working');
       } else {
-        toast.error('No response from LLM — check your API key and base URL');
+        toast.error('No response from LLM. Check your API key and base URL');
       }
     } catch (err) {
       toast.error(
@@ -191,7 +191,7 @@ export default function LLMSettingsPage() {
               <div>
                 <h2 className="text-sm font-medium text-white">Provider</h2>
                 <p className="text-xs text-white/40">
-                  Choose a fast LLM provider — Cerebras recommended for speed
+                  Choose a fast LLM provider. Cerebras is recommended for speed
                 </p>
               </div>
             </div>

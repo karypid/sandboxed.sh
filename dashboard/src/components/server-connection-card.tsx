@@ -66,9 +66,23 @@ interface ServerConnectionCardProps {
 // A logical "in-flight" operation key — either a host component update
 // (component name) or a per-workspace update (`${component}:${workspaceId}`).
 type OpKey = string;
+type ActiveOps = Record<OpKey, 'update' | 'uninstall'>;
 
 function workspaceOpKey(component: string, workspaceId: string): OpKey {
   return `${component}:${workspaceId}`;
+}
+
+function installedWorkspaces(report: ComponentWorkspaceReport | undefined) {
+  return report?.workspaces.filter((w) => w.version !== null) ?? [];
+}
+
+function syncableWorkspaces(report: ComponentWorkspaceReport | undefined) {
+  return installedWorkspaces(report).filter(
+    (w) =>
+      !w.in_sync &&
+      w.workspace_status === 'ready' &&
+      w.workspace_type === 'container'
+  );
 }
 
 export function ServerConnectionCard({
@@ -82,9 +96,8 @@ export function ServerConnectionCard({
   testApiConnection,
 }: ServerConnectionCardProps) {
   const [componentsExpanded, setComponentsExpanded] = useState(true);
-  const [activeOp, setActiveOp] = useState<OpKey | null>(null);
-  const [activeOpKind, setActiveOpKind] = useState<'update' | 'uninstall' | null>(null);
-  const [updateLogs, setUpdateLogs] = useState<UpdateLog[]>([]);
+  const [activeOps, setActiveOps] = useState<ActiveOps>({});
+  const [updateLogsByOp, setUpdateLogsByOp] = useState<Record<OpKey, UpdateLog[]>>({});
   const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
 
   // Fetch the legacy host-only summary AND the new per-workspace report in parallel.
@@ -123,37 +136,45 @@ export function ServerConnectionCard({
     ) => Promise<void>,
     successLabel: string
   ) => {
-    if (activeOp) return;
-    setActiveOp(opKey);
-    setActiveOpKind(kind);
-    setUpdateLogs([]);
+    if (activeOps[opKey]) return;
+    setActiveOps((prev) => ({ ...prev, [opKey]: kind }));
+    setUpdateLogsByOp((prev) => ({ ...prev, [opKey]: [] }));
 
     await operationFn(
       (event) => {
-        setUpdateLogs((prev) => [
+        setUpdateLogsByOp((prev) => ({
           ...prev,
-          {
-            message: event.message,
-            progress: event.progress ?? undefined,
-            type:
-              event.event_type === 'complete'
-                ? 'complete'
-                : event.event_type === 'error'
-                ? 'error'
-                : 'log',
-          },
-        ]);
+          [opKey]: [
+            ...(prev[opKey] ?? []),
+            {
+              message: event.message,
+              progress: event.progress ?? undefined,
+              type:
+                event.event_type === 'complete'
+                  ? 'complete'
+                  : event.event_type === 'error'
+                  ? 'error'
+                  : 'log',
+            },
+          ],
+        }));
       },
       async () => {
         toast.success(`${successLabel} ${kind === 'update' ? 'updated' : 'uninstalled'} successfully!`);
-        setActiveOp(null);
-        setActiveOpKind(null);
+        setActiveOps((prev) => {
+          const next = { ...prev };
+          delete next[opKey];
+          return next;
+        });
         refreshAll();
       },
       (error) => {
         toast.error(`${kind === 'update' ? 'Update' : 'Uninstall'} failed: ${error}`);
-        setActiveOp(null);
-        setActiveOpKind(null);
+        setActiveOps((prev) => {
+          const next = { ...prev };
+          delete next[opKey];
+          return next;
+        });
       }
     );
   };
@@ -191,13 +212,11 @@ export function ServerConnectionCard({
   };
 
   const handleSyncAll = (report: ComponentWorkspaceReport) => {
-    const outOfSync = report.workspaces.filter((w) => !w.in_sync);
+    const outOfSync = syncableWorkspaces(report);
     if (outOfSync.length === 0) return;
     // Sequential to avoid concurrent installs racing the same package manager.
     void (async () => {
       for (const ws of outOfSync) {
-        // Skip workspaces that aren't ready — the user gets a clear note next to them.
-        if (ws.workspace_status !== 'ready') continue;
         await new Promise<void>((resolve) => {
           runOperation(
             workspaceOpKey(report.name, ws.workspace_id),
@@ -229,7 +248,8 @@ export function ServerConnectionCard({
     component: ComponentInfo,
     report: ComponentWorkspaceReport | undefined
   ) => {
-    if (!report || report.workspaces.length === 0) {
+    const visibleWorkspaces = installedWorkspaces(report);
+    if (!report || visibleWorkspaces.length === 0) {
       // No workspace-level data: surface host status only.
       if (component.status === 'update_available') {
         return { label: 'Update available', tone: 'amber' as const };
@@ -239,8 +259,8 @@ export function ServerConnectionCard({
       }
       return { label: 'Synced', tone: 'emerald' as const };
     }
-    const total = report.workspaces.length;
-    const synced = report.workspaces.filter((w) => w.in_sync).length;
+    const total = visibleWorkspaces.length;
+    const synced = visibleWorkspaces.filter((w) => w.in_sync).length;
     const hostBehindUpstream = !!report.host_update_available;
     if (synced === total && !hostBehindUpstream) {
       return { label: `All ${total} synced`, tone: 'emerald' as const };
@@ -264,14 +284,22 @@ export function ServerConnectionCard({
   const toneDotClass = (tone: 'emerald' | 'amber' | 'red') =>
     tone === 'emerald' ? 'bg-emerald-400' : tone === 'amber' ? 'bg-amber-400' : 'bg-red-400';
 
-  const isOpInProgress = (key: OpKey) => activeOp === key && activeOpKind === 'update';
+  const isOpInProgress = (key: OpKey) => activeOps[key] === 'update';
+  const hasActiveOpsForComponent = (componentName: string) =>
+    Object.keys(activeOps).some((key) => key === componentName || key.startsWith(`${componentName}:`));
+  const logsForComponent = (componentName: string) => {
+    const key = Object.keys(updateLogsByOp)
+      .filter((candidate) => candidate === componentName || candidate.startsWith(`${componentName}:`))
+      .at(-1);
+    return key ? updateLogsByOp[key] ?? [] : [];
+  };
 
   // Default rows to expanded when the component has any drift, so the user
   // immediately sees the problem the page is meant to expose.
   const rowExpanded = (component: ComponentInfo, report?: ComponentWorkspaceReport) => {
     if (component.name in expandedRows) return expandedRows[component.name];
     if (!report) return false;
-    const hasDrift = report.workspaces.some((w) => !w.in_sync);
+    const hasDrift = installedWorkspaces(report).some((w) => !w.in_sync);
     return hasDrift;
   };
 
@@ -387,12 +415,13 @@ export function ServerConnectionCard({
               components.map((component) => {
                 const report = wsByName.get(component.name);
                 const summary = componentSyncSummary(component, report);
-                const outOfSync = report ? report.workspaces.filter((w) => !w.in_sync) : [];
-                const isExpanded = rowExpanded(component, report);
-                const hostOpInFlight = isOpInProgress(component.name);
-                const updateAvailableLine = component.update_available
-                  ? `v${component.update_available} available upstream`
-                  : null;
+                    const visibleWorkspaces = installedWorkspaces(report);
+                    const outOfSync = syncableWorkspaces(report);
+                    const isExpanded = rowExpanded(component, report);
+                    const hostOpInFlight = isOpInProgress(component.name);
+                    const componentLogs = logsForComponent(component.name);
+                    const displayVersion =
+                      component.update_available ?? component.version;
 
                 return (
                   <div
@@ -425,8 +454,8 @@ export function ServerConnectionCard({
                           <span className="text-sm text-white/80">
                             {componentNames[component.name] || component.name}
                           </span>
-                          {component.version && (
-                            <span className="text-xs text-white/40">v{component.version}</span>
+                          {displayVersion && (
+                            <span className="text-xs text-white/40">v{displayVersion}</span>
                           )}
                           <span
                             className={cn(
@@ -438,9 +467,6 @@ export function ServerConnectionCard({
                             {summary.label}
                           </span>
                         </div>
-                        {updateAvailableLine && (
-                          <div className="text-xs text-amber-400/80 mt-0.5">{updateAvailableLine}</div>
-                        )}
                         {!component.installed && (
                           <div className="text-xs text-red-400/80 mt-0.5">Not installed on host</div>
                         )}
@@ -451,7 +477,7 @@ export function ServerConnectionCard({
                         {component.status === 'update_available' && (
                           <button
                             onClick={() => handleHostUpdate(component)}
-                            disabled={activeOp !== null}
+                            disabled={!!activeOps[component.name]}
                             className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 border border-indigo-500/30 px-2.5 py-1 text-xs text-indigo-300 hover:bg-indigo-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                             title="Update host installation"
                           >
@@ -466,7 +492,7 @@ export function ServerConnectionCard({
                         {component.status === 'not_installed' && (
                           <button
                             onClick={() => handleHostUpdate(component)}
-                            disabled={activeOp !== null}
+                            disabled={!!activeOps[component.name]}
                             className="flex items-center gap-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             <ArrowUp className="h-3 w-3" />
@@ -476,9 +502,9 @@ export function ServerConnectionCard({
                         {report && outOfSync.length > 0 && (
                           <button
                             onClick={() => handleSyncAll(report)}
-                            disabled={activeOp !== null}
+                            disabled={hasActiveOpsForComponent(component.name)}
                             className="flex items-center gap-1.5 rounded-lg bg-amber-500/20 border border-amber-500/30 px-2.5 py-1 text-xs text-amber-300 hover:bg-amber-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                            title="Sync all out-of-sync workspaces"
+                            title="Sync installed workspaces that are behind the host version"
                           >
                             <ArrowUp className="h-3 w-3" />
                             Sync {outOfSync.length}
@@ -487,7 +513,7 @@ export function ServerConnectionCard({
                         {component.installed && component.name !== 'sandboxed_sh' && (
                           <button
                             onClick={() => handleHostUninstall(component)}
-                            disabled={activeOp !== null}
+                            disabled={!!activeOps[component.name]}
                             className="p-1.5 rounded-lg text-white/30 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                             title={`Uninstall ${componentNames[component.name] || component.name}`}
                           >
@@ -507,16 +533,21 @@ export function ServerConnectionCard({
                     </div>
 
                     {/* Per-workspace detail rows */}
-                    {report && isExpanded && (
+                    {report && isExpanded && visibleWorkspaces.length > 0 && (
                       <div className="border-t border-white/[0.06] px-3 py-2 space-y-1.5">
-                        <div className="text-[10px] uppercase tracking-wider text-white/30 px-1">
-                          Workspaces
+                        <div className="flex items-center justify-between px-1">
+                          <span className="text-[10px] uppercase tracking-wider text-white/30">
+                            Installed workspaces
+                          </span>
+                          <span className="text-[10px] text-white/30">
+                            Uninstalled containers are omitted
+                          </span>
                         </div>
-                        {report.workspaces.map((ws) => {
+                        {visibleWorkspaces.map((ws) => {
                           const opKey = workspaceOpKey(component.name, ws.workspace_id);
                           const inFlight = isOpInProgress(opKey);
                           const versionLabel = ws.version ? `v${ws.version}` : 'not installed';
-                          const dotTone = ws.in_sync ? 'bg-emerald-400' : ws.version ? 'bg-amber-400' : 'bg-red-400';
+                          const dotTone = ws.in_sync ? 'bg-emerald-400' : 'bg-amber-400';
                           return (
                             <div key={ws.workspace_id} className="flex items-center gap-2 text-xs">
                               <span className={cn('h-1.5 w-1.5 rounded-full shrink-0', dotTone)} />
@@ -539,7 +570,7 @@ export function ServerConnectionCard({
                               {!ws.in_sync && ws.workspace_status === 'ready' && ws.workspace_type === 'container' && (
                                 <button
                                   onClick={() => handleWorkspaceUpdate(component.name, ws)}
-                                  disabled={activeOp !== null}
+                                  disabled={!!activeOps[opKey]}
                                   className="flex items-center gap-1.5 rounded-md bg-indigo-500/15 border border-indigo-500/25 px-2 py-0.5 text-[10px] text-indigo-300 hover:bg-indigo-500/25 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                   {inFlight ? (
@@ -557,13 +588,11 @@ export function ServerConnectionCard({
                     )}
 
                     {/* In-flight operation logs (host or workspace) */}
-                    {activeOp &&
-                      (activeOp === component.name ||
-                        activeOp.startsWith(`${component.name}:`)) &&
-                      updateLogs.length > 0 && (
+                    {hasActiveOpsForComponent(component.name) &&
+                      componentLogs.length > 0 && (
                         <div className="border-t border-white/[0.06] px-3 py-2">
                           <div className="max-h-32 overflow-y-auto text-xs space-y-1 font-mono">
-                            {updateLogs.map((log, i) => (
+                            {componentLogs.map((log, i) => (
                               <div
                                 key={i}
                                 className={cn(

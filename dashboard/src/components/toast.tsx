@@ -131,7 +131,7 @@ interface ToastItemProps {
 function ToastItem({ toast, onDismiss, onShowDetails }: ToastItemProps) {
   const [isHovered, setIsHovered] = useState(false);
   const [isExiting, setIsExiting] = useState(false);
-  const startTimeRef = useRef<number>(Date.now());
+  const startTimeRef = useRef<number>(0);
   const remainingRef = useRef<number>(toast.duration);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -151,6 +151,7 @@ function ToastItem({ toast, onDismiss, onShowDetails }: ToastItemProps) {
       return;
     }
 
+    startTimeRef.current = Date.now();
     timerRef.current = setTimeout(dismiss, remainingRef.current);
 
     return () => {

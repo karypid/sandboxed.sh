@@ -594,7 +594,7 @@ function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isAct
     };
     
     return ws;
-  }, []);
+  }, [tabId]);
 
   // Initialize terminal (only once per tab instance)
   useEffect(() => {
@@ -705,7 +705,7 @@ function TerminalTab({ tabId, isActive, onStatusChange }: { tabId: string; isAct
         terminalInitializedRef.current = false;
       };
     }
-  }, [isActive, connectWebSocket]);
+  }, [isActive, connectWebSocket, tabId]);
 
   // Reconnect function
   const reconnect = useCallback(() => {
@@ -934,7 +934,7 @@ function WorkspaceShellTab({
     };
 
     return ws;
-  }, [workspaceId, workspaceName]);
+  }, [diagnoseApiReachability, tabId, workspaceId, workspaceName]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1056,7 +1056,7 @@ function WorkspaceShellTab({
         terminalInitializedRef.current = false;
       };
     }
-  }, [isActive, connectWebSocket, workspaceName]);
+  }, [isActive, connectWebSocket, tabId, workspaceId, workspaceName]);
 
   const reconnect = useCallback(() => {
     const term = termRef.current;
@@ -1545,7 +1545,7 @@ function FilesTab({ isActive }: { tabId: string; isActive: boolean }) {
                     <span className="truncate">{e.name}</span>
                   </div>
                   <div className="col-span-3 text-right text-[var(--foreground-muted)] tabular-nums">
-                    {e.kind === "file" ? formatBytes(e.size) : "—"}
+                    {e.kind === "file" ? formatBytes(e.size) : "N/A"}
                   </div>
                   <div className="col-span-2 text-right text-[var(--foreground-muted)]">
                     {e.kind}

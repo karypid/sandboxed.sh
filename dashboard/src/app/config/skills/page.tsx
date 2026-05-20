@@ -307,7 +307,7 @@ function FrontmatterEditor({ frontmatter, onChange, disabled }: FrontmatterEdito
           {descriptionHasSpecialChars && (
             <p className="text-xs text-blue-400/80 mt-1 flex items-center gap-1">
               <Check className="h-3 w-3" />
-              Contains special characters — will be auto-quoted for valid YAML
+              Contains special characters. This will be auto-quoted for valid YAML
             </p>
           )}
         </div>

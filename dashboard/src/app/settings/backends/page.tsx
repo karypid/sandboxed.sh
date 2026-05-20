@@ -269,7 +269,7 @@ export default function BackendsPage() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full max-w-xl space-y-6">
+      <div className="w-full max-w-6xl space-y-6">
         {/* Header */}
         <div className="mb-8">
           <h1 className="text-xl font-semibold text-white">Backends</h1>
@@ -278,35 +278,38 @@ export default function BackendsPage() {
           </p>
         </div>
 
-        {/* Server Connection */}
-        <ServerConnectionCard
-          apiUrl={apiUrl}
-          setApiUrl={setApiUrl}
-          urlError={urlError}
-          validateUrl={validateUrl}
-          health={health ?? null}
-          healthLoading={healthLoading}
-          testingConnection={testingConnection}
-          testApiConnection={testApiConnection}
-        />
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.85fr)]">
+          <div className="space-y-4">
+            {/* Server Connection */}
+            <ServerConnectionCard
+              apiUrl={apiUrl}
+              setApiUrl={setApiUrl}
+              urlError={urlError}
+              validateUrl={validateUrl}
+              health={health ?? null}
+              healthLoading={healthLoading}
+              testingConnection={testingConnection}
+              testApiConnection={testApiConnection}
+            />
 
-        {/* Save URL button */}
-        {hasUnsavedUrlChanges && (
-          <div className="flex items-center justify-end gap-3 -mt-4 mb-6">
-            <span className="text-xs text-amber-400">Unsaved changes</span>
-            <button
-              onClick={handleSaveUrl}
-              disabled={!!urlError}
-              className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <Save className="h-3.5 w-3.5" />
-              Save URL
-            </button>
+            {/* Save URL button */}
+            {hasUnsavedUrlChanges && (
+              <div className="flex items-center justify-end gap-3">
+                <span className="text-xs text-amber-400">Unsaved changes</span>
+                <button
+                  onClick={handleSaveUrl}
+                  disabled={!!urlError}
+                  className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Save className="h-3.5 w-3.5" />
+                  Save URL
+                </button>
+              </div>
+            )}
           </div>
-        )}
 
-        {/* Backends */}
-        <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+          {/* Backends */}
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
           <div className="flex items-center gap-3 mb-4">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10">
               <Server className="h-5 w-5 text-emerald-400" />
@@ -319,66 +322,68 @@ export default function BackendsPage() {
             </div>
           </div>
 
-          <div className="mb-4 rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
-            <label className="block text-xs text-white/60 mb-1.5">
-              Max Parallel Missions
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                type="number"
-                min={1}
-                step={1}
-                value={maxParallelMissionsValue}
-                onChange={(e) => setMaxParallelMissionsValue(e.target.value)}
-                className="w-32 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
-              />
-              <button
-                onClick={handleSaveMissionLimit}
-                disabled={savingMissionLimit}
-                className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
-              >
-                {savingMissionLimit ? (
-                  <Loader className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Save className="h-3.5 w-3.5" />
-                )}
-                Save Limit
-              </button>
+          <div className="mb-4 grid gap-3 sm:grid-cols-2">
+            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+              <label className="block text-xs text-white/60 mb-1.5">
+                Max Parallel Missions
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={maxParallelMissionsValue}
+                  onChange={(e) => setMaxParallelMissionsValue(e.target.value)}
+                  className="min-w-0 flex-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
+                />
+                <button
+                  onClick={handleSaveMissionLimit}
+                  disabled={savingMissionLimit}
+                  className="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-500 text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                  title="Save mission limit"
+                >
+                  {savingMissionLimit ? (
+                    <Loader className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Save className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              </div>
+              <p className="mt-1.5 text-xs text-white/30">
+                Global mission concurrency.
+              </p>
             </div>
-            <p className="mt-1.5 text-xs text-white/30">
-              Global limit across all backends. Controls how many missions can run at the same time.
-            </p>
-          </div>
 
-          <div className="mb-4 rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
-            <label className="block text-xs text-white/60 mb-1.5">
-              Max Concurrent Tasks
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                type="number"
-                min={1}
-                step={1}
-                value={maxConcurrentTasksValue}
-                onChange={(e) => setMaxConcurrentTasksValue(e.target.value)}
-                className="w-32 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
-              />
-              <button
-                onClick={handleSaveTaskLimit}
-                disabled={savingTaskLimit}
-                className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
-              >
-                {savingTaskLimit ? (
-                  <Loader className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Save className="h-3.5 w-3.5" />
-                )}
-                Save Limit
-              </button>
+            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+              <label className="block text-xs text-white/60 mb-1.5">
+                Max Concurrent Tasks
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={maxConcurrentTasksValue}
+                  onChange={(e) => setMaxConcurrentTasksValue(e.target.value)}
+                  className="min-w-0 flex-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
+                />
+                <button
+                  onClick={handleSaveTaskLimit}
+                  disabled={savingTaskLimit}
+                  className="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-500 text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                  title="Save task limit"
+                >
+                  {savingTaskLimit ? (
+                    <Loader className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Save className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              </div>
+              <p className="mt-1.5 text-xs text-white/30">
+                Command-mode task concurrency.
+              </p>
             </div>
-            <p className="mt-1.5 text-xs text-white/30">
-              Max command-mode tasks that can run simultaneously. Returns 429 when the limit is reached. Default: 5. Env: MAX_CONCURRENT_TASKS.
-            </p>
           </div>
 
           <div className="flex items-center gap-2 mb-4">
@@ -592,6 +597,7 @@ export default function BackendsPage() {
               </div>
             </div>
           ) : null}
+          </div>
         </div>
       </div>
     </div>

@@ -96,15 +96,18 @@ export function Sidebar() {
 
   // Auto-expand sections if we're on their subpages
   useEffect(() => {
-    if (pathname.startsWith('/config')) {
-      setExpandedItems((prev) => new Set([...prev, 'Library']));
-    }
-    if (pathname.startsWith('/inspect')) {
-      setExpandedItems((prev) => new Set([...prev, 'Inspect']));
-    }
-    if (pathname.startsWith('/settings')) {
-      setExpandedItems((prev) => new Set([...prev, 'Settings']));
-    }
+    const timer = window.setTimeout(() => {
+      if (pathname.startsWith('/config')) {
+        setExpandedItems((prev) => new Set([...prev, 'Library']));
+      }
+      if (pathname.startsWith('/inspect')) {
+        setExpandedItems((prev) => new Set([...prev, 'Inspect']));
+      }
+      if (pathname.startsWith('/settings')) {
+        setExpandedItems((prev) => new Set([...prev, 'Settings']));
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [pathname]);
 
   // Stream control events for real-time status

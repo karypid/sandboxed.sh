@@ -41,7 +41,6 @@ import { cn, formatCents } from '@/lib/utils';
 import { NewMissionDialog } from '@/components/new-mission-dialog';
 import {
   categorizeMissions,
-  finishedTone,
   getMissionTextColor,
   getMissionTitle,
   isFinishedStatus,
@@ -307,7 +306,7 @@ function OverviewPageContent() {
   }, [initialWorkspaceId, router]);
 
   // SWR: poll stats every 3 seconds
-  const { data: stats, isLoading: statsLoading, error: statsError } = useSWR(
+  const { data: stats, isLoading: statsLoading } = useSWR(
     'stats',
     getStats,
     {

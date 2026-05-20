@@ -158,7 +158,6 @@ export {
   createMissionAutomation,
   getAutomation,
   updateAutomation,
-  updateAutomationActive,
   deleteAutomation,
   getAutomationExecutions,
   getMissionAutomationExecutions,

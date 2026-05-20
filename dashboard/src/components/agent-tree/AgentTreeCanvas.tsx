@@ -95,7 +95,6 @@ interface AgentTreeCanvasProps {
  */
 function AnimatedEdge({ edge, index }: { edge: LayoutEdge; index: number }) {
   const colors = STATUS_COLORS[edge.status];
-  const pathId = `edge-path-${edge.id}`;
   
   // Curved path from parent to child
   const midY = (edge.from.y + edge.to.y) / 2;
@@ -584,9 +583,13 @@ export function AgentTreeCanvas({
         ? (dimensions.height - scaledHeight) / 2 
         : compact ? 20 : 30; // Start near top if tree is too tall
       
-      setZoom(fitZoom);
-      setPan({ x: centerX, y: centerY });
+      const timer = window.setTimeout(() => {
+        setZoom(fitZoom);
+        setPan({ x: centerX, y: centerY });
+      }, 0);
+      return () => window.clearTimeout(timer);
     }
+    return undefined;
   }, [layout.width, layout.height, dimensions.width, dimensions.height, compact]);
   
   // Pan handlers

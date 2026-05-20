@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { listTasks, stopTask, type Task, type TaskStep } from "@/lib/api/tasks";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { useDocumentVisible } from "@/hooks/use-visibility-polling";
+import { useNow } from "@/lib/now-tick";
 import {
   Clock,
   Loader,
@@ -148,10 +149,11 @@ function LogViewer({ task }: { task: Task }) {
 
 function TaskRow({ task, onStop, stopping }: { task: Task; onStop: (id: string) => void; stopping: boolean }) {
   const [expanded, setExpanded] = useState(false);
+  const nowMs = useNow();
 
   const started = task.started_at ?? task.log[0]?.timestamp;
   const elapsed = started
-    ? Math.round((Date.now() - new Date(started).getTime()) / 1000)
+    ? Math.round((nowMs - new Date(started).getTime()) / 1000)
     : null;
 
   return (

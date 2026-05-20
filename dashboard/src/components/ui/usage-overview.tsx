@@ -293,7 +293,7 @@ function CostAreaChart({
           padTop + chartH - (maxCost > 0 ? p.cost_cents / maxCost : 0) * chartH;
         return { x, y };
       }),
-    [points, maxCost, chartW, chartH, padX, padTop, baselineY]
+    [points, maxCost, chartW, chartH, padX, padTop]
   );
   const linePath = useMemo(
     () => buildSmoothPath(linePoints, baselineY, false),
@@ -549,7 +549,7 @@ function ProviderDistribution({ models }: { models: ModelUsageSummary[] }) {
                   key={provider}
                   className="h-full"
                   style={{ width: `${pct}%`, backgroundColor: providerColor(provider) }}
-                  title={`${provider} — ${pct.toFixed(1)}%`}
+                  title={`${provider}: ${pct.toFixed(1)}%`}
                 />
               );
             })}
@@ -862,7 +862,7 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
               sub={
                 totals!.requests > 0
                   ? `${fmtCompact(Math.round(totals!.output_tokens / totals!.requests))} avg per call`
-                  : '—'
+                  : 'N/A'
               }
             />
             <MetricTile

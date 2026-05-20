@@ -5,12 +5,11 @@ import Link from "next/link";
 import useSWR from "swr";
 import { toast } from "@/components/toast";
 import { cn } from "@/lib/utils";
-import { listMissions, getMissionTree, deleteMission, cleanupEmptyMissions, Mission } from "@/lib/api";
+import { listMissions, getMissionTree, deleteMission, cleanupEmptyMissions } from "@/lib/api";
 import { CopyButton } from "@/components/ui/copy-button";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { AgentTreeCanvas, type AgentNode } from "@/components/agent-tree";
 import {
-  Clock,
   Loader,
   ArrowRight,
   Search,

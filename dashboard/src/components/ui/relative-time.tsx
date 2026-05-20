@@ -1,15 +1,15 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useMemo } from 'react';
+import { useNow } from '@/lib/now-tick';
 
 interface RelativeTimeProps {
   date: string | Date;
   className?: string;
 }
 
-function getRelativeTime(date: Date): string {
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
+function getRelativeTime(date: Date, nowMs: number): string {
+  const diffMs = nowMs - date.getTime();
   const diffSec = Math.floor(diffMs / 1000);
   const diffMin = Math.floor(diffSec / 60);
   const diffHour = Math.floor(diffMin / 60);
@@ -27,6 +27,7 @@ function getRelativeTime(date: Date): string {
 }
 
 export function RelativeTime({ date, className }: RelativeTimeProps) {
+  const nowMs = useNow();
   // Memoize timestamp to avoid recreating Date object on every render
   const timestamp = useMemo(() => {
     const d = typeof date === 'string' ? new Date(date) : date;
@@ -34,19 +35,7 @@ export function RelativeTime({ date, className }: RelativeTimeProps) {
   }, [date]);
 
   const dateObj = useMemo(() => new Date(timestamp), [timestamp]);
-  const [relativeTime, setRelativeTime] = useState(() => getRelativeTime(dateObj));
-
-  // Update relative time periodically
-  useEffect(() => {
-    // Update immediately in case timestamp changed
-    setRelativeTime(getRelativeTime(dateObj));
-
-    const interval = setInterval(() => {
-      setRelativeTime(getRelativeTime(dateObj));
-    }, 60000); // Update every minute
-
-    return () => clearInterval(interval);
-  }, [dateObj, timestamp]);
+  const relativeTime = getRelativeTime(dateObj, nowMs);
 
   return (
     <span
@@ -57,9 +46,3 @@ export function RelativeTime({ date, className }: RelativeTimeProps) {
     </span>
   );
 }
-
-
-
-
-
-

@@ -180,14 +180,6 @@ export async function updateAutomation(
   return normalizeAutomation(data);
 }
 
-/** @deprecated Use updateAutomation instead */
-export async function updateAutomationActive(
-  automationId: string,
-  active: boolean
-): Promise<Automation> {
-  return updateAutomation(automationId, { active });
-}
-
 export async function deleteAutomation(automationId: string): Promise<void> {
   await apiDel(`/api/control/automations/${automationId}`, "Failed to delete automation");
 }

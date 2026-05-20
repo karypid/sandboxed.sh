@@ -17,14 +17,11 @@ import {
   type ChainEntry,
   type ResolvedEntry,
   type AccountHealthSnapshot,
-  type FallbackEvent,
-  type RtkStats,
 } from '@/lib/api/model-routing';
 import {
   listProxyApiKeys,
   createProxyApiKey,
   deleteProxyApiKey,
-  type ProxyApiKeySummary,
 } from '@/lib/api/proxy-keys';
 import {
   listProviders,
@@ -579,7 +576,7 @@ function HealthDashboard({
             <span className="text-emerald-400/60">
               {h.total_requests > 0
                 ? `${Math.round((h.total_successes / h.total_requests) * 100)}%`
-                : '—'}
+                : 'N/A'}
             </span>
             {h.is_degraded && (
               <span className="text-amber-400/80 font-medium">degraded</span>
@@ -1010,7 +1007,7 @@ export default function ModelRoutingPage() {
             <div className="text-center py-4">
               {rtkEnabled ? (
                 <>
-                  <p className="text-xs text-white/50">RTK is enabled — waiting for a wrapped command.</p>
+                  <p className="text-xs text-white/50">RTK is enabled and waiting for a wrapped command.</p>
                   <p className="mt-1 text-[10px] text-white/30">
                     Only commands run through the MCP terminal tool are wrapped. Claude Code and OpenCode
                     default to built-in bash, which bypasses RTK.
@@ -1187,7 +1184,7 @@ export default function ModelRoutingPage() {
               {createdKey && (
                 <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3">
                   <p className="text-[10px] text-emerald-400/80 mb-1">
-                    Copy this key now — it won&apos;t be shown again
+                    Copy this key now. It won&apos;t be shown again
                   </p>
                   <div className="flex items-center gap-2">
                     <code className="flex-1 text-xs text-emerald-300 font-mono break-all">

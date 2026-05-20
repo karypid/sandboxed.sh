@@ -171,8 +171,12 @@ export function SubagentsPanel({
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_SUBAGENTS);
   useEffect(() => {
     if (sorted.length < visibleCount) {
-      setVisibleCount(Math.max(INITIAL_VISIBLE_SUBAGENTS, sorted.length));
+      const timer = window.setTimeout(() => {
+        setVisibleCount(Math.max(INITIAL_VISIBLE_SUBAGENTS, sorted.length));
+      }, 0);
+      return () => window.clearTimeout(timer);
     }
+    return undefined;
   }, [sorted.length, visibleCount]);
   const visible = sorted.slice(0, visibleCount);
   const hidden = Math.max(0, sorted.length - visibleCount);

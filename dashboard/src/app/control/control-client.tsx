@@ -66,7 +66,6 @@ import {
   loadMission,
   markMissionOpened,
   getMission,
-  getMissionEvents,
   getMissionEventsWithMeta,
   getMissionSnapshot,
   searchMissionMoments,
@@ -103,7 +102,6 @@ import {
   type UploadProgress,
   type Workspace,
   type DesktopSessionDetail,
-  type DesktopSessionStatus,
   type StoredEvent,
   type SharedFile,
 } from "@/lib/api";
@@ -148,11 +146,10 @@ import {
   HelpCircle,
   PanelRightClose,
   PanelRight,
-  Wifi,
   WifiOff,
   AlertTriangle,
   Download,
-  Image,
+  Image as ImageIcon,
   FileArchive,
   File,
   ExternalLink,
@@ -184,9 +181,9 @@ type EventsWorkerResponse =
   | { id: number; ok: false; error: string };
 
 function formatDiagAge(ts?: number) {
-  if (!ts) return "—";
+  if (!ts) return "N/A";
   const deltaMs = Date.now() - ts;
-  if (deltaMs < 0) return "—";
+  if (deltaMs < 0) return "N/A";
   const secs = Math.floor(deltaMs / 1000);
   if (secs < 5) return "just now";
   if (secs < 60) return `${secs}s ago`;
@@ -234,19 +231,15 @@ function streamLog(
   const args = meta ? [prefix, message, meta] : [prefix, message];
   switch (level) {
     case "debug":
-      // eslint-disable-next-line no-console
       console.debug(...args);
       break;
     case "info":
-      // eslint-disable-next-line no-console
       console.info(...args);
       break;
     case "warn":
-      // eslint-disable-next-line no-console
       console.warn(...args);
       break;
     case "error":
-      // eslint-disable-next-line no-console
       console.error(...args);
       break;
   }
@@ -575,7 +568,7 @@ function QuestionToolItem({
   useEffect(() => {
     setAnswers(questions.map(() => []));
     setOtherText({});
-  }, [item.toolCallId, questions.length]);
+  }, [item.toolCallId, questions]);
 
   const hasResult = item.result !== undefined;
 
@@ -636,7 +629,11 @@ function QuestionToolItem({
   };
 
   return (
-    <div className="flex justify-start gap-3">
+    <div
+      id={`chat-item-${item.id}`}
+      data-chat-item-id={item.id}
+      className="flex justify-start gap-3"
+    >
       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
         <Bot className="h-4 w-4 text-indigo-400" />
       </div>
@@ -812,52 +809,13 @@ function QuestionToolItem({
   );
 }
 
-/**
- * Generate a unique fingerprint for comparing message content.
- * Uses a delimiter that's unlikely to appear in message content to avoid
- * false matches when content contains newlines or role prefixes.
- */
-function getMessageFingerprint(kind: string, content: string): string {
-  return `${kind}\x00${content.length}\x00${content}`;
-}
-
-/**
- * Compare current items with mission history by content fingerprints.
- * Returns true if the history has changed (contents differ).
- */
-function hasHistoryChanged(
-  items: ReadonlyArray<{ kind: string; content?: string }>,
-  history: ReadonlyArray<{ role: string; content?: string | null }> | undefined,
-): boolean {
-  const historyEntries = Array.isArray(history) ? history : [];
-  const currentFingerprints = items
-    .filter((i) => i.kind === "user" || i.kind === "assistant")
-    .map((i) => getMessageFingerprint(i.kind, i.content || ""));
-
-  const newFingerprints = historyEntries.map((e) =>
-    getMessageFingerprint(
-      e.role === "user" ? "user" : "assistant",
-      e.content || "",
-    ),
+function isPendingUserInputTool(item: ChatItem): boolean {
+  if (item.kind !== "tool" || item.result !== undefined) return false;
+  return (
+    item.name === "question" ||
+    item.name === "AskUserQuestion" ||
+    item.name === "ui_optionList"
   );
-
-  // If current items have MORE messages than API history, the API is stale (SSE delivered
-  // messages that haven't been persisted yet). Don't replace - we'd lose messages.
-  // But first verify the overlapping content matches to detect content mismatches.
-  if (currentFingerprints.length > newFingerprints.length) {
-    // Verify that all API messages match the corresponding local messages
-    const hasContentMismatch = newFingerprints.some(
-      (fp, i) => fp !== currentFingerprints[i],
-    );
-    // If content matches, keep local (has more messages). If mismatch, history changed.
-    return hasContentMismatch;
-  }
-
-  // If API has more messages, history has changed (e.g., messages from another session)
-  if (currentFingerprints.length < newFingerprints.length) return true;
-
-  // Same count - check if content differs
-  return currentFingerprints.some((fp, i) => fp !== newFingerprints[i]);
 }
 
 function formatTime(timestamp: number): string {
@@ -1251,7 +1209,7 @@ function SharedFilePreviewModal({
 // Shared file card component - renders images inline and other files as download cards
 function SharedFileCard({ file }: { file: SharedFile }) {
   const iconMap: Record<SharedFile["kind"], typeof File> = {
-    image: Image,
+    image: ImageIcon,
     document: FileText,
     archive: FileArchive,
     code: Code,
@@ -1360,16 +1318,19 @@ function SharedFileCard({ file }: { file: SharedFile }) {
           {loading && !blobUrl ? (
             <div className="h-[240px] w-full animate-pulse bg-white/[0.03]" />
           ) : (
-            <img
-              src={blobUrl || resolvedUrl}
-              alt={file.name}
-              className="max-w-full max-h-[400px] object-contain"
-              loading="lazy"
-            />
+            <>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={blobUrl || resolvedUrl}
+                alt={file.name}
+                className="max-w-full max-h-[400px] object-contain"
+                loading="lazy"
+              />
+            </>
           )}
         </button>
         <div className="flex items-center gap-2 px-3 py-2 text-xs text-white/40 border-t border-white/[0.06]">
-          <Image className="h-3 w-3" />
+          <ImageIcon aria-hidden="true" className="h-3 w-3" />
           <span className="truncate flex-1">{file.name}</span>
           {sizeLabel && <span>{sizeLabel}</span>}
           <button
@@ -2662,7 +2623,7 @@ const SubagentToolItem = memo(function SubagentToolItem({
                   <span className="text-xs text-amber-400">Cancelled</span>
                   {summary && (
                     <span className="text-xs text-white/40 truncate max-w-[200px]">
-                      — {summary}
+                      · {summary}
                     </span>
                   )}
                 </>
@@ -2673,7 +2634,7 @@ const SubagentToolItem = memo(function SubagentToolItem({
                   </span>
                   {summary && (
                     <span className="text-xs text-white/40 truncate max-w-[200px]">
-                      — {summary}
+                      · {summary}
                     </span>
                   )}
                 </>
@@ -2803,6 +2764,7 @@ function ImagePreview({
 
   useEffect(() => {
     let cancelled = false;
+    let objectUrl: string | null = null;
     const loadImage = async () => {
       setLoading(true);
       setError(null);
@@ -2823,6 +2785,7 @@ function ImagePreview({
         const blob = await res.blob();
         if (cancelled) return;
         const url = URL.createObjectURL(blob);
+        objectUrl = url;
         setImageUrl(url);
       } catch (e) {
         if (cancelled) return;
@@ -2834,9 +2797,8 @@ function ImagePreview({
     loadImage();
     return () => {
       cancelled = true;
-      if (imageUrl) URL.revokeObjectURL(imageUrl);
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, workspaceId, missionId]);
 
   const openInNewTab = () => {
@@ -2868,7 +2830,7 @@ function ImagePreview({
   return (
     <div className="mt-2">
       <div className="text-[10px] uppercase tracking-wider text-white/30 mb-1 flex items-center gap-2">
-        <Image className="h-3 w-3" />
+        <ImageIcon aria-hidden="true" className="h-3 w-3" />
         Screenshot Preview
       </div>
       <div
@@ -3512,7 +3474,11 @@ const ChatItemRow = memo(function ChatItemRow({
         const confirmed = item.result as OptionListSelection | undefined;
 
         return (
-          <div className="flex justify-start gap-3">
+          <div
+            id={`chat-item-${item.id}`}
+            data-chat-item-id={item.id}
+            className="flex justify-start gap-3"
+          >
             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
               <Bot className="h-4 w-4 text-indigo-400" />
             </div>
@@ -3555,7 +3521,11 @@ const ChatItemRow = memo(function ChatItemRow({
         const dataTable = parseSerializableDataTable(rawArgs);
 
         return (
-          <div className="flex justify-start gap-3">
+          <div
+            id={`chat-item-${item.id}`}
+            data-chat-item-id={item.id}
+            className="flex justify-start gap-3"
+          >
             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
               <Bot className="h-4 w-4 text-indigo-400" />
             </div>
@@ -3799,6 +3769,10 @@ export default function ControlClient() {
   const [visibleItemsLimit, setVisibleItemsLimit] = useState(
     INITIAL_VISIBLE_ITEMS,
   );
+  // Store items per mission to preserve context when switching.
+  const [missionItems, setMissionItems] = useState<Record<string, ChatItem[]>>(
+    {},
+  );
 
   // Memory pressure safety valve. Long-running missions (25k+ events, each
   // with large tool_result payloads) have crashed the Brave/Chrome tab with
@@ -3825,7 +3799,7 @@ export default function ControlClient() {
         if (prev.length <= KEEP_TAIL_ITEMS) return prev;
         console.warn(
           `[mission-debug] heap ${(used / 1_048_576).toFixed(0)} MB exceeded ` +
-            `${SHED_HEAP_BYTES / 1_048_576} MB — trimming items ` +
+            `${SHED_HEAP_BYTES / 1_048_576} MB; trimming items ` +
             `${prev.length} → ${KEEP_TAIL_ITEMS}`,
         );
         return prev.slice(-KEEP_TAIL_ITEMS);
@@ -3851,7 +3825,7 @@ export default function ControlClient() {
     }
     window.addEventListener("mission-debug-stats", onStats);
     return () => window.removeEventListener("mission-debug-stats", onStats);
-  }, []);
+  }, [setItems, setMissionItems]);
 
   // Connection state for SSE stream - starts as disconnected until first event received
   const [connectionState, setConnectionState] = useState<
@@ -3914,12 +3888,8 @@ export default function ControlClient() {
   // This can differ from currentMission when viewing a parallel mission; the
   // value itself lives in `controlViewingMissionStore`.
 
-  // Store items per mission to preserve context when switching
-  // Limited to MAX_CACHED_MISSIONS to prevent memory bloat
+  // Limit mission item caches to prevent memory bloat.
   const MAX_CACHED_MISSIONS = 5;
-  const [missionItems, setMissionItems] = useState<Record<string, ChatItem[]>>(
-    {},
-  );
 
   // Helper to update missionItems with LRU-style cleanup
   const updateMissionItems = useCallback(
@@ -3938,10 +3908,6 @@ export default function ControlClient() {
     [],
   );
 
-  // Attachment state
-  const [attachments, setAttachments] = useState<
-    { file: File; uploading: boolean }[]
-  >([]);
   const [uploadQueue, setUploadQueue] = useState<string[]>([]);
   const [uploadProgress, setUploadProgress] = useState<{
     fileName: string;
@@ -4009,12 +3975,12 @@ export default function ControlClient() {
       setThinkingPanelManuallyHidden(!next);
       return next;
     });
-  }, []);
+  }, [setShowThinkingPanel, setThinkingPanelManuallyHidden]);
 
   const handleCloseThinkingPanel = useCallback(() => {
     setShowThinkingPanel(false);
     setThinkingPanelManuallyHidden(true);
-  }, []);
+  }, [setShowThinkingPanel, setThinkingPanelManuallyHidden]);
 
   const adjustVisibleItemsLimit = useCallback((historyItems: ChatItem[]) => {
     let lastAssistantIdx = -1;
@@ -4159,11 +4125,22 @@ export default function ControlClient() {
       }
 
       if (!sorted) {
-        const snapshot = await getMissionSnapshot(id);
-        sorted = snapshot.events.sort((a, b) => a.sequence - b.sequence);
-        metaMaxSeq = snapshot.latest_sequence;
-        metaTotal = snapshot.total_events;
-        eventMergeCount = sorted.length;
+        try {
+          const snapshot = await getMissionSnapshot(id);
+          sorted = snapshot.events.sort((a, b) => a.sequence - b.sequence);
+          metaMaxSeq = snapshot.latest_sequence;
+          metaTotal = snapshot.total_events;
+          eventMergeCount = sorted.length;
+        } catch {
+          const fallback = await getMissionEventsWithMeta(id, {
+            types: HISTORY_EVENT_TYPES,
+            limit: HISTORY_PAGE_SIZE,
+          });
+          sorted = fallback.events.sort((a, b) => a.sequence - b.sequence);
+          metaMaxSeq = fallback.meta.maxSequence;
+          metaTotal = fallback.meta.totalEvents;
+          eventMergeCount = sorted.length;
+        }
       }
 
       if (metaMaxSeq !== undefined && metaMaxSeq > 0) {
@@ -4279,9 +4256,6 @@ export default function ControlClient() {
   // `useMemo` hooks that each looped over `items` (see `deriveItemViews`
   // for the rationale).
   const {
-    dedupedItems,
-    displayItems,
-    chatDisplayItems,
     lastNonQueuedItem,
     thinkingItems,
     thinkingItemsCount,
@@ -4391,11 +4365,11 @@ export default function ControlClient() {
       setShowThinkingPanel(true);
     }
     prevHasActiveThinking.current = hasActiveThinking;
-  }, [hasActiveThinking, thinkingPanelManuallyHidden]);
+  }, [hasActiveThinking, setShowThinkingPanel, thinkingPanelManuallyHidden]);
 
   useEffect(() => {
     setThinkingPanelManuallyHidden(false);
-  }, [viewingMissionId]);
+  }, [setThinkingPanelManuallyHidden, viewingMissionId]);
 
   // Tell the backend the user opened this mission. The server records
   // `first_viewed_at` on the first call (starting the 1h ack grace timer
@@ -4503,7 +4477,7 @@ export default function ControlClient() {
     return viewingRunningInfo.health;
   }, [viewingMissionId, viewingRunningInfo, viewingMission?.status]);
 
-  const hasPendingQuestion = useMemo(() => {
+  const pendingUserInputItem = useMemo(() => {
     // Find the index of the last user message — any question before it is
     // implicitly answered (the user continued the conversation).
     let lastUserIdx = -1;
@@ -4513,33 +4487,36 @@ export default function ControlClient() {
         break;
       }
     }
-    // Only consider questions that appear AFTER the last user message
+    // Only consider prompts that appear AFTER the last user message
     // and have no result — these are genuinely pending.
-    return items.some(
-      (item, idx) =>
-        item.kind === "tool" &&
-        (item.name === "question" || item.name === "AskUserQuestion") &&
-        item.result === undefined &&
-        idx > lastUserIdx,
-    );
+    for (let i = items.length - 1; i > lastUserIdx; i--) {
+      const item = items[i];
+      if (isPendingUserInputTool(item)) return item;
+    }
+    return null;
   }, [items]);
+  const hasPendingUserInput = pendingUserInputItem !== null;
+
+  const handleShowPendingUserInput = useCallback(() => {
+    if (!pendingUserInputItem) return;
+    const el = document.getElementById(`chat-item-${pendingUserInputItem.id}`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
+    const index = groupedItems.findIndex(
+      (item) => item.kind === "tool" && item.id === pendingUserInputItem.id,
+    );
+    if (index >= 0) {
+      chatVirtualizer.scrollToIndex(index, { align: "center" });
+    }
+  }, [chatVirtualizer, groupedItems, pendingUserInputItem]);
 
   const viewingMissionStallSeconds =
     viewingMissionStallInfo?.seconds_since_activity ?? 0;
   const isViewingMissionStalled = Boolean(viewingMissionStallInfo);
   const isViewingMissionSeverelyStalled =
     viewingMissionStallInfo?.severity === "severe";
-
-  const recentMissionList = useMemo(() => {
-    if (recentMissions.length === 0) return [];
-    const runningIds = new Set(runningMissions.map((m) => m.mission_id));
-    const currentId = currentMission?.id ?? null;
-    return recentMissions
-      .filter(
-        (mission) => mission.id !== currentId && !runningIds.has(mission.id),
-      )
-      .slice(0, 6);
-  }, [recentMissions, runningMissions, currentMission?.id]);
 
   // Treat "waiting_for_tool" as not busy for message input (user should respond immediately)
   const isBusy = viewingRunState === "running";
@@ -4641,7 +4618,6 @@ export default function ControlClient() {
   // the adjustment lands. Declared after the scroll-to-bottom effect on
   // purpose so React runs it second; the bottom-scroll only fires when
   // `isAtBottom`, which is never true during a paginate-back.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   useLayoutEffect(() => {
     const pending = pendingScrollRestoreRef.current;
     if (!pending) return;
@@ -5470,7 +5446,7 @@ export default function ControlClient() {
     // reads `viewingMissionRef.current` (synced from state by an effect
     // above), so capturing the state value would re-introduce the stale
     // closure that bugbot flagged.
-    [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder],
+    [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder, setItems],
   );
 
   // Background fill: after the initial fetch shows the newest events,
@@ -5987,7 +5963,7 @@ export default function ControlClient() {
         return next;
       });
     },
-    [],
+    [setStreamDiagnostics],
   );
 
   // Refresh recent missions periodically (after the callback is defined).
@@ -6847,7 +6823,7 @@ export default function ControlClient() {
         ),
       );
     },
-    [],
+    [setItems],
   );
 
   const handleToolResultCommit = useCallback(
@@ -7086,8 +7062,9 @@ export default function ControlClient() {
         if (newState === "idle" && effectiveMissionId) {
           setProgressByMission((prev) => {
             if (!prev[effectiveMissionId]) return prev;
-            const { [effectiveMissionId]: _removed, ...rest } = prev;
-            return rest;
+            const next = { ...prev };
+            delete next[effectiveMissionId];
+            return next;
           });
           if (shouldApplyStatus) {
             // Auto-close desktop stream when agent finishes, unless a session is still running.
@@ -7100,27 +7077,7 @@ export default function ControlClient() {
           }
         }
 
-        // If we reconnected and agent is already running, add a visual indicator
-        setRunState((prevState) => {
-          if (
-            shouldApplyStatus &&
-            newState === "running" &&
-            prevState === "idle"
-          ) {
-            setItems((prevItems) => {
-              const hasActiveThinking = prevItems.some(
-                (it) =>
-                  ((it.kind === "thinking" || it.kind === "stream") &&
-                    !it.done) ||
-                  it.kind === "phase",
-              );
-              // If there's no active streaming item, the user is seeing stale state
-              // The "Agent is working..." indicator will show via the render logic
-              return prevItems;
-            });
-          }
-          return newState;
-        });
+        setRunState(newState);
         return;
       }
 
@@ -7929,7 +7886,7 @@ export default function ControlClient() {
             ? (data["dropped"] as number)
             : undefined;
         perfBus.updateDiagnostics({ droppedEvents: dropped ?? 0 });
-        streamLog("warn", "stream_lagged — refetching", { dropped });
+        streamLog("warn", "stream_lagged; refetching", { dropped });
         const viewingId = viewingMissionIdRef.current;
         if (viewingId) {
           void reloadMissionHistory(viewingId).catch((err) => {
@@ -8424,12 +8381,13 @@ export default function ControlClient() {
       }
       pendingStreamRef.current = null;
     };
-  }, []);
+  }, [setItems]);
 
   const status = useMemo(() => statusLabel(viewingRunState), [viewingRunState]);
   const StatusIcon = status.Icon;
 
   const streamHints = useMemo(() => {
+    void diagTick;
     const hints: string[] = [];
     const ct = streamDiagnostics.contentType;
     if (ct && !ct.toLowerCase().includes("text/event-stream")) {
@@ -8497,102 +8455,6 @@ export default function ControlClient() {
     viewingMission,
     currentMission,
   ]);
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const content = input.trim();
-    if (!content) return;
-
-    const targetMissionId = viewingMissionIdRef.current;
-
-    // Always sync with backend before sending to prevent mission routing bugs.
-    // The backend's current_mission can get out of sync (e.g., from another tab or auto-creation).
-    if (targetMissionId) {
-      try {
-        console.debug("[control] syncing mission before send", {
-          targetMissionId,
-        });
-        const mission = await loadMission(targetMissionId);
-        if (!mission) {
-          toast.error("Mission not found");
-          return;
-        }
-        setCurrentMission(mission);
-        setViewingMission(mission);
-        setViewingMissionId(mission.id);
-        // Only update items if history content has actually changed
-        if (hasHistoryChanged(items, mission.history)) {
-          setItems(missionHistoryToItems(mission));
-        }
-        applyDesktopSessionState(mission);
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        console.error("Failed to sync mission before sending:", err);
-        toast.error(
-          `Failed to sync mission: ${errMsg}. Check API connection in Settings.`,
-        );
-        return;
-      }
-    }
-
-    setInput("");
-    setDraftInput("");
-
-    // Generate temp ID and add message optimistically BEFORE the API call
-    // This ensures messages appear in send order, not response order
-    const tempId = crypto.randomUUID();
-    const timestamp = Date.now();
-
-    // Message is queued only if agent is currently busy AND there are existing user messages
-    // The first message in a conversation should never be shown as queued
-    const hasExistingUserMessages = items.some((item) => item.kind === "user");
-    const willBeQueued = isBusy && hasExistingUserMessages;
-
-    setItems((prev) => [
-      ...prev,
-      {
-        kind: "user" as const,
-        id: tempId,
-        content,
-        timestamp,
-        queued: willBeQueued,
-      },
-    ]);
-
-    try {
-      const { id, queued } = await postControlMessageWithRetry(content, {
-        client_message_id: tempId,
-      });
-
-      // Replace temp ID with server-assigned ID and update queued status
-      // This allows SSE handler to correctly deduplicate
-      // The first message should never be shown as queued
-      setItems((prev) => {
-        // Check if SSE already added this message (race condition where SSE arrives before API response)
-        // If so, just remove the temp message to avoid duplicates
-        const sseAlreadyAdded = prev.some(
-          (item) => item.id === id && item.id !== tempId,
-        );
-        if (sseAlreadyAdded) {
-          return prev.filter((item) => item.id !== tempId);
-        }
-
-        const otherUserMessages = prev.filter(
-          (item) => item.kind === "user" && item.id !== tempId,
-        );
-        const isFirstMessage = otherUserMessages.length === 0;
-        const effectiveQueued = isFirstMessage ? false : queued;
-        return prev.map((item) =>
-          item.id === tempId ? { ...item, id, queued: effectiveQueued } : item,
-        );
-      });
-    } catch (err) {
-      console.error(err);
-      // Remove the optimistic message on error
-      setItems((prev) => prev.filter((item) => item.id !== tempId));
-      toast.error("Failed to send message");
-    }
-  };
 
   // Handler for EnhancedInput that takes a payload with content and optional agent
   const handleEnhancedSubmit = useCallback(
@@ -8768,7 +8630,7 @@ export default function ControlClient() {
     } finally {
       syncingQueueRef.current = false;
     }
-  }, []);
+  }, [setItems]);
 
   // Reload mission history from the API. Used for visibility change,
   // periodic sync, and SSE reconnect catch-up.
@@ -8973,6 +8835,7 @@ export default function ControlClient() {
       seedPaginationStateAfterInitialLoad,
       updateMissionItems,
       applyDesktopSessionFromEvents,
+      setItems,
     ],
   );
 
@@ -9540,7 +9403,7 @@ export default function ControlClient() {
                                       "Orphaned sessions cleaned up",
                                     );
                                     await refreshDesktopSessions();
-                                  } catch (err) {
+                                  } catch {
                                     toast.error("Failed to cleanup sessions");
                                   }
                                 }}
@@ -9564,7 +9427,7 @@ export default function ControlClient() {
                                     await cleanupStoppedDesktopSessions();
                                     toast.success("Stopped sessions cleared");
                                     await refreshDesktopSessions();
-                                  } catch (err) {
+                                  } catch {
                                     toast.error(
                                       "Failed to clear stopped sessions",
                                     );
@@ -10080,7 +9943,7 @@ export default function ControlClient() {
                           Start a conversation
                         </h2>
                         <p className="mt-2 text-sm text-white/40 max-w-sm">
-                          Ask the agent to do something — messages queue while
+                          Ask the agent to do something. Messages queue while
                           it&apos;s busy
                         </p>
 
@@ -10153,8 +10016,8 @@ export default function ControlClient() {
                       </div>
                     )}
 
-                  {/* Waiting banner for question tool */}
-                  {hasPendingQuestion && (
+                  {/* Waiting banner for interactive user-input tools */}
+                  {hasPendingUserInput && (
                     <div className="flex justify-center py-4 animate-fade-in">
                       <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4 bg-indigo-500/10 border border-indigo-500/20">
                         <div className="flex items-center gap-3">
@@ -10164,11 +10027,19 @@ export default function ControlClient() {
                               Waiting for your response
                             </span>
                             <p className="text-white/50">
-                              The agent asked a question and is paused until you
-                              answer.
+                              The agent is paused until you answer the prompt
+                              above.
                             </p>
                           </div>
                         </div>
+                        <button
+                          type="button"
+                          onClick={handleShowPendingUserInput}
+                          className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30 border border-indigo-500/30 transition-colors"
+                        >
+                          <ArrowDown className="h-3.5 w-3.5" />
+                          Show prompt
+                        </button>
                       </div>
                     </div>
                   )}
@@ -10176,7 +10047,7 @@ export default function ControlClient() {
                   {/* Stall warning banner when agent hasn't reported activity for 60+ seconds */}
                   {isViewingMissionStalled &&
                     viewingMissionId &&
-                    !hasPendingQuestion && (
+                    !hasPendingUserInput && (
                       <div className="flex justify-center py-4 animate-fade-in">
                         <div
                           className={cn(
@@ -10207,7 +10078,7 @@ export default function ControlClient() {
                                 Agent may be stuck
                               </span>
                               <span className="text-white/50 ml-1">
-                                — No activity for{" "}
+                                : no activity for{" "}
                                 {Math.floor(viewingMissionStallSeconds)}s
                               </span>
                               <p className="text-white/40 text-xs mt-1">
@@ -10247,7 +10118,7 @@ export default function ControlClient() {
                             Iteration limit reached
                           </span>
                           <span className="text-white/50 ml-1">
-                            — Agent used all {maxIterations} iterations
+                            : agent used all {maxIterations} iterations
                           </span>
                         </div>
                         <button

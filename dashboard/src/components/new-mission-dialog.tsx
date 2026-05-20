@@ -385,7 +385,7 @@ export function NewMissionDialog({
             : model.id;
         options.push({
           value,
-          label: `${provider.name} — ${model.name}`,
+          label: `${provider.name} · ${model.name}`,
           description: model.description,
         });
       }
@@ -854,8 +854,9 @@ export function NewMissionDialog({
                   const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string; provider_id?: string }>>();
 
                   for (const option of modelOptions) {
-                    // Extract provider from the label (format: "Provider Name — Model Name")
-                    const providerName = option.label.split(' — ')[0] || 'Other';
+                    // Extract provider from the label (format: "Provider Name · Model Name")
+                    const labelParts = option.label.split(/\s[—·]\s/);
+                    const providerName = labelParts[0] || 'Other';
                     if (!groupedOptions.has(providerName)) {
                       groupedOptions.set(providerName, []);
                     }
@@ -873,7 +874,7 @@ export function NewMissionDialog({
                       <optgroup key={providerName} label={groupLabel}>
                         {options.map((option) => {
                           // Extract just the model name from the label
-                          const modelName = option.label.split(' — ')[1] || option.label;
+                          const modelName = option.label.split(/\s[—·]\s/)[1] || option.label;
                           const displayText = option.description
                             ? `${modelName} - ${option.description}`
                             : modelName;

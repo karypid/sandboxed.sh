@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { X, ExternalLink, Key, Loader, Plus, Trash2 } from 'lucide-react';
 import { toast } from '@/components/toast';
 import { cn } from '@/lib/utils';
@@ -130,6 +130,10 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     }
   }, [open]);
 
+  const handleClose = useCallback(async () => {
+    onClose();
+  }, [onClose]);
+
   // Handle escape key
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -139,7 +143,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [open, loading]);
+  }, [handleClose, open, loading]);
 
   // Handle click outside
   useEffect(() => {
@@ -152,11 +156,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
       document.addEventListener('mousedown', handleClickOutside);
       return () => document.removeEventListener('mousedown', handleClickOutside);
     }
-  }, [open, loading]);
-
-  const handleClose = async () => {
-    onClose();
-  };
+  }, [handleClose, open, loading]);
 
   const handleSelectProvider = (providerType: AIProviderType) => {
     setSelectedProvider(providerType);
@@ -595,7 +595,6 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                     </label>
 
                     {(() => {
-                      const method = selectedMethodIndex !== null ? authMethods[selectedMethodIndex] : null;
                       const disableCodex = false;
                       return (
                         <label

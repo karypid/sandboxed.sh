@@ -58,7 +58,7 @@ async function chatCompletion(
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       console.warn(
-        `[LLM] Chat completion failed: HTTP ${res.status}${text ? ` — ${text.slice(0, 200)}` : ""}`,
+        `[LLM] Chat completion failed: HTTP ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}`,
       );
       return null;
     }

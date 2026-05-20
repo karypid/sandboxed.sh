@@ -6,8 +6,6 @@ import { getHealth, type HealthResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import {
   Server,
-  Wifi,
-  WifiOff,
   Shield,
   ShieldOff,
   Code,
@@ -43,7 +41,6 @@ function ServerInfoCard() {
     return () => clearInterval(interval);
   }, []);
 
-  const StatusIcon = connectionState === 'connected' ? Wifi : connectionState === 'checking' ? Wifi : WifiOff;
   const statusColor = connectionState === 'connected' 
     ? 'text-emerald-400' 
     : connectionState === 'checking' 
@@ -80,7 +77,7 @@ function ServerInfoCard() {
             <span className="text-xs text-white/50">Latency</span>
           </div>
           <span className="text-xs font-medium text-white/80 tabular-nums">
-            {latency !== null ? `${latency}ms` : '—'}
+            {latency !== null ? `${latency}ms` : 'N/A'}
           </span>
         </div>
 
@@ -91,7 +88,7 @@ function ServerInfoCard() {
             <span className="text-xs text-white/50">Version</span>
           </div>
           <span className="text-xs font-medium text-white/80">
-            {health?.version ?? '—'}
+            {health?.version ?? 'N/A'}
           </span>
         </div>
 
@@ -111,7 +108,7 @@ function ServerInfoCard() {
           )}>
             {health?.auth_mode === 'disabled' ? 'Disabled' : 
              health?.auth_mode === 'single_tenant' ? 'Single' :
-             health?.auth_mode === 'multi_user' ? 'Multi-user' : '—'}
+             health?.auth_mode === 'multi_user' ? 'Multi-user' : 'N/A'}
           </span>
         </div>
 
@@ -138,7 +135,7 @@ function ServerInfoCard() {
             <span className="text-xs text-white/50">Max Iter</span>
           </div>
           <span className="text-xs font-medium text-white/80 tabular-nums">
-            {health?.max_iterations ?? '—'}
+            {health?.max_iterations ?? 'N/A'}
           </span>
         </div>
       </div>
