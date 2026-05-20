@@ -32,8 +32,11 @@ Each line is one of:
 `GET /api/control/ws?mission=<uuid>&cap=text_op`
 
 The WebSocket stream carries the same JSON `AgentEvent` payloads as SSE,
-including the `type` discriminator. The dashboard attempts WebSocket first
-and falls back to SSE if the upgrade fails.
+including the `type` discriminator. The dashboard does not prefer this
+channel by default yet: browser-created WebSockets cannot attach the same
+Bearer header as SSE, so `dashboard/src/lib/api.ts` only tries WS when
+`preferWebSocket` is explicitly set. Normal web and iOS control streams use
+SSE until control WS auth is wired through a JWT subprotocol.
 
 Additional WebSocket-only messages:
 
@@ -155,6 +158,8 @@ canonical row rather than the op log.
 
 - Uses `/snapshot` for first paint and `/events` for pagination/resume.
 - Connects with `?mission=<id>` when viewing a specific mission.
+- Prefers SSE for control streaming; WS is opt-in only until browser auth is
+  correct.
 - Reconnects whenever the viewing mission changes.
 - Coalesces `text_delta` and `thinking` re-renders via
   `requestAnimationFrame` — at most one React commit per frame.

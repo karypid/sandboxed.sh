@@ -3177,6 +3177,24 @@ struct ControlView: View {
                 break
             }
 
+            if done,
+               data["goal_role"] as? String == "deliverable",
+               (viewingMission?.goalMode == true || currentMission?.goalMode == true) {
+                let eventId = data["id"] as? String
+                let messageId = eventId.map { "goal-deliverable-\($0)" } ?? "goal-deliverable-\(UUID().uuidString)"
+                guard !messages.contains(where: { $0.id == messageId }) else { break }
+                finalizeActiveThinkingMessages()
+                messages.removeAll { $0.isPhase }
+                messages.append(
+                    ChatMessage(
+                        id: messageId,
+                        type: .assistant(success: true, costCents: 0, costSource: .unknown, model: nil, sharedFiles: nil),
+                        content: content
+                    )
+                )
+                break
+            }
+
             // Skip if we've already seen this server-supplied event id —
             // delta resume can re-deliver completed thinking events we already
             // appended, and the active-message fast path won't catch them
