@@ -216,6 +216,54 @@ fn is_paloma_command(text: &str, name: &str) -> bool {
     trimmed == name || trimmed.starts_with(&format!("{name} "))
 }
 
+fn normalize_paloma_natural_command(text: &str) -> Option<&'static str> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('/') || trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let mentions_missions = lower.contains("mission");
+    let asks_for_mission_list = mentions_missions
+        && (lower.contains("en cours")
+            || lower.contains("en ce moment")
+            || lower.contains("actif")
+            || lower.contains("active")
+            || lower.contains("liste")
+            || lower.contains("quelles")
+            || lower.contains("lesquelles")
+            || lower.contains("quoi")
+            || lower.contains("voir")
+            || lower.contains("list")
+            || lower.contains("show")
+            || lower.contains("current")
+            || lower.contains("running")
+            || lower.contains("montre"));
+    if asks_for_mission_list {
+        return Some("/missions");
+    }
+
+    if lower == "status"
+        || lower == "statut"
+        || lower.starts_with("status ")
+        || lower.starts_with("statut ")
+        || lower.contains("statut")
+        || lower.contains("update me")
+        || lower.contains("update moi")
+        || lower.contains("mets moi a jour")
+        || lower.contains("mets-moi a jour")
+        || lower.contains("mets moi à jour")
+        || lower.contains("mets-moi à jour")
+        || lower.contains("quoi de neuf")
+        || lower.contains("nouveau")
+        || lower.contains("what changed")
+    {
+        return Some("/status");
+    }
+
+    None
+}
+
 fn redact_for_telegram(text: &str) -> String {
     let token_re = regex::Regex::new(
         r#"(?i)(bot[0-9]{6,}:[A-Za-z0-9_-]{20,}|[A-Za-z0-9_]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|api[_-]?hash\s*[:=]\s*[A-Za-z0-9]{16,}|token\s*[:=]\s*\S+|secret\s*[:=]\s*\S+)"#,
@@ -711,11 +759,13 @@ async fn handle_paloma_command(
     user: Option<&TelegramUser>,
     clean_text: &str,
 ) -> bool {
-    let is_known_command = is_paloma_command(clean_text, "/status")
-        || is_paloma_command(clean_text, "/missions")
-        || is_paloma_command(clean_text, "/summary")
-        || is_paloma_command(clean_text, "/send")
-        || is_paloma_command(clean_text, "/approve");
+    let normalized_command = normalize_paloma_natural_command(clean_text);
+    let command_text = normalized_command.unwrap_or(clean_text);
+    let is_known_command = is_paloma_command(command_text, "/status")
+        || is_paloma_command(command_text, "/missions")
+        || is_paloma_command(command_text, "/summary")
+        || is_paloma_command(command_text, "/send")
+        || is_paloma_command(command_text, "/approve");
     let owner_feedback = user
         .filter(|_| msg.chat.chat_type == "private")
         .filter(|u| u.role == TelegramUserRole::Owner)
@@ -758,34 +808,34 @@ async fn handle_paloma_command(
         apply_paloma_interest_feedback(ctx, user, msg, level, rule_text)
             .await
             .map(|body| (body, None))
-    } else if is_paloma_command(clean_text, "/status") {
+    } else if is_paloma_command(command_text, "/status") {
         match user {
             Some(user) => build_paloma_status(ctx, user.telegram_user_id)
                 .await
                 .map(|(body, sequences)| (body, Some(sequences))),
             None => Err("Missing Telegram user identity.".to_string()),
         }
-    } else if is_paloma_command(clean_text, "/missions") {
+    } else if is_paloma_command(command_text, "/missions") {
         match user {
             Some(user) => build_paloma_missions(ctx, user.telegram_user_id)
                 .await
                 .map(|body| (body, None)),
             None => Err("Missing Telegram user identity.".to_string()),
         }
-    } else if is_paloma_command(clean_text, "/summary") {
-        let selector = clean_text.trim().strip_prefix("/summary").map(str::trim);
+    } else if is_paloma_command(command_text, "/summary") {
+        let selector = command_text.trim().strip_prefix("/summary").map(str::trim);
         build_paloma_summary(ctx, selector)
             .await
             .map(|body| (body, None))
-    } else if is_paloma_command(clean_text, "/send") {
-        match parse_paloma_selector_and_payload(clean_text, "/send") {
+    } else if is_paloma_command(command_text, "/send") {
+        match parse_paloma_selector_and_payload(command_text, "/send") {
             Some((selector, payload)) => send_paloma_mission_message(ctx, selector, payload)
                 .await
                 .map(|body| (body, None)),
             None => Err("Usage: /send <mission selector> <message>".to_string()),
         }
-    } else if is_paloma_command(clean_text, "/approve") {
-        let answer = clean_text
+    } else if is_paloma_command(command_text, "/approve") {
+        let answer = command_text
             .trim()
             .strip_prefix("/approve")
             .unwrap_or("")
@@ -4671,15 +4721,15 @@ mod tests {
         build_internal_telegram_action_token, extract_structured_memory_from_text,
         extract_telegram_actions, feedback_mutes_alerts, feedback_raises_interest,
         format_structured_memory_context, is_paloma_command, markdown_to_telegram_html,
-        merge_telegram_chat_metadata, mission_label, paloma_alert_kind_for_status,
-        paloma_command_error_response, paloma_role_for_user, parse_paloma_selector_and_payload,
-        redact_for_telegram, render_telegram_chunk, sanitize_telegram_visible_text,
-        scope_for_extracted_memory, telegram_action_target_matches, telegram_chat_display_title,
-        truncate_for_telegram, verify_internal_telegram_action_token, workflow_reply_text,
-        workflow_request_delivery_text, Chat, ExtractedTelegramMemory, Mission, MissionMode,
-        MissionStatus, TelegramAction, TelegramActionKind, TelegramBridge, TelegramMemorySubject,
-        TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
-        TelegramUserRole,
+        merge_telegram_chat_metadata, mission_label, normalize_paloma_natural_command,
+        paloma_alert_kind_for_status, paloma_command_error_response, paloma_role_for_user,
+        parse_paloma_selector_and_payload, redact_for_telegram, render_telegram_chunk,
+        sanitize_telegram_visible_text, scope_for_extracted_memory, telegram_action_target_matches,
+        telegram_chat_display_title, truncate_for_telegram, verify_internal_telegram_action_token,
+        workflow_reply_text, workflow_request_delivery_text, Chat, ExtractedTelegramMemory,
+        Mission, MissionMode, MissionStatus, TelegramAction, TelegramActionKind, TelegramBridge,
+        TelegramMemorySubject, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
+        TelegramStructuredMemoryScope, TelegramUserRole,
     };
     use uuid::Uuid;
 
@@ -4754,6 +4804,32 @@ mod tests {
         assert!(is_paloma_command("/status latest", "/status"));
         assert!(!is_paloma_command("/statusplease", "/status"));
         assert!(!is_paloma_command("status", "/status"));
+    }
+
+    #[test]
+    fn paloma_natural_owner_commands_cover_status_and_missions() {
+        assert_eq!(
+            normalize_paloma_natural_command("update moi sur les missions en cours"),
+            Some("/missions")
+        );
+        assert_eq!(
+            normalize_paloma_natural_command("quelles missions actives en ce moment ?"),
+            Some("/missions")
+        );
+        assert_eq!(
+            normalize_paloma_natural_command("show current running missions"),
+            Some("/missions")
+        );
+        assert_eq!(
+            normalize_paloma_natural_command("mets-moi à jour sur le statut"),
+            Some("/status")
+        );
+        assert_eq!(
+            normalize_paloma_natural_command("what changed since yesterday?"),
+            Some("/status")
+        );
+        assert_eq!(normalize_paloma_natural_command("/status"), None);
+        assert_eq!(normalize_paloma_natural_command("how are you?"), None);
     }
 
     #[test]
