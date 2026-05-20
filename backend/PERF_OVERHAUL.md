@@ -30,7 +30,7 @@ verity fixture missions.
 | P3 | #19 WS migration | ✅ implemented in this branch |
 | P3 | #20 per-mission channels | ⏸ deferred — backend, medium |
 | P3 | #21 backend text_delta backpressure | ⏸ deferred — backend, medium |
-| P4 | #22 negotiated `text_op` protocol | ✅ implemented in this branch |
+| P4 | #22 live `text_op` protocol | ✅ implemented in this branch |
 | P4 | #23 canonical assistant rows | ✅ implemented in this branch |
 | P4 | #24 tool-output truncation | ⏸ deferred — backend, medium |
 | P5 | #25 health budget telemetry | ⏸ deferred — needs ingestion |
@@ -60,7 +60,7 @@ optimisations, not bug fixes.
 | --- | --- |
 | P2-#11/#12 virtualization | `dashboard/tests/control-perf.spec.ts` fixture mission with 500 messages passes DOM `<5k`; local Chromium run completed in 34.0s. |
 | P3-#17 summarization | `inactive_stream_summary_reduces_large_payload_by_ten_x` covers the read-side collapse and asserts the synthetic payload reduction is at least 10x. |
-| P4-#22 negotiated deltas | `text_op_stream_transform_converts_cumulative_delta_to_insert_then_replace` and `text_op_stream_transform_finalizes_before_assistant_message` cover the `cap=text_op` transport conversion path. |
+| P4-#22 live deltas | `text_op_stream_transform_converts_cumulative_delta_to_insert_then_replace` and `text_op_stream_transform_finalizes_before_assistant_message` cover the transport conversion path. |
 | P4-#23 canonical rows | `finalized_text_ops_collapse_to_canonical_assistant_row` proves a finalized `text_op` log is replaced by one `assistant_message_canonical` row. |
 | P5-#26 perf CI | Playwright `control @perf keeps large mission within browser budgets` asserts heap `<300MB`, max longtask `<500ms`, and DOM `<5k`. |
 
@@ -127,11 +127,9 @@ deferred follow-ups.
 
 ### P4-#22..#24: content model changes
 
-P4-#22 is implemented as a negotiated transport capability:
-dashboard and iOS append `cap=text_op`, the backend converts cumulative
-`text_delta` buffers into `TextOp::Insert`/`Replace` events for that
-connection, and older clients continue receiving cumulative
-`text_delta`.
+P4-#22 is implemented as the live transport default: the backend converts
+cumulative `text_delta` buffers into `TextOp::Insert`/`Replace` events for
+dashboard, iOS, and WebSocket control clients.
 
 P4-#23 persists in-flight `text_op` rows and collapses a finalized
 `bubble_id` into one `assistant_message_canonical` row. Historical

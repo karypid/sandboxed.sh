@@ -226,13 +226,11 @@ final class APIService {
         return response.ok
     }
 
-    func getMissionEvents(id: String, types: [String]? = nil, limit: Int? = nil, offset: Int? = nil, latest: Bool = false, beforeSeq: Int64? = nil) async throws -> [StoredEvent] {
+    func getMissionEvents(id: String, types: [String]? = nil, limit: Int? = nil, beforeSeq: Int64? = nil) async throws -> [StoredEvent] {
         try await getMissionEventsWithMeta(
             id: id,
             types: types,
             limit: limit,
-            offset: offset,
-            latest: latest,
             beforeSeq: beforeSeq
         ).events
     }
@@ -245,13 +243,11 @@ final class APIService {
     ///
     /// `sinceSeq` requests only events with `sequence > sinceSeq` (delta path used
     /// on SSE reconnect / scene-phase active). `beforeSeq` requests events with
-    /// `sequence < beforeSeq` (backwards pagination). `latest` requests the tail page.
+    /// `sequence < beforeSeq` (backwards pagination).
     func getMissionEventsWithMeta(
         id: String,
         types: [String]? = nil,
         limit: Int? = nil,
-        offset: Int? = nil,
-        latest: Bool = false,
         sinceSeq: Int64? = nil,
         beforeSeq: Int64? = nil
     ) async throws -> MissionEventsResult {
@@ -261,12 +257,6 @@ final class APIService {
         }
         if let limit = limit {
             queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
-        }
-        if let offset = offset {
-            queryItems.append(URLQueryItem(name: "offset", value: String(offset)))
-        }
-        if latest {
-            queryItems.append(URLQueryItem(name: "latest", value: "true"))
         }
         if let sinceSeq = sinceSeq {
             queryItems.append(URLQueryItem(name: "since_seq", value: String(sinceSeq)))
@@ -600,7 +590,7 @@ final class APIService {
 
         return Task { [weak self] in
             var components = URLComponents(string: "\(base)/api/control/stream")
-            var queryItems = [URLQueryItem(name: "cap", value: "text_op")]
+            var queryItems: [URLQueryItem] = []
             if let missionId {
                 queryItems.append(URLQueryItem(name: "mission", value: missionId))
             }

@@ -94,14 +94,13 @@ Statuses: `pending`, `active`, `completed`, `failed`, `interrupted`.
 ## Get Mission Events (History)
 
 ```
-GET /api/control/missions/:id/events?types=user_message,assistant_message&limit=100&latest=true
+GET /api/control/missions/:id/events?view=history&limit=100&before_seq=1234
 ```
 
 **Query params** (all optional):
 - `types`: comma-separated event types to filter
+- `view`: typed preset, one of `transcript`, `trace`, `history`, or `all`
 - `limit`: max events to return
-- `offset`: legacy pagination offset
-- `latest`: when `true`, return the newest `limit` events
 - `since_seq`: return events after a stored sequence number
 - `before_seq`: return events before a stored sequence number
 
@@ -170,7 +169,7 @@ GET /api/control/missions/:id/events?view=history&since_seq=0&limit=200
 ```
 
 `/events` supports `view=transcript|trace|history|all`, explicit `types`,
-`limit`, `offset`, `latest`, `since_seq`, and `before_seq`, and includes
+`limit`, `since_seq`, and `before_seq`, and includes
 `X-Total-Events` / `X-Max-Sequence` headers.
 
 ## Stream Events (SSE)

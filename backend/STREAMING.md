@@ -10,13 +10,11 @@ traced back to drift between live transport and historical replay.
 
 ## SSE channel
 
-`GET /api/control/stream?mission=<uuid>&cap=text_op`
+`GET /api/control/stream?mission=<uuid>`
 
 | Param | Meaning |
 | --- | --- |
 | `mission` | When present, the server only emits events whose `mission_id` matches. `status` and `stream_lagged` (connection-scoped) always pass. Omit the param to receive every event the authenticated user can see (used by the mission list and the `?debug=perf` overlay). |
-| `cap` | Comma-separated client capabilities. Current dashboard and iOS clients send `text_op`, which asks the transport to convert cumulative backend `text_delta` events into CRDT-style `text_op` operations for this connection. |
-
 Each line is one of:
 
 - `event: status\ndata: <json>\n\n` — connection-scoped run state +
@@ -29,7 +27,7 @@ Each line is one of:
 
 ## WebSocket channel
 
-`GET /api/control/ws?mission=<uuid>&cap=text_op`
+`GET /api/control/ws?mission=<uuid>`
 
 The WebSocket stream carries the same JSON `AgentEvent` payloads as SSE,
 including the `type` discriminator. The dashboard does not prefer this
@@ -62,7 +60,7 @@ Listed with the backends that emit them.
 | `user_message` | server | `{id, mission_id, content, queued}` | Echoes the user message back after persisting. |
 | `assistant_message` | server | `{id, mission_id, content, success, cost_cents?, cost_source?, model?, shared_files?}` | One per completed agent turn. **Cumulative content** — the message is the final consolidated text. |
 | `text_delta` | grok, codex | `{mission_id, content, event_id?}` | **Cumulative buffer** — the `content` field contains the *entire* text so far, not the new tokens. Clients must consolidate by replacing, not appending. See "Continuation rule". |
-| `text_op` | negotiated streaming backends | `{mission_id, bubble_id, ops}` | CRDT-style delta stream. `ops` entries are `insert`, `replace`, or `finalize`; clients apply them to a local buffer keyed by `bubble_id`. Current dashboard and iOS clients request this via `cap=text_op`. |
+| `text_op` | streaming backends | `{mission_id, bubble_id, ops}` | CRDT-style delta stream. `ops` entries are `insert`, `replace`, or `finalize`; clients apply them to a local buffer keyed by `bubble_id`. Control live transports always convert cumulative `text_delta` payloads to this shape for current clients. |
 | `thinking` | grok, codex | `{mission_id, content, done, goal_role?, event_id?}` | Cumulative buffer. `done: true` finalises the current thought; subsequent non-prefix payloads start a new thought. |
 | `tool_call` | all | `{mission_id, tool_call_id, name, args}` | One per tool invocation. |
 | `tool_result` | all | `{mission_id, tool_call_id, name, result}` | Pairs with `tool_call` via `tool_call_id`. |
@@ -146,9 +144,9 @@ Events NOT persisted:
 - `status`, `stream_lagged`, `fido_sign_request` — connection-scoped.
 - `mission_activity` — diagnostic only, intentionally not stored.
 
-For negotiated `text_op` streams, in-flight ops persist as `text_op` rows.
-When a `finalize` op arrives, the mission store applies the full op log for
-that `bubble_id`, deletes those delta rows, and writes one
+For `text_op` streams, in-flight ops persist as `text_op` rows. When a
+`finalize` op arrives, the mission store applies the full op log for that
+`bubble_id`, deletes those delta rows, and writes one
 `assistant_message_canonical` row. Future `/events` fetches return the
 canonical row rather than the op log.
 
@@ -196,7 +194,7 @@ canonical row rather than the op log.
 2. Always populate `mission_id` (the `?mission=<uuid>` filter drops
    events without it).
 3. For streaming text, send cumulative buffers in `text_delta`; the control
-   transport converts them to `text_op` for current clients.
+   transport converts them to `text_op` for clients.
 4. Update this file with the per-backend notes.
 
 ## Where this document is enforced

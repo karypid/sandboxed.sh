@@ -199,14 +199,11 @@ export async function getMissionEvents(
   options?: {
     types?: string[];
     limit?: number;
-    offset?: number;
-    latest?: boolean;
     /** When set, request only events with `sequence > sinceSeq`.
-     * Takes precedence over `offset`/`latest` on the server. */
+     * Used for reconnect and forward delta fetches. */
     sinceSeq?: number;
     /** When set, request only events with `sequence < beforeSeq`,
-     * returned ASC. Takes precedence over `sinceSeq`/`offset`/`latest`.
-     * Used for backwards pagination. */
+     * returned ASC. Used for backwards pagination. */
     beforeSeq?: number;
   },
 ): Promise<StoredEvent[]> {
@@ -237,8 +234,6 @@ export async function getMissionEventsWithMeta(
     types?: string[];
     view?: "transcript" | "trace" | "history" | "all";
     limit?: number;
-    offset?: number;
-    latest?: boolean;
     sinceSeq?: number;
     beforeSeq?: number;
   },
@@ -247,8 +242,6 @@ export async function getMissionEventsWithMeta(
   if (options?.types?.length) params.set("types", options.types.join(","));
   if (options?.view) params.set("view", options.view);
   if (options?.limit) params.set("limit", String(options.limit));
-  if (options?.offset) params.set("offset", String(options.offset));
-  if (options?.latest) params.set("latest", "true");
   if (options?.sinceSeq !== undefined)
     params.set("since_seq", String(options.sinceSeq));
   if (options?.beforeSeq !== undefined)

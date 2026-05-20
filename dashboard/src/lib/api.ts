@@ -565,14 +565,12 @@ export function streamControl(
   let bytesRead = 0;
   const baseUrl = apiUrl("/api/control/stream");
   const streamParams = new URLSearchParams();
-  streamParams.set("cap", "text_op");
   if (options?.missionId) {
     streamParams.set("mission", options.missionId);
   }
   const streamUrl = `${baseUrl}?${streamParams.toString()}`;
   const wsBaseUrl = apiUrl("/api/control/ws").replace(/^http/, "ws");
   const wsParams = new URLSearchParams();
-  wsParams.set("cap", "text_op");
   if (options?.missionId) {
     wsParams.set("mission", options.missionId);
   }

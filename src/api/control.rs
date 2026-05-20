@@ -2668,7 +2668,7 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
     },
-    /// Negotiated CRDT-style text operations for streaming assistant content.
+    /// CRDT-style text operations for streaming assistant content.
     TextOp {
         mission_id: Uuid,
         bubble_id: String,
@@ -4601,23 +4601,16 @@ pub struct GetEventsQuery {
     /// Maximum number of events to return
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Offset for pagination
-    #[serde(default)]
-    pub offset: Option<usize>,
-    /// When true, return the latest N events (computes offset from total count)
-    #[serde(default)]
-    pub latest: Option<bool>,
     /// If set, return only events with `sequence > since_seq`, ordered
     /// by sequence ASC. Used by the client for delta reconnect to
     /// avoid redownloading the full event tail on every focus/reopen.
-    /// Takes precedence over `offset`/`latest` when provided.
     #[serde(default)]
     pub since_seq: Option<i64>,
     /// If set, return only events with `sequence < before_seq`, ordered
     /// by sequence ASC (oldest first). Used by the client for backwards
     /// pagination — pass the lowest sequence already seen to fetch the
-    /// next page of older events. Takes precedence over `since_seq` /
-    /// `offset` / `latest` when provided.
+    /// next page of older events. Takes precedence over `since_seq`
+    /// when provided.
     #[serde(default)]
     pub before_seq: Option<i64>,
 }
@@ -4741,25 +4734,9 @@ pub async fn get_mission_events(
             .await
             .map_err(internal_error)?
     } else {
-        // When latest=true with a limit, compute offset to return the last N events
-        let offset = if query.latest.unwrap_or(false) {
-            if let Some(limit) = query.limit {
-                let total = control
-                    .mission_store
-                    .count_events(mission_id, types.as_deref())
-                    .await
-                    .map_err(internal_error)?;
-                Some(total.saturating_sub(limit))
-            } else {
-                query.offset
-            }
-        } else {
-            query.offset
-        };
-
         control
             .mission_store
-            .get_events(mission_id, types.as_deref(), query.limit, offset)
+            .get_events(mission_id, types.as_deref(), query.limit, None)
             .await
             .map_err(internal_error)?
     };
@@ -4922,19 +4899,13 @@ pub async fn get_mission_snapshot(
         mission.workspace_name = Some(workspace.name);
     }
 
-    let total = control
-        .mission_store
-        .count_events(mission_id, Some(HISTORY_EVENT_TYPES))
-        .await
-        .map_err(internal_error)?;
-    let offset = total.saturating_sub(SNAPSHOT_EVENT_LIMIT);
     let events = control
         .mission_store
-        .get_events(
+        .get_events_before(
             mission_id,
+            i64::MAX,
             Some(HISTORY_EVENT_TYPES),
             Some(SNAPSHOT_EVENT_LIMIT),
-            Some(offset),
         )
         .await
         .map_err(internal_error)?;
@@ -4948,6 +4919,7 @@ pub async fn get_mission_snapshot(
         .count_events_by_type(mission_id, Some(HISTORY_EVENT_TYPES))
         .await
         .map_err(internal_error)?;
+    let total = event_counts.values().copied().sum();
     let mut visibility_counts: HashMap<String, usize> = HashMap::new();
     for (event_type, count) in &event_counts {
         *visibility_counts
@@ -5185,11 +5157,6 @@ pub struct StreamQuery {
     /// event the user can see (used by the mission list / debug overlay).
     #[serde(default)]
     pub mission: Option<Uuid>,
-    /// Optional comma-separated client capabilities. `text_op` asks the
-    /// stream transport to deliver cumulative text deltas as CRDT-style ops
-    /// while preserving the default cumulative fallback for older clients.
-    #[serde(default)]
-    pub cap: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5201,15 +5168,6 @@ enum ControlWsClientMessage {
 #[derive(Debug, Serialize)]
 struct ControlWsHeartbeat {
     seq: i64,
-}
-
-fn stream_supports_text_op(query: &StreamQuery) -> bool {
-    query
-        .cap
-        .as_deref()
-        .unwrap_or_default()
-        .split(',')
-        .any(|cap| cap.trim().eq_ignore_ascii_case("text_op"))
 }
 
 fn text_op_events_for_stream(
@@ -5454,15 +5412,13 @@ pub async fn control_ws(
     axum::extract::Query(query): axum::extract::Query<StreamQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let use_text_op = stream_supports_text_op(&query);
-    ws.on_upgrade(move |socket| control_ws_loop(state, user, query.mission, use_text_op, socket))
+    ws.on_upgrade(move |socket| control_ws_loop(state, user, query.mission, socket))
 }
 
 async fn control_ws_loop(
     state: Arc<AppState>,
     user: AuthUser,
     mission_filter: Option<Uuid>,
-    use_text_op: bool,
     socket: WebSocket,
 ) {
     let control = control_for_user(&state, &user).await;
@@ -5537,11 +5493,7 @@ async fn control_ws_loop(
                                             for event in events {
                                                 latest_seq = latest_seq.max(event.sequence);
                                                 if let Some(agent_event) = stored_event_to_agent_event(&event) {
-                                                    let outbound = if use_text_op {
-                                                        text_op_events_for_stream(agent_event, &mut text_op_buffers)
-                                                    } else {
-                                                        vec![agent_event]
-                                                    };
+                                                    let outbound = text_op_events_for_stream(agent_event, &mut text_op_buffers);
                                                     for agent_event in outbound {
                                                         if !send_ws_json(&mut sender, &agent_event).await {
                                                             return;
@@ -5587,11 +5539,7 @@ async fn control_ws_loop(
                         if let Some(mid) = ev.mission_id() {
                             latest_seq = control.mission_store.max_event_sequence(mid).await.unwrap_or(latest_seq);
                         }
-                        let outbound = if use_text_op {
-                            text_op_events_for_stream(ev, &mut text_op_buffers)
-                        } else {
-                            vec![ev]
-                        };
+                        let outbound = text_op_events_for_stream(ev, &mut text_op_buffers);
                         for ev in outbound {
                             if !send_ws_json(&mut sender, &ev).await {
                                 return;
@@ -5621,11 +5569,7 @@ async fn control_ws_loop(
                         if let Some(mid) = mission_id {
                             latest_seq = control.mission_store.max_event_sequence(mid).await.unwrap_or(latest_seq);
                         }
-                        let outbound = if use_text_op {
-                            text_op_events_for_stream(ev, &mut text_op_buffers)
-                        } else {
-                            vec![ev]
-                        };
+                        let outbound = text_op_events_for_stream(ev, &mut text_op_buffers);
                         for ev in outbound {
                             if !send_ws_json(&mut sender, &ev).await {
                                 return;
@@ -5654,7 +5598,6 @@ pub async fn stream(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mission_filter = query.mission;
-    let use_text_op = stream_supports_text_op(&query);
     // P3-#20: when a mission filter is set, subscribe to that mission's
     // dedicated channel — the fan-out task in spawn_control_session
     // mirrors events from the global tx into per-mission txs. Avoids
@@ -5781,11 +5724,7 @@ pub async fn stream(
                                     );
                                 }
                             }
-                            let outbound = if use_text_op {
-                                text_op_events_for_stream(ev, &mut text_op_buffers)
-                            } else {
-                                vec![ev]
-                            };
+                            let outbound = text_op_events_for_stream(ev, &mut text_op_buffers);
                             for ev in outbound {
                                 match serde_json::to_string(&ev) {
                                     Ok(payload) => {
@@ -5867,11 +5806,7 @@ pub async fn stream(
                             // the metrics endpoint (P0-#3). The payload
                             // size approximates the on-the-wire chunk
                             // length closely enough for p50/p99 use.
-                            let outbound = if use_text_op {
-                                text_op_events_for_stream(ev, &mut text_op_buffers)
-                            } else {
-                                vec![ev]
-                            };
+                            let outbound = text_op_events_for_stream(ev, &mut text_op_buffers);
                             for ev in outbound {
                                 match serde_json::to_string(&ev) {
                                     Ok(payload) => {
