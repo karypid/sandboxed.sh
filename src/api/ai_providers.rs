@@ -6521,34 +6521,25 @@ async fn get_provider_usage(
                 }
             };
 
-            // Z.AI doesn't expose rate-limit headers; do a health-check style call
+            // Z.AI doesn't expose rate-limit headers. Previously we sent a
+            // 1-token chat completion as a probe, but that burns quota every
+            // 60s and quickly hits 429 on free tiers. The `/models` endpoint
+            // is auth-checked without consuming inference budget, so use it
+            // instead — same connectedness signal, no rate-limit churn.
             let resp = client
-                .post("https://open.bigmodel.cn/api/paas/v4/chat/completions")
+                .get("https://open.bigmodel.cn/api/paas/v4/models")
                 .header("Authorization", format!("Bearer {}", key))
-                .header("Content-Type", "application/json")
-                .json(&serde_json::json!({
-                    "model": "glm-4.7-flash",
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "hi"}]
-                }))
                 .send()
                 .await;
 
             match resp {
                 Ok(r) => {
                     let status_code = r.status().as_u16();
-                    let body = r.json::<serde_json::Value>().await.unwrap_or_default();
                     let mut info = serde_json::json!({
                         "provider_type": "zai",
                         "provider_name": provider_name,
                         "status": if status_code < 400 { "connected" } else { "error" },
                     });
-                    // Z.AI returns usage in response body for completed requests
-                    if let Some(usage) = body.get("usage") {
-                        info.as_object_mut()
-                            .unwrap()
-                            .insert("last_call_usage".to_string(), usage.clone());
-                    }
                     if status_code >= 400 {
                         info.as_object_mut().unwrap().insert(
                             "error".to_string(),

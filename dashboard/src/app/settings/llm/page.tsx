@@ -201,7 +201,7 @@ export default function LLMSettingsPage() {
               <label className="block text-xs font-medium text-white/60 mb-1.5">
                 Provider
               </label>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 {Object.entries(LLM_PROVIDERS).map(([id, p]) => (
                   <button
                     key={id}

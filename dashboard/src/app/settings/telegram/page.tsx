@@ -56,9 +56,11 @@ const BACKEND_LABELS: Record<string, string> = {
 };
 
 export default function TelegramSettingsPage() {
-  const { data: bots = [], mutate: mutateBots } = useSWR('telegram-bots', listTelegramBots, {
-    revalidateOnFocus: false,
-  });
+  const { data: bots = [], mutate: mutateBots, isLoading: botsLoading } = useSWR(
+    'telegram-bots',
+    listTelegramBots,
+    { revalidateOnFocus: false }
+  );
   const { data: backends = [] } = useSWR('backends', listBackends, {
     revalidateOnFocus: false,
   });
@@ -395,7 +397,34 @@ export default function TelegramSettingsPage() {
         </header>
 
         {/* Bot list */}
-        {bots.length === 0 ? (
+        {botsLoading ? (
+          <div className="space-y-4" aria-busy="true" aria-label="Loading Telegram bots">
+            {Array.from({ length: 2 }).map((_, i) => (
+              <div
+                key={i}
+                className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden animate-pulse"
+              >
+                <div className="p-4 flex items-center gap-4">
+                  <div className="h-10 w-10 rounded-lg bg-white/[0.04] flex-shrink-0" />
+                  <div className="flex-1 min-w-0 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <div className="h-4 w-32 rounded bg-white/[0.06]" />
+                      <div className="h-4 w-14 rounded-full bg-white/[0.04]" />
+                      <div className="h-4 w-20 rounded bg-white/[0.04]" />
+                    </div>
+                    <div className="h-3 w-40 rounded bg-white/[0.04]" />
+                  </div>
+                  <div className="flex items-center gap-1">
+                    {Array.from({ length: 3 }).map((__, j) => (
+                      <div key={j} className="h-7 w-7 rounded-lg bg-white/[0.04]" />
+                    ))}
+                  </div>
+                </div>
+                <div className="h-7 border-t border-white/[0.04] bg-white/[0.01]" />
+              </div>
+            ))}
+          </div>
+        ) : bots.length === 0 ? (
           <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-12 text-center">
             <MessageCircle className="h-12 w-12 text-white/20 mx-auto mb-4" />
             <h3 className="text-lg font-medium text-white mb-2">No Telegram bots</h3>

@@ -376,9 +376,9 @@ export default function SecretsPage() {
       </header>
 
       {loading ? (
-        <div className="space-y-4">
+        <div className="space-y-4" aria-busy="true" aria-label="Loading security settings">
           {Array.from({ length: 3 }).map((_, index) => (
-            <div key={index} className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6">
+            <div key={index} className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6 animate-pulse">
               <div className="flex items-center gap-3 mb-5">
                 <div className="h-9 w-9 rounded-lg bg-white/[0.06]" />
                 <div className="space-y-2">
@@ -564,7 +564,7 @@ export default function SecretsPage() {
           </div>
           <div className="flex-1">
             <div className="flex items-center gap-2 mb-1">
-              <h2 className="text-lg font-medium text-white">Skill Content Encryption</h2>
+              <h2 className="text-base font-medium text-white">Skill Content Encryption</h2>
               {encryptionStatus?.key_available ? (
                 <span className="flex items-center gap-1 text-xs text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full">
                   <CheckCircle className="h-3 w-3" />

@@ -589,8 +589,27 @@ export default function ProvidersPage() {
 
           <div className="space-y-2">
             {providersLoading ? (
-              <div className="flex items-center justify-center py-8">
-                <Loader className="h-5 w-5 animate-spin text-white/40" />
+              <div aria-busy="true" aria-label="Loading providers" className="space-y-2">
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <div
+                    key={i}
+                    className="rounded-lg border border-white/[0.06] bg-white/[0.01] animate-pulse"
+                  >
+                    <div className="flex items-center gap-3 px-3 py-2.5">
+                      <div className="h-4 w-4 rounded bg-white/[0.06]" />
+                      <div className="flex-1 min-w-0 space-y-1.5">
+                        <div className="h-3 w-32 rounded bg-white/[0.06]" />
+                        <div className="h-2.5 w-44 rounded bg-white/[0.04]" />
+                      </div>
+                      <div className="h-1.5 w-1.5 rounded-full bg-white/[0.06]" />
+                      <div className="flex items-center gap-0.5">
+                        {Array.from({ length: 3 }).map((__, j) => (
+                          <div key={j} className="h-6 w-6 rounded-md bg-white/[0.04]" />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
             ) : providers.length === 0 ? (
               <div className="text-center py-8">
