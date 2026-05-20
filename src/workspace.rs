@@ -788,11 +788,20 @@ fn opencode_entry_from_mcp(
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "context".to_string());
-                // Get the global context root from env var, falling back to /root/context
+                // Get the global context root from env var, then WORKING_DIR/context.
+                // Avoid falling back to /root/context when the service has an
+                // isolated working directory; /root/context can be a
+                // mission-local symlink from older runs.
                 let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var("WORKING_DIR")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|dir| PathBuf::from(dir).join(&context_dir_name))
+                    })
                     .unwrap_or_else(|| PathBuf::from("/root").join(&context_dir_name));
                 // Create the context directory if it doesn't exist
                 let _ = std::fs::create_dir_all(&global_context_root);
@@ -3922,14 +3931,17 @@ async fn copy_binary_into_container(
     let dest_dir = container_root.join("usr/local/bin");
     tokio::fs::create_dir_all(&dest_dir).await?;
     let dest = dest_dir.join(binary);
-    tokio::fs::copy(&source, &dest).await?;
+    let tmp = dest.with_extension(format!("tmp-{}", std::process::id()));
+    tokio::fs::copy(&source, &tmp).await?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        tokio::fs::set_permissions(&dest, perms).await?;
+        tokio::fs::set_permissions(&tmp, perms).await?;
     }
+
+    tokio::fs::rename(&tmp, &dest).await?;
 
     Ok(())
 }
@@ -3938,8 +3950,14 @@ async fn sync_workspace_mcp_binaries(
     working_dir: &Path,
     container_root: &Path,
 ) -> anyhow::Result<()> {
-    // Copy MCP binaries into the container so workspace-local MCP configs can run them directly.
+    // Copy runtime binaries into the container so per-workspace harnesses can
+    // start even when the image lacks the host's developer tooling.
     for binary in [
+        "opencode",
+        "curl",
+        "wget",
+        "bunx",
+        "npx",
         "workspace-mcp",
         "desktop-mcp",
         "orchestrator-mcp",

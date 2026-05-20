@@ -74,6 +74,7 @@ struct OpencodeSseState {
 
 struct OpencodeSseParseResult {
     event: Option<AgentEvent>,
+    extra_events: Vec<AgentEvent>,
     message_complete: bool,
     session_id: Option<String>,
     model: Option<String>,
@@ -87,6 +88,78 @@ struct OpencodeSseParseResult {
     session_retry: bool,
     /// Token usage extracted from response.completed events (input, output).
     usage: Option<(u64, u64)>,
+}
+
+fn tool_result_text(result: &serde_json::Value) -> Option<String> {
+    match result {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Object(map) => {
+            for key in ["output", "result", "stdout", "content", "text"] {
+                if let Some(text) = map.get(key).and_then(tool_result_text) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(tool_result_text),
+        _ => None,
+    }
+}
+
+fn replace_filepath_artifact_with_tool_output(output: &str, tool_output: &str) -> Option<String> {
+    let tool_output = tool_output.trim();
+    if output.contains(tool_output)
+        || output.len() > 600
+        || tool_output.is_empty()
+        || tool_output.len() > 4_000
+    {
+        return None;
+    }
+
+    let mut repaired = output.to_string();
+    let mut changed = false;
+    let mut candidates: Vec<String> = Vec::new();
+    for token in output.split_whitespace() {
+        let trimmed =
+            token.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | ',' | '.' | ')' | '('));
+        let unwrapped = trimmed
+            .strip_prefix("<filepath>")
+            .and_then(|s| s.strip_suffix("</filepath>"))
+            .unwrap_or(trimmed);
+        let lower = unwrapped.to_ascii_lowercase();
+        let looks_like_file = unwrapped.contains('/')
+            || lower.ends_with(".txt")
+            || lower.ends_with(".md")
+            || lower.ends_with(".svg")
+            || lower.ends_with(".json")
+            || lower.ends_with(".log");
+        if looks_like_file && !unwrapped.is_empty() {
+            candidates.push(trimmed.to_string());
+            candidates.push(unwrapped.to_string());
+        }
+    }
+
+    for candidate in candidates {
+        if repaired.contains(&candidate) {
+            repaired = repaired.replace(&candidate, tool_output);
+            changed = true;
+        }
+    }
+
+    changed.then_some(repaired)
+}
+
+fn remember_tool_result_text(event: &AgentEvent, slot: &Arc<StdMutex<Option<String>>>) {
+    if let AgentEvent::ToolResult { result, .. } = event {
+        if let Some(text) = tool_result_text(result) {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(text);
+            }
+        }
+    }
 }
 
 /// Extract the `[Instructions: <text>]` content from a Telegram user message.
@@ -1255,14 +1328,18 @@ fn handle_tool_part_update(
     state: &mut OpencodeSseState,
     mission_id: Uuid,
 ) -> Option<AgentEvent> {
-    let state_obj = part.get("state")?;
-    let status = state_obj.get("status").and_then(|v| v.as_str())?;
+    let state_obj = part.get("state").unwrap_or(part);
+    let status = state_obj
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("running");
 
-    let tool_call_id = extract_str(part, &["callID", "id"])
+    let tool_call_id = extract_str(part, &["callID", "call_id", "toolCallID", "id"])
         .unwrap_or("unknown")
         .to_string();
 
     let tool_name = extract_str(part, &["tool", "name"])
+        .or_else(|| extract_str(state_obj, &["tool", "name"]))
         .unwrap_or("unknown")
         .to_string();
 
@@ -1274,6 +1351,9 @@ fn handle_tool_part_update(
             state.emitted_tool_calls.insert(tool_call_id.clone(), ());
             let args = state_obj
                 .get("input")
+                .or_else(|| state_obj.get("args"))
+                .or_else(|| part.get("input"))
+                .or_else(|| part.get("args"))
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
             Some(AgentEvent::ToolCall {
@@ -1290,6 +1370,9 @@ fn handle_tool_part_update(
             state.emitted_tool_results.insert(tool_call_id.clone(), ());
             let result = state_obj
                 .get("output")
+                .or_else(|| state_obj.get("result"))
+                .or_else(|| part.get("output"))
+                .or_else(|| part.get("result"))
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
             Some(AgentEvent::ToolResult {
@@ -1318,6 +1401,50 @@ fn handle_tool_part_update(
         }
         _ => None,
     }
+}
+
+fn opencode_tool_event_pair_for_completed_part(
+    part: &serde_json::Value,
+    state: &mut OpencodeSseState,
+    mission_id: Uuid,
+) -> Option<(AgentEvent, Option<AgentEvent>)> {
+    let state_obj = part.get("state").unwrap_or(part);
+    let status = state_obj
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("running");
+    if status != "completed" && status != "error" {
+        return handle_tool_part_update(part, state, mission_id).map(|event| (event, None));
+    }
+
+    let tool_call_id = extract_str(part, &["callID", "call_id", "toolCallID", "id"])
+        .unwrap_or("unknown")
+        .to_string();
+    let tool_name = extract_str(part, &["tool", "name"])
+        .or_else(|| extract_str(state_obj, &["tool", "name"]))
+        .unwrap_or("unknown")
+        .to_string();
+    let call_was_emitted = state.emitted_tool_calls.contains_key(&tool_call_id);
+    let result = handle_tool_part_update(part, state, mission_id)?;
+    if call_was_emitted {
+        return Some((result, None));
+    }
+
+    state.emitted_tool_calls.insert(tool_call_id.clone(), ());
+    let args = state_obj
+        .get("input")
+        .or_else(|| state_obj.get("args"))
+        .or_else(|| part.get("input"))
+        .or_else(|| part.get("args"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let call = AgentEvent::ToolCall {
+        tool_call_id,
+        name: tool_name,
+        args,
+        mission_id: Some(mission_id),
+    };
+    Some((call, Some(result)))
 }
 
 fn handle_part_update(
@@ -1495,6 +1622,7 @@ fn parse_opencode_sse_event(
     let mut message_complete = false;
     let mut model: Option<String> = None;
     let mut sse_usage: Option<(u64, u64)> = None;
+    let mut extra_events: Vec<AgentEvent> = Vec::new();
     let event = match event_type {
         "response.output_text.delta" => {
             let delta = props
@@ -1779,6 +1907,19 @@ fn parse_opencode_sse_event(
                 }
             }
         }
+        "tool_use" => {
+            let part = props.get("part").unwrap_or(&props);
+            if let Some((event, extra)) =
+                opencode_tool_event_pair_for_completed_part(part, state, mission_id)
+            {
+                if let Some(extra) = extra {
+                    extra_events.push(extra);
+                }
+                Some(event)
+            } else {
+                None
+            }
+        }
         "step_start" => None,
         "step_finish" => {
             let part = props.get("part").unwrap_or(&props);
@@ -1877,6 +2018,7 @@ fn parse_opencode_sse_event(
 
     Some(OpencodeSseParseResult {
         event,
+        extra_events,
         message_complete,
         session_id,
         model,
@@ -8672,10 +8814,13 @@ async fn command_available(
         } else {
             args.push(format!("command -v {} 2>/dev/null", program));
         }
-        let output = workspace_exec
-            .output(cwd, "/bin/sh", &args, HashMap::new())
-            .await
-            .ok()?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            workspace_exec.output(cwd, "/bin/sh", &args, HashMap::new()),
+        )
+        .await
+        .ok()?
+        .ok()?;
         if !output.status.success() {
             return Some(false);
         }
@@ -10688,6 +10833,11 @@ pub async fn run_opencode_turn(
     let workspace_exec = WorkspaceExec::new(workspace.clone());
     if let Err(err) = ensure_opencode_cli_available(&workspace_exec, work_dir).await {
         tracing::error!("{}", err);
+        let _ = events_tx.send(AgentEvent::Error {
+            message: err.clone(),
+            mission_id: Some(mission_id),
+            resumable: true,
+        });
         return AgentResult::failure(err, 0).with_terminal_reason(TerminalReason::LlmError);
     }
 
@@ -11357,6 +11507,7 @@ pub async fn run_opencode_turn(
     // Updated only by the dedicated SSE curl task; the stdout parser uses local counters
     // and only accumulates when the SSE task is absent (to avoid double-counting).
     let sse_usage_tokens: Arc<Mutex<(u64, u64)>> = Arc::new(Mutex::new((0, 0)));
+    let latest_tool_result_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let rate_limit_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
     let (sse_complete_tx, mut sse_complete_rx) = tokio::sync::watch::channel(false);
@@ -11396,6 +11547,7 @@ pub async fn run_opencode_turn(
         let text_output_tx = text_output_tx.clone();
         let sse_tool_depth_tx = sse_tool_depth_tx.clone();
         let sse_usage_tokens = sse_usage_tokens.clone();
+        let latest_tool_result_text = latest_tool_result_text.clone();
         let events_tx = events_tx.clone();
         let opencode_port = opencode_port.clone();
         let sse_host = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME")
@@ -11563,6 +11715,28 @@ pub async fn run_opencode_turn(
                                                 }
                                                 _ => {}
                                             }
+                                            remember_tool_result_text(
+                                                &event,
+                                                &latest_tool_result_text,
+                                            );
+                                            let _ = events_tx.send(event);
+                                        }
+                                        for event in parsed.extra_events {
+                                            match &event {
+                                                AgentEvent::ToolCall { .. } => {
+                                                    sse_tool_depth_tx
+                                                        .send_modify(|v| *v = v.saturating_add(1));
+                                                }
+                                                AgentEvent::ToolResult { .. } => {
+                                                    sse_tool_depth_tx
+                                                        .send_modify(|v| *v = v.saturating_sub(1));
+                                                }
+                                                _ => {}
+                                            }
+                                            remember_tool_result_text(
+                                                &event,
+                                                &latest_tool_result_text,
+                                            );
                                             let _ = events_tx.send(event);
                                         }
                                         if parsed.message_complete {
@@ -12350,6 +12524,11 @@ pub async fn run_opencode_turn(
                                         let _ = text_output_tx.send(true);
                                         sse_emitted_text.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
+                                    remember_tool_result_text(&event, &latest_tool_result_text);
+                                    let _ = events_tx.send(event);
+                                }
+                                for event in parsed.extra_events {
+                                    remember_tool_result_text(&event, &latest_tool_result_text);
                                     let _ = events_tx.send(event);
                                 }
                                 if parsed.message_complete {
@@ -12627,6 +12806,20 @@ pub async fn run_opencode_turn(
     if !cleaned_result.trim().is_empty() {
         if let Cow::Owned(clean) = cleaned_result {
             final_result = clean;
+        }
+    }
+
+    if let Ok(guard) = latest_tool_result_text.lock() {
+        if let Some(tool_output) = guard.as_deref() {
+            if let Some(repaired) =
+                replace_filepath_artifact_with_tool_output(&final_result, tool_output)
+            {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    "Replaced filepath-style OpenCode final output with latest tool result text"
+                );
+                final_result = repaired;
+            }
         }
     }
 
@@ -15008,13 +15201,13 @@ mod tests {
         is_tool_call_only_output, opencode_idle_timeout_result_message,
         opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, record_codex_error_message, resolve_cost_cents_and_source,
-        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
-        sync_opencode_agent_config, use_thinking_only_fallback, ClaudeIncompleteTurnContext,
-        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        preferred_model_for_cost, record_codex_error_message,
+        replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
+        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
+        use_thinking_only_fallback, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
+        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text,
@@ -17065,6 +17258,125 @@ mod tests {
         assert_eq!(
             parse_opencode_stderr_text_part(line),
             Some("Hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_opencode_tool_use_event_emits_tool_call() {
+        let mission_id = Uuid::new_v4();
+        let mut state = OpencodeSseState::default();
+        let event = json!({
+            "type": "tool_use",
+            "part": {
+                "id": "tool-1",
+                "type": "tool",
+                "tool": "bash",
+                "state": {
+                    "status": "running",
+                    "input": { "command": "cat /tmp/result.txt" }
+                }
+            }
+        });
+
+        let parsed =
+            parse_opencode_sse_event(&event.to_string(), None, None, &mut state, mission_id)
+                .expect("event should parse")
+                .event
+                .expect("tool call should emit");
+
+        match parsed {
+            crate::api::control::AgentEvent::ToolCall {
+                tool_call_id,
+                name,
+                args,
+                mission_id: parsed_mission_id,
+            } => {
+                assert_eq!(tool_call_id, "tool-1");
+                assert_eq!(name, "bash");
+                assert_eq!(args["command"], "cat /tmp/result.txt");
+                assert_eq!(parsed_mission_id, Some(mission_id));
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_tool_use_completed_event_emits_tool_result() {
+        let mission_id = Uuid::new_v4();
+        let mut state = OpencodeSseState::default();
+        let event = json!({
+            "type": "tool_use",
+            "part": {
+                "id": "tool-1",
+                "type": "tool",
+                "tool": "bash",
+                "state": {
+                    "status": "completed",
+                    "output": "done"
+                }
+            }
+        });
+
+        let parsed =
+            parse_opencode_sse_event(&event.to_string(), None, None, &mut state, mission_id)
+                .expect("event should parse");
+
+        match parsed.event.expect("synthetic tool call should emit first") {
+            crate::api::control::AgentEvent::ToolCall {
+                tool_call_id,
+                name,
+                mission_id: parsed_mission_id,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "tool-1");
+                assert_eq!(name, "bash");
+                assert_eq!(parsed_mission_id, Some(mission_id));
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+
+        let result_event = parsed
+            .extra_events
+            .into_iter()
+            .next()
+            .expect("tool result should emit after synthetic call");
+        match result_event {
+            crate::api::control::AgentEvent::ToolResult {
+                tool_call_id,
+                name,
+                result,
+                mission_id: parsed_mission_id,
+            } => {
+                assert_eq!(tool_call_id, "tool-1");
+                assert_eq!(name, "bash");
+                assert_eq!(result, json!("done"));
+                assert_eq!(parsed_mission_id, Some(mission_id));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_filepath_artifact_with_tool_output_replaces_path_token() {
+        assert_eq!(
+            replace_filepath_artifact_with_tool_output(
+                "SMOKE_OK /tmp/sboxed-result.txt",
+                "actual-file-content\n"
+            )
+            .as_deref(),
+            Some("SMOKE_OK actual-file-content")
+        );
+    }
+
+    #[test]
+    fn replace_filepath_artifact_with_tool_output_replaces_filepath_tag() {
+        assert_eq!(
+            replace_filepath_artifact_with_tool_output(
+                "SMOKE_OK <filepath>/tmp/sboxed-result.txt</filepath>",
+                "actual-file-content"
+            )
+            .as_deref(),
+            Some("SMOKE_OK actual-file-content")
         );
     }
 

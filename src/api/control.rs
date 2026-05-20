@@ -4873,6 +4873,7 @@ pub struct MissionSnapshotResponse {
     pub mission: Mission,
     pub events: Vec<mission_store::StoredEvent>,
     pub event_counts: HashMap<String, usize>,
+    pub counts: HashMap<String, usize>,
     pub visibility_counts: HashMap<String, usize>,
     pub total_events: usize,
     pub latest_sequence: i64,
@@ -4944,6 +4945,7 @@ pub async fn get_mission_snapshot(
     Ok(Json(MissionSnapshotResponse {
         mission,
         events: summary.events,
+        counts: event_counts.clone(),
         event_counts,
         visibility_counts,
         total_events: total,

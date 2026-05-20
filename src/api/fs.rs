@@ -444,11 +444,7 @@ fn configured_context_root(config_working_dir: &Path) -> PathBuf {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "context".to_string());
-    let root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config_working_dir.join(context_dir_name));
+    let root = config_working_dir.join(context_dir_name);
 
     if root.is_absolute() {
         root

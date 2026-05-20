@@ -520,22 +520,33 @@ impl WorkspaceExec {
         // to operate, and machined cannot create cgroup scopes without
         // systemd as PID 1, so we run nspawn with --register=no and locate
         // the leader by scanning for `systemd-nspawn -D <workspace path>`.
-        let path = self.workspace.path.to_string_lossy().into_owned();
-        let nspawn_pids = Command::new("pgrep")
-            .args(["-f", &format!("systemd-nspawn.*-D {}", path)])
-            .output()
-            .await
-            .ok()?;
-        if !nspawn_pids.status.success() {
-            return None;
+        let mut paths = vec![self.workspace.path.to_string_lossy().into_owned()];
+        if let Ok(canonical) = self.workspace.path.canonicalize() {
+            let canonical = canonical.to_string_lossy().into_owned();
+            if !paths.iter().any(|path| path == &canonical) {
+                paths.push(canonical);
+            }
         }
-        let nspawn_pid = String::from_utf8_lossy(&nspawn_pids.stdout)
-            .lines()
-            .next()
-            .map(|s| s.trim().to_string())?;
-        if nspawn_pid.is_empty() {
-            return None;
+
+        let mut nspawn_pid = None;
+        for path in paths {
+            let output = Command::new("pgrep")
+                .args(["-f", &format!("systemd-nspawn.*-D {}", path)])
+                .output()
+                .await
+                .ok()?;
+            if output.status.success() {
+                nspawn_pid = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                if nspawn_pid.is_some() {
+                    break;
+                }
+            }
         }
+        let nspawn_pid = nspawn_pid?;
         let child_pids = Command::new("pgrep")
             .args(["-P", &nspawn_pid])
             .output()
@@ -589,6 +600,12 @@ impl WorkspaceExec {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("WORKING_DIR")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|dir| PathBuf::from(dir).join(&context_dir_name))
+            })
             .unwrap_or_else(|| PathBuf::from("/root").join(&context_dir_name));
         if global_context_root.exists() {
             cmd.arg(format!(
