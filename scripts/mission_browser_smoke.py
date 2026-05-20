@@ -12,10 +12,10 @@ import socket
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
+
+from http_client import json_request, sse_get
 
 DEFAULT_BACKENDS = ["claudecode", "codex"]
 REQUIRED_TOOL_PREFIXES = (
@@ -40,38 +40,11 @@ def env_or(name: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def http_json(method: str, url: str, token: str, payload: Optional[dict]) -> dict:
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header(
-        "User-Agent",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8")
-            if not body:
-                return {}
-            return json.loads(body)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8")
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {body}")
+    return json_request(method, url, token, payload, timeout=30)
 
 
-def open_sse_stream(url: str, token: str, timeout: float) -> urllib.response.addinfourl:
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Accept", "text/event-stream")
-    req.add_header(
-        "User-Agent",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    )
-    return urllib.request.urlopen(req, timeout=timeout)
+def open_sse_stream(url: str, token: str, timeout: float):
+    return sse_get(url, token, timeout)
 
 
 def parse_sse(stream, on_event, stop_event: threading.Event, timeout: float) -> None:

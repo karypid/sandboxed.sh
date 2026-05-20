@@ -23,10 +23,10 @@ import os
 import socket
 import sys
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+from http_client import json_request, sse_post
 
 
 def die(message: str) -> None:
@@ -48,32 +48,11 @@ def http_json(
     payload: Optional[dict],
     timeout: float = 60,
 ) -> dict:
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-            if not body:
-                return {}
-            return json.loads(body)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8")
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {body}")
+    return json_request(method, url, token, payload, timeout=timeout)
 
 
-def open_sse_stream(
-    url: str, token: str, payload: dict, timeout: float
-) -> urllib.response.addinfourl:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "text/event-stream")
-    return urllib.request.urlopen(req, timeout=timeout)
+def open_sse_stream(url: str, token: str, payload: dict, timeout: float):
+    return sse_post(url, token, payload, timeout)
 
 
 def parse_sse_events(stream, on_event, timeout: float) -> None:
