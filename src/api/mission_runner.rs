@@ -12967,6 +12967,42 @@ impl TextDeltaCoalescer {
     }
 }
 
+fn suffix_prefix_overlap_len(existing: &str, incoming: &str) -> usize {
+    let max_chars = existing.chars().count().min(incoming.chars().count());
+    for overlap_chars in (1..=max_chars).rev() {
+        let existing_start = existing
+            .char_indices()
+            .nth(existing.chars().count() - overlap_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let incoming_end = incoming
+            .char_indices()
+            .nth(overlap_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(incoming.len());
+        if existing[existing_start..] == incoming[..incoming_end] {
+            return incoming_end;
+        }
+    }
+    0
+}
+
+fn merge_stream_fragment(buffer: &mut String, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if buffer.is_empty() || fragment.starts_with(buffer.as_str()) {
+        *buffer = fragment.to_string();
+        return;
+    }
+    if buffer.starts_with(fragment) {
+        return;
+    }
+
+    let overlap = suffix_prefix_overlap_len(buffer, fragment);
+    buffer.push_str(&fragment[overlap..]);
+}
+
 /// Execute a turn using the Grok Build CLI backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_grok_turn(
@@ -13182,7 +13218,7 @@ pub async fn run_grok_turn(
                         }
                         if let Some(reasoning) = grok_event_reasoning(&value) {
                             if !reasoning.is_empty() {
-                                reasoning_buffer.push_str(&reasoning);
+                                merge_stream_fragment(&mut reasoning_buffer, &reasoning);
                                 // Mirror the TextDelta coalescing strategy:
                                 // emit cumulative snapshots throttled to ~50ms.
                                 if reasoning_buffer.len() > last_reasoning_len
@@ -13216,10 +13252,10 @@ pub async fn run_grok_turn(
                                     .get("delta")
                                     .is_some()
                                     || value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
-                                        t.contains("delta") || t.contains("chunk") || t == "text"
+                                    t.contains("delta") || t.contains("chunk") || t == "text"
                                     })
                                 {
-                                    final_result.push_str(&text);
+                                    merge_stream_fragment(&mut final_result, &text);
                                 } else {
                                     final_result = text;
                                 }
@@ -14985,7 +15021,8 @@ mod tests {
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text,
-        inject_telegram_identity_into_claude_md, localhost_api_base_url, public_api_base_url,
+        inject_telegram_identity_into_claude_md, localhost_api_base_url, merge_stream_fragment,
+        public_api_base_url,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -15007,6 +15044,25 @@ mod tests {
             Some("private reasoning")
         );
         assert_eq!(grok_event_text(&event), None);
+    }
+
+    #[test]
+    fn merge_stream_fragment_accepts_delta_and_snapshot_chunks() {
+        let mut buffer = String::new();
+        merge_stream_fragment(&mut buffer, "I have enough evidence");
+        merge_stream_fragment(
+            &mut buffer,
+            "I have enough evidence for a focused ecosystem-fit report",
+        );
+        merge_stream_fragment(&mut buffer, ". I’m going");
+        merge_stream_fragment(&mut buffer, "going to write it");
+
+        assert_eq!(
+            buffer,
+            "I have enough evidence for a focused ecosystem-fit report. I’m going to write it"
+        );
+        assert!(!buffer.contains("reportI have"));
+        assert!(!buffer.contains("goinggoing"));
     }
 
     #[test]
