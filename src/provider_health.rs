@@ -822,6 +822,9 @@ impl ModelChainStore {
     /// Idempotent: skips any chain whose ID is already present.
     /// Checks and inserts under a single write lock to avoid TOCTOU races.
     async fn ensure_default_chain(&self) {
+        // Refresh these stock chains against the upstream model catalogs:
+        // Z.AI: https://docs.z.ai/guides/llm/glm
+        // MiniMax: https://platform.minimaxi.com/document/ChatCompletion%20v2
         let mut chains = self.chains.write().await;
 
         let now = chrono::Utc::now();
@@ -834,7 +837,7 @@ impl ModelChainStore {
                 entries: vec![
                     ChainEntry {
                         provider_id: "zai".to_string(),
-                        model_id: "glm-5".to_string(),
+                        model_id: "glm-5.1".to_string(),
                     },
                     ChainEntry {
                         provider_id: "minimax".to_string(),
@@ -847,19 +850,24 @@ impl ModelChainStore {
             });
             changed = true;
         } else {
-            // Migrate builtin/smart: upgrade MiniMax-M2.5 → MiniMax-M2.7
-            // Only if the chain exactly matches the old stock config (not user-customized).
+            // Built-in chains are managed defaults. Preserve configured order
+            // and extra fallbacks, but keep their stock model IDs current.
             if let Some(chain) = chains.iter_mut().find(|c| c.id == "builtin/smart") {
-                let is_old_stock = chain.entries.len() == 2
-                    && chain.entries[0].provider_id == "zai"
-                    && chain.entries[0].model_id == "glm-5"
-                    && chain.entries[1].provider_id == "minimax"
-                    && chain.entries[1].model_id == "MiniMax-M2.5";
-                if is_old_stock {
-                    chain.entries[1].model_id = "MiniMax-M2.7".to_string();
+                let mut migrated = false;
+                for entry in &mut chain.entries {
+                    if entry.provider_id == "zai" && entry.model_id == "glm-5" {
+                        entry.model_id = "glm-5.1".to_string();
+                        migrated = true;
+                    }
+                    if entry.provider_id == "minimax" && entry.model_id == "MiniMax-M2.5" {
+                        entry.model_id = "MiniMax-M2.7".to_string();
+                        migrated = true;
+                    }
+                }
+                if migrated {
                     chain.updated_at = now;
                     changed = true;
-                    tracing::info!("Migrated builtin/smart: MiniMax-M2.5 → MiniMax-M2.7");
+                    tracing::info!("Migrated builtin/smart model IDs to current defaults");
                 }
             }
         }

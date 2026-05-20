@@ -92,6 +92,7 @@ fn normalize_model(model: &str) -> &str {
         s if s.contains("grok-3") => "grok-3",
 
         // Z.AI / GLM models
+        s if s.contains("glm-5.1") || s.contains("glm-5-1") => "glm-5.1",
         s if s.contains("glm-5") => "glm-5",
         s if s.contains("glm-4.5") || s.contains("glm-4-5") => "glm-4.5",
 
@@ -394,7 +395,7 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
         }),
 
         // Z.AI / GLM OpenAI-compatible pricing
-        "glm-5" => Some(ModelPricing {
+        "glm-5" | "glm-5.1" => Some(ModelPricing {
             input_nano_per_token: 600,
             output_nano_per_token: 2_200,
             cache_create_nano_per_token: None,
@@ -542,6 +543,7 @@ mod tests {
         assert_eq!(normalize_model("gemini-3-pro-preview"), "gemini-3-pro");
         assert_eq!(normalize_model("grok-4-fast-reasoning"), "grok-4-fast");
         assert_eq!(normalize_model("zai/glm-5"), "glm-5");
+        assert_eq!(normalize_model("zai/glm-5.1"), "glm-5.1");
         assert_eq!(normalize_model("minimax-m2"), "minimax-m2");
     }
 
@@ -561,6 +563,7 @@ mod tests {
         assert!(pricing_for_model("gemini-3-flash-preview").is_some());
         assert!(pricing_for_model("grok-4-fast").is_some());
         assert!(pricing_for_model("glm-5").is_some());
+        assert!(pricing_for_model("glm-5.1").is_some());
         assert!(pricing_for_model("minimax-m2").is_some());
     }
 

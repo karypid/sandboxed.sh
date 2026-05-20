@@ -36,9 +36,9 @@ use crate::workspace_exec::WorkspaceExec;
 
 use super::automation_variables::substitute_custom_variables;
 use super::control::{
-    resolve_claudecode_default_model, resolve_gemini_default_model, resolve_grok_default_model,
-    safe_truncate_index, AgentEvent, AgentTreeNode, ControlRunState, ControlStatus,
-    ExecutionProgress, FrontendToolHub,
+    resolve_claudecode_default_model, resolve_codex_default_model, resolve_gemini_default_model,
+    resolve_grok_default_model, safe_truncate_index, AgentEvent, AgentTreeNode, ControlRunState,
+    ControlStatus, ExecutionProgress, FrontendToolHub,
 };
 use super::library::SharedLibrary;
 
@@ -2808,9 +2808,9 @@ async fn run_mission_turn(
         // models take precedence instead of being overridden.
         config.default_model = None;
     } else if backend_id == "codex" && model_override.is_none() {
-        // The global DEFAULT_MODEL (e.g. claude-opus-4-7) is not valid for
-        // Codex.  Clear it so Codex uses its own CLI default.
-        config.default_model = None;
+        // Pin Codex instead of inheriting the global DEFAULT_MODEL, which is
+        // usually a Claude/OpenCode slug and invalid for the Codex CLI.
+        config.default_model = Some(resolve_codex_default_model());
     } else if backend_id == "gemini" && model_override.is_none() {
         // Pin Gemini to a stable backend default instead of inheriting the
         // global model or relying on the CLI's own default.

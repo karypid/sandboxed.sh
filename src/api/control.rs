@@ -2256,34 +2256,54 @@ pub(crate) async fn resolve_claudecode_default_model(
     library: &SharedLibrary,
     config_profile: Option<&str>,
 ) -> Option<String> {
+    // Keep this fallback aligned with Anthropic's model catalog:
+    // https://docs.anthropic.com/en/docs/about-claude/models/overview
+    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-opus-4-7";
+
     let lib = {
         let guard = library.read().await;
         guard.clone()
-    }?;
+    };
+
+    let Some(lib) = lib else {
+        return Some(CLAUDECODE_DEFAULT_MODEL.to_string());
+    };
 
     let profile = config_profile.unwrap_or("default");
     match lib.get_claudecode_config_for_profile(profile).await {
-        Ok(config) => config.default_model.and_then(|model| {
-            let trimmed = model.trim().to_string();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        }),
+        Ok(config) => {
+            let configured = config.default_model.and_then(|model| {
+                let trimmed = model.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            });
+            configured.or_else(|| Some(CLAUDECODE_DEFAULT_MODEL.to_string()))
+        }
         Err(err) => {
             tracing::warn!(
                 "Failed to load Claude Code config from library (profile: {}): {}",
                 profile,
                 err
             );
-            None
+            Some(CLAUDECODE_DEFAULT_MODEL.to_string())
         }
     }
 }
 
+/// Return the default model for Codex CLI when no override is specified.
+pub(crate) fn resolve_codex_default_model() -> String {
+    // Keep aligned with Codex upstream:
+    // https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json
+    "gpt-5.5".to_string()
+}
+
 /// Return the default model for Gemini CLI when no override is specified.
 pub(crate) fn resolve_gemini_default_model() -> String {
+    // Keep aligned with Google AI's model docs:
+    // https://ai.google.dev/gemini-api/docs/models
     "gemini-3.1-pro-preview".to_string()
 }
 
@@ -2294,6 +2314,9 @@ pub(crate) fn resolve_gemini_default_model() -> String {
 /// grok missions from inheriting the global `DEFAULT_MODEL`
 /// (e.g. `anthropic/claude-opus-4-6`) which grok rejects as "unknown model id".
 pub(crate) fn resolve_grok_default_model() -> String {
+    // Grok Build CLI currently advertises this coding model alias. xAI API
+    // model IDs live in the provider catalog instead:
+    // https://docs.x.ai/docs/models
     "grok-build".to_string()
 }
 
@@ -10959,6 +10982,7 @@ async fn run_single_control_turn(
     mission_config_profile: Option<String>,
 ) -> crate::agents::AgentResult {
     let is_claudecode = backend_id.as_deref() == Some("claudecode");
+    let is_codex = backend_id.as_deref() == Some("codex");
     // Get config profile: mission's config_profile takes priority over workspace's
     let workspace_config_profile = if let Some(ws_id) = workspace_id {
         workspaces.get(ws_id).await.and_then(|ws| ws.config_profile)
@@ -10976,10 +11000,13 @@ async fn run_single_control_turn(
         {
             config.default_model = Some(default_model);
         }
+    } else if is_codex {
+        // Pin Codex instead of inheriting the global DEFAULT_MODEL, which is
+        // usually a Claude/OpenCode slug and invalid for the Codex CLI.
+        config.default_model = Some(resolve_codex_default_model());
     } else if (backend_id.as_deref() == Some("opencode")
         && effective_config_profile.is_some()
         && requested_model.is_none())
-        || (backend_id.as_deref() == Some("codex") && requested_model.is_none())
         || (backend_id.as_deref() == Some("grok") && requested_model.is_none())
     {
         config.default_model = None;

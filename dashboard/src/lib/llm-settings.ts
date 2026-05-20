@@ -46,8 +46,9 @@ export const LLM_PROVIDERS: Record<
   zai: {
     name: "Z.AI",
     baseUrl: "https://open.bigmodel.cn/api/paas/v4",
-    defaultModel: "glm-4.7",
-    models: ["glm-4.7", "glm-4.6", "glm-4.5", "glm-4.6v-flash"],
+    // Keep aligned with https://docs.z.ai/guides/llm/glm
+    defaultModel: "glm-5.1",
+    models: ["glm-5.1", "glm-5-turbo", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.6v-flash"],
   },
   groq: {
     name: "Groq",

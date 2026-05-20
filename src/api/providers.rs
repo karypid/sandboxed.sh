@@ -411,6 +411,8 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "subscription".to_string(),
                 description: "Included in Claude Max".to_string(),
                 models: vec![
+                    // Check Anthropic's current model IDs here:
+                    // https://docs.anthropic.com/en/docs/about-claude/models/overview
                     ProviderModel {
                         id: "claude-opus-4-7".to_string(),
                         name: "Claude Opus 4.7".to_string(),
@@ -536,6 +538,8 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "subscription".to_string(),
                 description: "Gemini models via Google OAuth".to_string(),
                 models: vec![
+                    // Check Gemini model IDs here:
+                    // https://ai.google.dev/gemini-api/docs/models
                     ProviderModel {
                         id: "gemini-3.1-pro-preview".to_string(),
                         name: "Gemini 3.1 Pro Preview".to_string(),
@@ -571,6 +575,8 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
+                    // Check xAI model IDs here:
+                    // https://docs.x.ai/docs/models
                     ProviderModel {
                         id: "grok-4.3".to_string(),
                         name: "Grok 4.3".to_string(),
@@ -607,6 +613,13 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "GLM models via Z.AI API key".to_string(),
                 models: vec![
+                    // Check Z.AI / GLM model IDs here:
+                    // https://docs.z.ai/guides/llm/glm
+                    ProviderModel {
+                        id: "glm-5.1".to_string(),
+                        name: "GLM-5.1".to_string(),
+                        description: Some("Most capable GLM reasoning model".to_string()),
+                    },
                     ProviderModel {
                         id: "glm-5-turbo".to_string(),
                         name: "GLM-5 Turbo".to_string(),
@@ -640,6 +653,8 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "MiniMax models via Minimax API key".to_string(),
                 models: vec![
+                    // Check MiniMax text model IDs here:
+                    // https://platform.minimaxi.com/document/ChatCompletion%20v2
                     ProviderModel {
                         id: "MiniMax-M2.7".to_string(),
                         name: "MiniMax M2.7".to_string(),
