@@ -689,18 +689,12 @@ fn paloma_alert_importance_for_mission(
 }
 
 fn paloma_alert_event_kind(mission: &Mission, base_kind: &str) -> String {
-    let updated = mission
-        .metadata_updated_at
-        .as_deref()
-        .unwrap_or(mission.updated_at.as_str());
+    let updated = mission.updated_at.as_str();
     format!("{base_kind}:{}", updated.replace([':', '.', '+'], "-"))
 }
 
 fn paloma_alert_transition_is_recent(mission: &Mission) -> bool {
-    let updated = mission
-        .metadata_updated_at
-        .as_deref()
-        .unwrap_or(mission.updated_at.as_str());
+    let updated = mission.updated_at.as_str();
     let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated) else {
         return true;
     };
@@ -5213,6 +5207,13 @@ mod tests {
         let mut recent = test_mission("Current outage", MissionStatus::Failed);
         recent.updated_at = now_string();
         assert!(paloma_alert_transition_is_recent(&recent));
+
+        let mut stale_metadata_recent_status = test_mission("Recent status", MissionStatus::Failed);
+        stale_metadata_recent_status.metadata_updated_at = Some("2026-01-01T00:00:00Z".to_string());
+        stale_metadata_recent_status.updated_at = now_string();
+        assert!(paloma_alert_transition_is_recent(
+            &stale_metadata_recent_status
+        ));
     }
 
     #[test]
