@@ -5665,6 +5665,32 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn acknowledge_pending_telegram_alerts_for_mission(
+        &self,
+        telegram_user_id: i64,
+        mission_id: Uuid,
+        acknowledged_at: &str,
+    ) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        let acknowledged_at = acknowledged_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let changed = conn
+                .execute(
+                    "UPDATE telegram_alerts
+                     SET status = 'acknowledged', acknowledged_at = ?3, last_error = NULL
+                     WHERE telegram_user_id = ?1
+                       AND mission_id = ?2
+                       AND status = 'pending'",
+                    params![telegram_user_id, mission_id.to_string(), acknowledged_at],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(changed)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn mark_telegram_alert_failed(&self, id: Uuid, error: &str) -> Result<(), String> {
         let conn = self.conn.clone();
         let error = error.to_string();
@@ -8298,6 +8324,42 @@ mod tests {
             .list_pending_telegram_alerts(1_139_694_048, 10)
             .await
             .expect("pending alerts after sent")
+            .is_empty());
+
+        let queued_after_mute = TelegramAlert {
+            id: Uuid::new_v4(),
+            telegram_user_id: 1_139_694_048,
+            mission_id: Some(mission.id),
+            event_kind: "mission_awaiting_user".to_string(),
+            importance: "high".to_string(),
+            title: "Paloma state".to_string(),
+            body: "Paloma state needs input.".to_string(),
+            status: "pending".to_string(),
+            telegram_message_id: None,
+            last_error: Some("previous retry".to_string()),
+            created_at: "2026-05-20T10:02:00Z".to_string(),
+            sent_at: None,
+            acknowledged_at: None,
+        };
+        store
+            .create_telegram_alert_if_absent(queued_after_mute)
+            .await
+            .expect("queued alert after mute");
+        assert_eq!(
+            store
+                .acknowledge_pending_telegram_alerts_for_mission(
+                    1_139_694_048,
+                    mission.id,
+                    "2026-05-20T10:03:00Z",
+                )
+                .await
+                .expect("acknowledge pending alerts"),
+            1
+        );
+        assert!(store
+            .list_pending_telegram_alerts(1_139_694_048, 10)
+            .await
+            .expect("pending alerts after ack")
             .is_empty());
     }
 

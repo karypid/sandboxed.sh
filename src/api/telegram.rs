@@ -631,6 +631,16 @@ async fn apply_paloma_interest_feedback(
     ctx.mission_store
         .upsert_telegram_mission_subscription(subscription)
         .await?;
+    if level == TelegramMissionInterestLevel::Muted {
+        let _ = ctx
+            .mission_store
+            .acknowledge_pending_telegram_alerts_for_mission(
+                user.telegram_user_id,
+                mission.id,
+                &now,
+            )
+            .await;
+    }
     let _ = ctx
         .mission_store
         .create_telegram_alert_preference(TelegramAlertPreference {
@@ -888,11 +898,44 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
             .await;
     }
 
-    let pending = ctx
+    let mut pending = ctx
         .mission_store
         .list_pending_telegram_alerts(owner_id, PALOMA_ALERT_DIGEST_LIMIT)
         .await
         .unwrap_or_default();
+    let muted_pending = pending
+        .iter()
+        .filter_map(|alert| alert.mission_id.map(|mission_id| (alert.id, mission_id)))
+        .filter(|(_, mission_id)| {
+            subscriptions
+                .get(mission_id)
+                .copied()
+                .unwrap_or(TelegramMissionInterestLevel::Normal)
+                == TelegramMissionInterestLevel::Muted
+        })
+        .collect::<Vec<_>>();
+    if !muted_pending.is_empty() {
+        let acknowledged_at = now_string();
+        for (_, mission_id) in &muted_pending {
+            let _ = ctx
+                .mission_store
+                .acknowledge_pending_telegram_alerts_for_mission(
+                    owner_id,
+                    *mission_id,
+                    &acknowledged_at,
+                )
+                .await;
+        }
+        pending.retain(|alert| {
+            alert.mission_id.is_none_or(|mission_id| {
+                subscriptions
+                    .get(&mission_id)
+                    .copied()
+                    .unwrap_or(TelegramMissionInterestLevel::Normal)
+                    != TelegramMissionInterestLevel::Muted
+            })
+        });
+    }
     if pending.is_empty() {
         return;
     }
