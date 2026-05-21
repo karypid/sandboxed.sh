@@ -2875,6 +2875,8 @@ export interface SettingsResponse {
   rtk_enabled: boolean | null;
   max_parallel_missions: number | null;
   max_concurrent_tasks: number | null;
+  auto_cleanup_enabled: boolean | null;
+  auto_cleanup_days: number | null;
 }
 
 export interface UpdateLibraryRemoteResponse {

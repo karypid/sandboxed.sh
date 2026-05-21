@@ -68,6 +68,7 @@ fn normalize_model(model: &str) -> &str {
         s if s.contains("gpt-5.4") || s.contains("gpt-5-4") => "gpt-5.4",
         s if s.contains("gpt-5.3") || s.contains("gpt-5-3") => "gpt-5.3",
         s if s.contains("gpt-5.2") || s.contains("gpt-5-2") => "gpt-5.2",
+        s if s.contains("gpt-5.1") || s.contains("gpt-5-1") => "gpt-5",
         s if s.contains("gpt-4o-mini") => "gpt-4o-mini",
         s if s.contains("gpt-4o") => "gpt-4o",
         s if s.contains("gpt-4-turbo") => "gpt-4-turbo",
@@ -91,11 +92,13 @@ fn normalize_model(model: &str) -> &str {
         s if s.contains("grok-4") => "grok-4",
         s if s.contains("grok-3-mini") => "grok-3-mini",
         s if s.contains("grok-3") => "grok-3",
-        s if s.contains("grok-inference") => "grok-4-fast",
+        s if s.contains("grok-inference") || s.contains("grok-build") => "grok-4-fast",
 
         // Z.AI / GLM models
         s if s.contains("glm-5.1") || s.contains("glm-5-1") => "glm-5.1",
         s if s.contains("glm-5") => "glm-5",
+        s if s.contains("glm-4.7") || s.contains("glm-4-7") => "glm-4.7",
+        s if s.contains("glm-4.6") || s.contains("glm-4-6") => "glm-4.6",
         s if s.contains("glm-4.5") || s.contains("glm-4-5") => "glm-4.5",
 
         // MiniMax models
@@ -403,7 +406,7 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_create_nano_per_token: None,
             cache_read_nano_per_token: None,
         }),
-        "glm-4.5" => Some(ModelPricing {
+        "glm-4.5" | "glm-4.6" | "glm-4.7" => Some(ModelPricing {
             input_nano_per_token: 600,
             output_nano_per_token: 2_200,
             cache_create_nano_per_token: None,
@@ -539,6 +542,7 @@ mod tests {
         assert_eq!(normalize_model("gpt-4o-2024-08-06"), "gpt-4o");
         assert_eq!(normalize_model("gpt-5.3-codex"), "gpt-5.3");
         assert_eq!(normalize_model("OpenAI/GPT-5"), "gpt-5");
+        assert_eq!(normalize_model("openai/gpt-5.1-codex"), "gpt-5");
         assert_eq!(normalize_model("gpt-5-mini"), "gpt-5-mini");
         assert_eq!(normalize_model("gemini-2.5-pro-preview"), "gemini-2.5-pro");
         assert_eq!(normalize_model("gemini-3.1-pro-preview"), "gemini-3.1-pro");
@@ -546,9 +550,11 @@ mod tests {
         assert_eq!(normalize_model("gemini-3-pro-preview"), "gemini-3-pro");
         assert_eq!(normalize_model("grok-4-fast-reasoning"), "grok-4-fast");
         assert_eq!(normalize_model("xAI/Grok Inference"), "grok-4-fast");
+        assert_eq!(normalize_model("grok-build"), "grok-4-fast");
         assert_eq!(normalize_model("zai/glm-5"), "glm-5");
         assert_eq!(normalize_model("zai/glm-5.1"), "glm-5.1");
-        assert_eq!(normalize_model("minimax-m2"), "minimax-m2");
+        assert_eq!(normalize_model("zai/glm-4.7"), "glm-4.7");
+        assert_eq!(normalize_model("minimax/MiniMax-M2.5"), "minimax-m2");
     }
 
     #[test]
@@ -561,6 +567,7 @@ mod tests {
         assert!(pricing_for_model("gpt-4o").is_some());
         assert!(pricing_for_model("gpt-5.3-codex").is_some());
         assert!(pricing_for_model("OpenAI/GPT-5").is_some());
+        assert!(pricing_for_model("openai/gpt-5.1-codex").is_some());
         assert!(pricing_for_model("gpt-5-mini").is_some());
         assert!(pricing_for_model("gemini-2.5-pro").is_some());
         assert!(pricing_for_model("gemini-3.1-pro-preview").is_some());
@@ -568,9 +575,11 @@ mod tests {
         assert!(pricing_for_model("gemini-3-flash-preview").is_some());
         assert!(pricing_for_model("grok-4-fast").is_some());
         assert!(pricing_for_model("xAI/Grok Inference").is_some());
+        assert!(pricing_for_model("grok-build").is_some());
         assert!(pricing_for_model("glm-5").is_some());
         assert!(pricing_for_model("glm-5.1").is_some());
-        assert!(pricing_for_model("minimax-m2").is_some());
+        assert!(pricing_for_model("zai/glm-4.7").is_some());
+        assert!(pricing_for_model("minimax/MiniMax-M2.5").is_some());
     }
 
     #[test]

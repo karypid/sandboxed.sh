@@ -41,6 +41,8 @@ describe('DataSettingsPage RTK toggle', () => {
       rtk_enabled: false,
       max_parallel_missions: 1,
       max_concurrent_tasks: null,
+      auto_cleanup_enabled: null,
+      auto_cleanup_days: null,
     });
   });
 

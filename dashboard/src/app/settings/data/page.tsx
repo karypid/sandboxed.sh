@@ -20,6 +20,7 @@ import {
   Upload,
   Archive,
   Terminal,
+  Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -31,6 +32,10 @@ export default function DataSettingsPage() {
   const [repoPathValue, setRepoPathValue] = useState('');
   const [savingRepoPath, setSavingRepoPath] = useState(false);
   const [togglingRtk, setTogglingRtk] = useState(false);
+  const [togglingAutoCleanup, setTogglingAutoCleanup] = useState(false);
+  const [editingCleanupDays, setEditingCleanupDays] = useState(false);
+  const [cleanupDaysValue, setCleanupDaysValue] = useState('');
+  const [savingCleanupDays, setSavingCleanupDays] = useState(false);
 
   const [downloadingBackup, setDownloadingBackup] = useState(false);
   const [restoringBackup, setRestoringBackup] = useState(false);
@@ -129,6 +134,8 @@ export default function DataSettingsPage() {
             rtk_enabled: enabled,
             max_parallel_missions: current?.max_parallel_missions ?? 1,
             max_concurrent_tasks: current?.max_concurrent_tasks ?? null,
+            auto_cleanup_enabled: current?.auto_cleanup_enabled ?? null,
+            auto_cleanup_days: current?.auto_cleanup_days ?? null,
           };
         },
         {
@@ -138,6 +145,8 @@ export default function DataSettingsPage() {
             rtk_enabled: enabled,
             max_parallel_missions: current?.max_parallel_missions ?? 1,
             max_concurrent_tasks: current?.max_concurrent_tasks ?? null,
+            auto_cleanup_enabled: current?.auto_cleanup_enabled ?? null,
+            auto_cleanup_days: current?.auto_cleanup_days ?? null,
           }),
           rollbackOnError: true,
           revalidate: true,
@@ -150,6 +159,60 @@ export default function DataSettingsPage() {
       );
     } finally {
       setTogglingRtk(false);
+    }
+  };
+
+  const handleToggleAutoCleanup = async (enabled: boolean) => {
+    setTogglingAutoCleanup(true);
+    try {
+      const next = await updateSettings({ auto_cleanup_enabled: enabled });
+      mutateSettings(next, { revalidate: false });
+      toast.success(
+        enabled
+          ? 'Auto-cleanup enabled — old mission files will be deleted on the next hourly sweep'
+          : 'Auto-cleanup disabled'
+      );
+    } catch (err) {
+      toast.error(
+        `Failed to update auto-cleanup: ${err instanceof Error ? err.message : 'Unknown error'}`
+      );
+    } finally {
+      setTogglingAutoCleanup(false);
+    }
+  };
+
+  const handleStartEditCleanupDays = () => {
+    setCleanupDaysValue(
+      serverSettings?.auto_cleanup_days != null
+        ? String(serverSettings.auto_cleanup_days)
+        : '7'
+    );
+    setEditingCleanupDays(true);
+  };
+
+  const handleCancelEditCleanupDays = () => {
+    setEditingCleanupDays(false);
+    setCleanupDaysValue('');
+  };
+
+  const handleSaveCleanupDays = async () => {
+    const parsed = Number.parseInt(cleanupDaysValue, 10);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      toast.error('Retention must be a whole number of days (1 or more)');
+      return;
+    }
+    setSavingCleanupDays(true);
+    try {
+      const next = await updateSettings({ auto_cleanup_days: parsed });
+      mutateSettings(next, { revalidate: false });
+      setEditingCleanupDays(false);
+      toast.success(`Retention set to ${parsed} day${parsed === 1 ? '' : 's'}`);
+    } catch (err) {
+      toast.error(
+        `Failed to update retention: ${err instanceof Error ? err.message : 'Unknown error'}`
+      );
+    } finally {
+      setSavingCleanupDays(false);
     }
   };
 
@@ -412,6 +475,126 @@ export default function DataSettingsPage() {
                     )}
                   />
                 </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Auto-cleanup of old mission workspace files */}
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-500/10">
+                <Trash2 className="h-5 w-5 text-rose-400" />
+              </div>
+              <div>
+                <h2 className="text-sm font-medium text-white">Auto-cleanup old mission files</h2>
+                <p className="text-xs text-white/40">
+                  Periodically delete on-disk sandbox files for missions that ended a while ago
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <p className="text-sm text-white/70">
+                  {serverSettings?.auto_cleanup_enabled
+                    ? `Sweeping every hour — anything completed, failed, or interrupted more than ${
+                        serverSettings?.auto_cleanup_days ?? 7
+                      } day${(serverSettings?.auto_cleanup_days ?? 7) === 1 ? '' : 's'} ago is removed`
+                    : 'Disabled — old mission directories accumulate until you clean them manually'}
+                </p>
+                <p className="mt-1 text-xs text-white/40">
+                  Only the agent&apos;s sandbox files are deleted. Conversation history stays in the
+                  mission store, so the mission can still be reopened. Running and awaiting-user
+                  missions are never touched.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {togglingAutoCleanup && (
+                  <Loader className="h-3.5 w-3.5 animate-spin text-white/40" />
+                )}
+                <button
+                  type="button"
+                  aria-label="Toggle auto-cleanup"
+                  aria-pressed={Boolean(serverSettings?.auto_cleanup_enabled)}
+                  onClick={() =>
+                    handleToggleAutoCleanup(!Boolean(serverSettings?.auto_cleanup_enabled))
+                  }
+                  disabled={togglingAutoCleanup || settingsLoading}
+                  className={cn(
+                    'relative inline-flex h-6 w-11 items-center rounded-full transition-colors disabled:opacity-60 disabled:cursor-not-allowed',
+                    serverSettings?.auto_cleanup_enabled ? 'bg-rose-500' : 'bg-white/10'
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'inline-block h-4 w-4 rounded-full bg-white transition-transform',
+                      serverSettings?.auto_cleanup_enabled ? 'translate-x-6' : 'translate-x-1'
+                    )}
+                  />
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-4 flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <p className="text-xs uppercase tracking-wide text-white/40">
+                  Retention window
+                </p>
+                {editingCleanupDays ? (
+                  <div className="mt-1 flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      value={cleanupDaysValue}
+                      onChange={(e) => setCleanupDaysValue(e.target.value)}
+                      className="w-20 rounded-md bg-white/[0.04] border border-white/10 px-2 py-1 text-sm text-white focus:outline-none focus:border-white/30"
+                      autoFocus
+                    />
+                    <span className="text-sm text-white/60">days</span>
+                  </div>
+                ) : (
+                  <p className="mt-1 text-sm text-white/80">
+                    {serverSettings?.auto_cleanup_days ?? 7} day
+                    {(serverSettings?.auto_cleanup_days ?? 7) === 1 ? '' : 's'}
+                  </p>
+                )}
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {editingCleanupDays ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={handleSaveCleanupDays}
+                      disabled={savingCleanupDays}
+                      className="flex items-center gap-1 rounded-md bg-rose-500/20 hover:bg-rose-500/30 px-2 py-1 text-xs text-rose-200 disabled:opacity-60"
+                    >
+                      {savingCleanupDays ? (
+                        <Loader className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Check className="h-3 w-3" />
+                      )}
+                      Save
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCancelEditCleanupDays}
+                      disabled={savingCleanupDays}
+                      className="flex items-center gap-1 rounded-md bg-white/[0.04] hover:bg-white/10 px-2 py-1 text-xs text-white/70 disabled:opacity-60"
+                    >
+                      <X className="h-3 w-3" />
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleStartEditCleanupDays}
+                    disabled={settingsLoading}
+                    className="rounded-md bg-white/[0.04] hover:bg-white/10 px-2 py-1 text-xs text-white/70 disabled:opacity-60"
+                  >
+                    Edit
+                  </button>
+                )}
               </div>
             </div>
           </div>

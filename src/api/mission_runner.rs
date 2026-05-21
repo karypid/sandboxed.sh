@@ -13176,6 +13176,65 @@ fn grok_event_model(value: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn usage_value_tokens(value: &serde_json::Value, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|v| v.as_u64()))
+        .unwrap_or(0)
+}
+
+fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage> {
+    let usage = value
+        .get("usage")
+        .or_else(|| value.get("tokenUsage"))
+        .or_else(|| value.get("token_usage"))
+        .or_else(|| value.get("response").and_then(|r| r.get("usage")))
+        .or_else(|| value.get("message").and_then(|m| m.get("usage")))?;
+
+    let input_tokens = usage_value_tokens(
+        usage,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+        ],
+    );
+    let output_tokens = usage_value_tokens(
+        usage,
+        &[
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+        ],
+    );
+    let cache_creation_tokens = usage_value_tokens(
+        usage,
+        &[
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+        ],
+    );
+    let cache_read_tokens = usage_value_tokens(
+        usage,
+        &[
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "cached_tokens",
+            "cachedTokens",
+        ],
+    );
+    let token_usage = crate::cost::TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: Some(cache_creation_tokens),
+        cache_read_input_tokens: Some(cache_read_tokens),
+    };
+    token_usage.has_usage().then_some(token_usage)
+}
+
 fn grok_event_is_error(value: &serde_json::Value) -> bool {
     value
         .get("type")
@@ -13410,6 +13469,7 @@ pub async fn run_grok_turn(
     let mut model_used = model.map(str::to_string);
     let mut last_streamed_len = 0usize;
     let mut text_delta_coalescer = TextDeltaCoalescer::new();
+    let mut token_usage = crate::cost::TokenUsage::default();
     // Accumulate Grok's reasoning deltas into a cumulative buffer and
     // throttle Thinking emissions the same way text deltas are throttled.
     // Grok's CLI delivers reasoning as incremental tokens, mirroring the
@@ -13457,6 +13517,24 @@ pub async fn run_grok_turn(
                         }
                         if model_used.is_none() {
                             model_used = grok_event_model(&value);
+                        }
+                        if let Some(usage) = grok_event_usage(&value) {
+                            token_usage.input_tokens =
+                                token_usage.input_tokens.max(usage.input_tokens);
+                            token_usage.output_tokens =
+                                token_usage.output_tokens.max(usage.output_tokens);
+                            token_usage.cache_creation_input_tokens = Some(
+                                token_usage
+                                    .cache_creation_input_tokens
+                                    .unwrap_or(0)
+                                    .max(usage.cache_creation_input_tokens.unwrap_or(0)),
+                            );
+                            token_usage.cache_read_input_tokens = Some(
+                                token_usage
+                                    .cache_read_input_tokens
+                                    .unwrap_or(0)
+                                    .max(usage.cache_read_input_tokens.unwrap_or(0)),
+                            );
                         }
                         if grok_event_is_error(&value) {
                             had_error = true;
@@ -13608,14 +13686,25 @@ pub async fn run_grok_turn(
     }
 
     let success = exit_status.map(|status| status.success()).unwrap_or(false) && !had_error;
+    let model_for_cost = model_used.as_deref().or(Some("grok-build"));
+    let (cost_cents, cost_source) =
+        resolve_cost_cents_and_source(None, model_for_cost, &token_usage);
     let mut result = if success {
-        AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::TurnComplete)
+        AgentResult::success(final_result, cost_cents)
+            .with_cost_source(cost_source)
+            .with_terminal_reason(TerminalReason::TurnComplete)
     } else if let Some(marker) = cancel_marker {
-        AgentResult::failure(final_result, 0)
+        AgentResult::failure(final_result, cost_cents)
+            .with_cost_source(cost_source)
             .with_terminal_reason(marker.terminal_reason.unwrap_or(TerminalReason::Cancelled))
     } else {
-        AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
+        AgentResult::failure(final_result, cost_cents)
+            .with_cost_source(cost_source)
+            .with_terminal_reason(TerminalReason::LlmError)
     };
+    if token_usage.has_usage() {
+        result = result.with_usage(token_usage);
+    }
     result = result.with_model(model_used.unwrap_or_else(|| "grok-build".to_string()));
     result
 }
@@ -15263,7 +15352,7 @@ mod tests {
         MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
-        extract_telegram_instructions, grok_event_reasoning, grok_event_text,
+        extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
         inject_telegram_identity_into_claude_md, localhost_api_base_url, merge_stream_fragment,
         public_api_base_url,
     };
@@ -15356,6 +15445,25 @@ mod tests {
 
         assert_eq!(grok_event_text(&event).as_deref(), Some("visible answer"));
         assert_eq!(grok_event_reasoning(&event), None);
+    }
+
+    #[test]
+    fn grok_event_usage_extracts_common_token_shapes() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "prompt_tokens": 1200,
+                    "completion_tokens": 345,
+                    "cached_tokens": 100
+                }
+            }
+        });
+
+        let usage = grok_event_usage(&event).expect("usage");
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.output_tokens, 345);
+        assert_eq!(usage.cache_read_input_tokens, Some(100));
     }
 
     #[test]

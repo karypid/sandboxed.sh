@@ -57,6 +57,15 @@ pub struct Settings {
     /// When None, falls back to the MAX_CONCURRENT_TASKS env var (default: 5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_tasks: Option<usize>,
+    /// Whether the background GC task should delete on-disk workspace dirs of
+    /// missions that have been in a terminal state longer than
+    /// `auto_cleanup_days`. When None, treat as disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_cleanup_enabled: Option<bool>,
+    /// Retention window in days for terminal-mission workspace dirs. Anything
+    /// older than this becomes eligible for GC. When None, defaults to 7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_cleanup_days: Option<u32>,
 }
 
 /// In-memory store for global settings with disk persistence.
@@ -135,7 +144,19 @@ impl SettingsStore {
             rtk_enabled,
             max_parallel_missions,
             max_concurrent_tasks,
+            auto_cleanup_enabled: None,
+            auto_cleanup_days: None,
         }
+    }
+
+    /// Get the auto-cleanup enabled state.
+    pub async fn get_auto_cleanup_enabled(&self) -> Option<bool> {
+        self.settings.read().await.auto_cleanup_enabled
+    }
+
+    /// Get the auto-cleanup retention window in days.
+    pub async fn get_auto_cleanup_days(&self) -> Option<u32> {
+        self.settings.read().await.auto_cleanup_days
     }
 
     /// Load settings from a file path.

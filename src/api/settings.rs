@@ -37,6 +37,8 @@ pub struct SettingsResponse {
     pub rtk_enabled: Option<bool>,
     pub max_parallel_missions: Option<usize>,
     pub max_concurrent_tasks: Option<usize>,
+    pub auto_cleanup_enabled: Option<bool>,
+    pub auto_cleanup_days: Option<u32>,
 }
 
 impl From<Settings> for SettingsResponse {
@@ -47,6 +49,8 @@ impl From<Settings> for SettingsResponse {
             rtk_enabled: settings.rtk_enabled,
             max_parallel_missions: settings.max_parallel_missions,
             max_concurrent_tasks: settings.max_concurrent_tasks,
+            auto_cleanup_enabled: settings.auto_cleanup_enabled,
+            auto_cleanup_days: settings.auto_cleanup_days,
         }
     }
 }
@@ -64,6 +68,10 @@ pub struct UpdateSettingsRequest {
     pub max_parallel_missions: Option<usize>,
     #[serde(default)]
     pub max_concurrent_tasks: Option<usize>,
+    #[serde(default)]
+    pub auto_cleanup_enabled: Option<bool>,
+    #[serde(default)]
+    pub auto_cleanup_days: Option<u32>,
 }
 
 /// Request to update library remote specifically.
@@ -128,6 +136,20 @@ async fn update_settings(
         }
         new_settings.max_concurrent_tasks = Some(value);
         crate::settings::set_max_concurrent_tasks_cached(value);
+    }
+    if let Some(value) = req.auto_cleanup_enabled {
+        new_settings.auto_cleanup_enabled = Some(value);
+    }
+    if let Some(value) = req.auto_cleanup_days {
+        // Floor the retention to 1 day so an accidental "0" can't trigger
+        // immediate deletion of every terminal mission's workspace dir.
+        if value < 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "auto_cleanup_days must be at least 1".to_string(),
+            ));
+        }
+        new_settings.auto_cleanup_days = Some(value);
     }
 
     state

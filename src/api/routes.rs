@@ -528,6 +528,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         });
     }
 
+    // Periodic GC for terminal-mission workspace dirs (controlled by
+    // `auto_cleanup_enabled` in settings). No-op if the setting is off, so
+    // it's safe to always spawn.
+    super::mission_workspace_gc::spawn(Arc::clone(&state));
+
     // Start background OAuth token refresher task
     {
         let ai_providers = Arc::clone(&state.ai_providers);
