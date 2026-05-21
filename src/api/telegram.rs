@@ -64,6 +64,8 @@ struct TelegramReplyRecord {
 const TELEGRAM_UPDATE_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_REPLY_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const PALOMA_ALERT_RECENCY_WINDOW_MINUTES: i64 = 60;
+const PALOMA_ALERT_DIGEST_LIMIT: usize = 12;
 const DEFAULT_PALOMA_OWNER_TELEGRAM_ID: i64 = 1_139_694_048;
 const DEFAULT_PALOMA_TRUSTED_FRIEND_TELEGRAM_ID: i64 = 0;
 
@@ -699,6 +701,18 @@ fn paloma_alert_event_kind(mission: &Mission, base_kind: &str) -> String {
     format!("{base_kind}:{}", updated.replace([':', '.', '+'], "-"))
 }
 
+fn paloma_alert_transition_is_recent(mission: &Mission) -> bool {
+    let updated = mission
+        .metadata_updated_at
+        .as_deref()
+        .unwrap_or(mission.updated_at.as_str());
+    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated) else {
+        return true;
+    };
+    Utc::now() - updated_at.with_timezone(&Utc)
+        <= ChronoDuration::minutes(PALOMA_ALERT_RECENCY_WINDOW_MINUTES)
+}
+
 fn paloma_latest_attention_line(mission: &Mission, events: &[StoredEvent]) -> Option<String> {
     events
         .iter()
@@ -729,6 +743,77 @@ fn paloma_alert_body(mission: &Mission, events: &[StoredEvent]) -> String {
     }
 }
 
+fn paloma_alert_rank(alert: &TelegramAlert) -> i32 {
+    match alert.importance.as_str() {
+        "high" => 0,
+        "normal" => 1,
+        _ => 2,
+    }
+}
+
+fn paloma_alert_digest_line(alert: &TelegramAlert) -> String {
+    let mut lines = alert.body.lines();
+    let lead = lines
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .unwrap_or(alert.title.as_str());
+    let latest = lines.find_map(|line| line.trim().strip_prefix("Latest: "));
+    match latest {
+        Some(latest) if !latest.trim().is_empty() => {
+            format!("- {lead} Latest: {}", latest.trim())
+        }
+        _ => format!("- {lead}"),
+    }
+}
+
+fn paloma_alert_digest_text(alerts: &[TelegramAlert]) -> String {
+    if alerts.len() == 1 {
+        return redact_for_telegram(alerts[0].body.trim());
+    }
+
+    let mut sorted = alerts.to_vec();
+    sorted.sort_by(|a, b| {
+        paloma_alert_rank(a)
+            .cmp(&paloma_alert_rank(b))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+
+    let high_count = sorted
+        .iter()
+        .filter(|alert| alert.importance == "high")
+        .count();
+    let mut text = if high_count > 0 {
+        format!(
+            "{} mission update{} {} attention:",
+            high_count,
+            if high_count == 1 { "" } else { "s" },
+            if high_count == 1 { "needs" } else { "need" }
+        )
+    } else {
+        format!(
+            "{} mission update{}:",
+            sorted.len(),
+            if sorted.len() == 1 { "" } else { "s" }
+        )
+    };
+
+    let visible = sorted.len().min(8);
+    for alert in sorted.iter().take(visible) {
+        text.push('\n');
+        text.push_str(&paloma_alert_digest_line(alert));
+    }
+    let remaining = sorted.len().saturating_sub(visible);
+    if remaining > 0 {
+        text.push_str(&format!(
+            "\n- {} more lower-priority update{}",
+            remaining,
+            if remaining == 1 { "" } else { "s" }
+        ));
+    }
+    redact_for_telegram(&text)
+}
+
 async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
     let Some(owner_id) =
         configured_telegram_id("PALOMA_TELEGRAM_OWNER_ID", DEFAULT_PALOMA_OWNER_TELEGRAM_ID)
@@ -755,6 +840,9 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
         let Some(base_kind) = paloma_alert_kind_for_status(mission.status) else {
             continue;
         };
+        if !paloma_alert_transition_is_recent(&mission) {
+            continue;
+        }
         let interest = subscriptions
             .get(&mission.id)
             .copied()
@@ -792,23 +880,26 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
 
     let pending = ctx
         .mission_store
-        .list_pending_telegram_alerts(owner_id, 5)
+        .list_pending_telegram_alerts(owner_id, PALOMA_ALERT_DIGEST_LIMIT)
         .await
         .unwrap_or_default();
     if pending.is_empty() {
         return;
     }
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
-    for alert in pending {
-        let text = format!("{}\n\n{}", alert.title, alert.body);
-        match send_message(http, &base_url, owner_id, &text, None).await {
-            Ok(message_id) => {
+    let text = paloma_alert_digest_text(&pending);
+    match send_message(http, &base_url, owner_id, &text, None).await {
+        Ok(message_id) => {
+            let sent_at = now_string();
+            for alert in pending {
                 let _ = ctx
                     .mission_store
-                    .mark_telegram_alert_sent(alert.id, Some(message_id), &now_string())
+                    .mark_telegram_alert_sent(alert.id, Some(message_id), &sent_at)
                     .await;
             }
-            Err(err) => {
+        }
+        Err(err) => {
+            for alert in pending {
                 tracing::warn!("Failed to send Telegram alert {}: {}", alert.id, err);
                 let _ = ctx
                     .mission_store
@@ -4806,17 +4897,19 @@ mod tests {
         extract_telegram_actions, feedback_mutes_alerts, feedback_raises_interest,
         format_structured_memory_context, is_paloma_command, markdown_to_telegram_html,
         merge_telegram_chat_metadata, mission_label, normalize_paloma_natural_command,
-        paloma_alert_body, paloma_alert_event_kind, paloma_alert_importance_for_mission,
-        paloma_alert_kind_for_status, paloma_command_error_response, paloma_role_for_user,
+        paloma_alert_body, paloma_alert_digest_text, paloma_alert_event_kind,
+        paloma_alert_importance_for_mission, paloma_alert_kind_for_status,
+        paloma_alert_transition_is_recent, paloma_command_error_response, paloma_role_for_user,
         parse_paloma_selector_and_payload, redact_for_telegram, render_telegram_chunk,
         sanitize_telegram_visible_text, scope_for_extracted_memory, telegram_action_target_matches,
         telegram_chat_display_title, truncate_for_telegram, verify_internal_telegram_action_token,
         workflow_reply_text, workflow_request_delivery_text, Chat, ExtractedTelegramMemory,
-        Mission, MissionMode, MissionStatus, TelegramAction, TelegramActionKind, TelegramBridge,
-        TelegramMemorySubject, TelegramMissionInterestLevel, TelegramStructuredMemoryEntry,
-        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramUserRole,
+        Mission, MissionMode, MissionStatus, TelegramAction, TelegramActionKind, TelegramAlert,
+        TelegramBridge, TelegramMemorySubject, TelegramMissionInterestLevel,
+        TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+        TelegramUserRole,
     };
-    use crate::api::mission_store::StoredEvent;
+    use crate::api::mission_store::{now_string, StoredEvent};
     use uuid::Uuid;
 
     fn test_mission(title: &str, status: MissionStatus) -> Mission {
@@ -4850,6 +4943,24 @@ mod tests {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+        }
+    }
+
+    fn test_alert(title: &str, body: &str, importance: &str, created_at: &str) -> TelegramAlert {
+        TelegramAlert {
+            id: Uuid::new_v4(),
+            telegram_user_id: 1_139_694_048,
+            mission_id: Some(Uuid::new_v4()),
+            event_kind: format!("mission_update:{title}"),
+            importance: importance.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            status: "pending".to_string(),
+            telegram_message_id: None,
+            last_error: None,
+            created_at: created_at.to_string(),
+            sent_at: None,
+            acknowledged_at: None,
         }
     }
 
@@ -5037,6 +5148,57 @@ mod tests {
 
         assert!(body.contains("waiting for your input"));
         assert!(body.contains("Please confirm the deploy window"));
+    }
+
+    #[test]
+    fn paloma_alert_digest_coalesces_bursts_without_repeating_titles() {
+        let alerts = vec![
+            test_alert(
+                "Inventory",
+                "Inventory completed.\n\nLatest: Wrote the report.",
+                "low",
+                "2026-05-20T00:02:00Z",
+            ),
+            test_alert(
+                "Checkout fix",
+                "Checkout fix is waiting for your input.\n\nLatest: Please confirm the deploy window.",
+                "high",
+                "2026-05-20T00:01:00Z",
+            ),
+        ];
+
+        let body = paloma_alert_digest_text(&alerts);
+
+        assert!(body.starts_with("1 mission update needs attention:"));
+        assert!(body.contains("- Checkout fix is waiting for your input. Latest: Please confirm"));
+        assert!(body.contains("- Inventory completed. Latest: Wrote the report."));
+        assert!(!body.contains("Checkout fix\n\nCheckout fix"));
+    }
+
+    #[test]
+    fn paloma_single_alert_uses_body_only() {
+        let alerts = vec![test_alert(
+            "Checkout fix",
+            "Checkout fix failed.\n\nLatest: Tests failed.",
+            "high",
+            "2026-05-20T00:01:00Z",
+        )];
+
+        assert_eq!(
+            paloma_alert_digest_text(&alerts),
+            "Checkout fix failed.\n\nLatest: Tests failed."
+        );
+    }
+
+    #[test]
+    fn paloma_alert_backfill_guard_skips_old_terminal_missions() {
+        let mut old = test_mission("Old outage", MissionStatus::Failed);
+        old.updated_at = "2026-01-01T00:00:00Z".to_string();
+        assert!(!paloma_alert_transition_is_recent(&old));
+
+        let mut recent = test_mission("Current outage", MissionStatus::Failed);
+        recent.updated_at = now_string();
+        assert!(paloma_alert_transition_is_recent(&recent));
     }
 
     #[test]
