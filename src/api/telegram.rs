@@ -682,13 +682,8 @@ fn paloma_alert_importance_for_mission(
     match mission.status {
         MissionStatus::Failed | MissionStatus::Blocked | MissionStatus::Interrupted => "high",
         MissionStatus::AwaitingUser | MissionStatus::NotFeasible => "normal",
-        MissionStatus::Completed => {
-            if mission.parent_mission_id.is_some() {
-                "normal"
-            } else {
-                "low"
-            }
-        }
+        MissionStatus::Completed if mission.parent_mission_id.is_some() => "normal",
+        MissionStatus::Completed => "low",
         _ => "low",
     }
 }
