@@ -490,8 +490,16 @@ fn feedback_mutes_alerts(text: &str) -> bool {
     let normalized = text.trim().to_ascii_lowercase();
     normalized.contains("don't tell me about this again")
         || normalized.contains("dont tell me about this again")
+        || normalized.contains("i am not interested in these updates")
+        || normalized.contains("i'm not interested in these updates")
+        || normalized.contains("not interested in these updates")
+        || normalized.contains("not interested in this")
         || normalized.contains("mute this")
+        || normalized.contains("too many updates")
+        || normalized.contains("stop these updates")
         || normalized.contains("stop alerting me about this")
+        || normalized.contains("stop sending me updates about this")
+        || normalized.contains("stop updating me about this")
 }
 
 fn feedback_raises_interest(text: &str) -> bool {
@@ -5097,6 +5105,11 @@ mod tests {
     #[test]
     fn paloma_feedback_parser_recognizes_interest_changes() {
         assert!(feedback_mutes_alerts("Don't tell me about this again."));
+        assert!(feedback_mutes_alerts(
+            "I'm not interested in these updates."
+        ));
+        assert!(feedback_mutes_alerts("This is too many updates."));
+        assert!(feedback_mutes_alerts("Stop these updates please."));
         assert!(feedback_raises_interest("Keep me posted on this."));
         assert!(!feedback_mutes_alerts("what changed?"));
     }
