@@ -801,7 +801,7 @@ fn paloma_alert_digest_text(alerts: &[TelegramAlert]) -> String {
     let remaining = sorted.len().saturating_sub(visible);
     if remaining > 0 {
         text.push_str(&format!(
-            "\n- {} more lower-priority update{}",
+            "\n- {} more update{}",
             remaining,
             if remaining == 1 { "" } else { "s" }
         ));
@@ -5168,6 +5168,25 @@ mod tests {
         assert!(body.contains("- Checkout fix is waiting for your input. Latest: Please confirm"));
         assert!(body.contains("- Inventory completed. Latest: Wrote the report."));
         assert!(!body.contains("Checkout fix\n\nCheckout fix"));
+    }
+
+    #[test]
+    fn paloma_alert_digest_overflow_does_not_downgrade_hidden_alerts() {
+        let alerts = (0..9)
+            .map(|idx| {
+                test_alert(
+                    &format!("Mission {idx}"),
+                    &format!("Mission {idx} failed."),
+                    "high",
+                    &format!("2026-05-20T00:{idx:02}:00Z"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let body = paloma_alert_digest_text(&alerts);
+
+        assert!(body.contains("- 1 more update"));
+        assert!(!body.contains("lower-priority"));
     }
 
     #[test]
