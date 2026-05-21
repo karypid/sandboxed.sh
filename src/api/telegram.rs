@@ -660,11 +660,72 @@ async fn apply_paloma_interest_feedback(
 
 fn paloma_alert_kind_for_status(status: MissionStatus) -> Option<&'static str> {
     match status {
+        MissionStatus::AwaitingUser => Some("mission_awaiting_user"),
         MissionStatus::Completed => Some("mission_completed"),
         MissionStatus::Failed => Some("mission_failed"),
         MissionStatus::Blocked => Some("mission_blocked"),
         MissionStatus::Interrupted => Some("mission_interrupted"),
+        MissionStatus::NotFeasible => Some("mission_not_feasible"),
         _ => None,
+    }
+}
+
+fn paloma_alert_importance_for_mission(
+    mission: &Mission,
+    interest: TelegramMissionInterestLevel,
+) -> &'static str {
+    if interest == TelegramMissionInterestLevel::High {
+        return "high";
+    }
+    match mission.status {
+        MissionStatus::Failed | MissionStatus::Blocked | MissionStatus::Interrupted => "high",
+        MissionStatus::AwaitingUser | MissionStatus::NotFeasible => "normal",
+        MissionStatus::Completed => {
+            if mission.parent_mission_id.is_some() {
+                "normal"
+            } else {
+                "low"
+            }
+        }
+        _ => "low",
+    }
+}
+
+fn paloma_alert_event_kind(mission: &Mission, base_kind: &str) -> String {
+    let updated = mission
+        .metadata_updated_at
+        .as_deref()
+        .unwrap_or(mission.updated_at.as_str());
+    format!("{base_kind}:{}", updated.replace([':', '.', '+'], "-"))
+}
+
+fn paloma_latest_attention_line(mission: &Mission, events: &[StoredEvent]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event.event_type.as_str() {
+            "assistant_message" | "error" | "mission_status_changed" => {
+                event_summary_line(mission, event)
+            }
+            _ => None,
+        })
+}
+
+fn paloma_alert_body(mission: &Mission, events: &[StoredEvent]) -> String {
+    let title = mission_label(mission);
+    let lead = match mission.status {
+        MissionStatus::AwaitingUser => format!("{title} is waiting for your input."),
+        MissionStatus::Completed => format!("{title} completed."),
+        MissionStatus::Failed => format!("{title} failed."),
+        MissionStatus::Blocked => format!("{title} is blocked."),
+        MissionStatus::Interrupted => format!("{title} was interrupted."),
+        MissionStatus::NotFeasible => format!("{title} was marked not feasible."),
+        _ => format!("{title} is now {}.", mission.status),
+    };
+
+    match paloma_latest_attention_line(mission, events) {
+        Some(line) => redact_for_telegram(&format!("{lead}\n\nLatest: {line}")),
+        None => redact_for_telegram(&lead),
     }
 }
 
@@ -691,17 +752,23 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
     };
 
     for mission in missions {
-        let Some(kind) = paloma_alert_kind_for_status(mission.status) else {
+        let Some(base_kind) = paloma_alert_kind_for_status(mission.status) else {
             continue;
         };
-        if subscriptions
+        let interest = subscriptions
             .get(&mission.id)
-            .is_some_and(|level| *level == TelegramMissionInterestLevel::Muted)
-        {
+            .copied()
+            .unwrap_or(TelegramMissionInterestLevel::Normal);
+        if interest == TelegramMissionInterestLevel::Muted {
             continue;
         }
         let title = mission_label(&mission);
-        let body = redact_for_telegram(&format!("{} is now {}.", title, mission.status));
+        let events = ctx
+            .mission_store
+            .get_events(mission.id, None, Some(40), None)
+            .await
+            .unwrap_or_default();
+        let body = paloma_alert_body(&mission, &events);
         let now = now_string();
         let _ = ctx
             .mission_store
@@ -709,8 +776,8 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
                 id: Uuid::new_v4(),
                 telegram_user_id: owner_id,
                 mission_id: Some(mission.id),
-                event_kind: kind.to_string(),
-                importance: "high".to_string(),
+                event_kind: paloma_alert_event_kind(&mission, base_kind),
+                importance: paloma_alert_importance_for_mission(&mission, interest).to_string(),
                 title,
                 body,
                 status: "pending".to_string(),
@@ -1959,8 +2026,10 @@ fn extract_structured_memory_from_text(text: &str) -> Vec<ExtractedTelegramMemor
     }
 
     let mut entries = Vec::new();
-    let remember_re = regex::Regex::new(r"(?i)^(?:souviens[- ]toi que|remember that)\s+(.+)$")
-        .expect("telegram remember extraction regex must compile");
+    let remember_re = regex::Regex::new(
+        r"(?i)^(?:souviens[- ]toi que|remember that|please remember that|note that)\s+(.+)$",
+    )
+    .expect("telegram remember extraction regex must compile");
 
     if let Some(captures) = remember_re.captures(trimmed) {
         let body = normalize_memory_text(&strip_memory_follow_up_directives(
@@ -1993,6 +2062,21 @@ fn extract_structured_memory_from_text(text: &str) -> Vec<ExtractedTelegramMemor
         if !value.is_empty() {
             entries.push(ExtractedTelegramMemory {
                 kind: TelegramStructuredMemoryKind::Preference,
+                label: None,
+                value,
+            });
+        }
+    }
+
+    let task_re = regex::Regex::new(r"(?i)^(?:remind me to|rappelle[- ]moi de)\s+(.+)$")
+        .expect("telegram task extraction regex must compile");
+    if let Some(captures) = task_re.captures(trimmed) {
+        let value = normalize_memory_text(&strip_memory_follow_up_directives(
+            captures.get(1).map(|m| m.as_str()).unwrap_or(""),
+        ));
+        if !value.is_empty() {
+            entries.push(ExtractedTelegramMemory {
+                kind: TelegramStructuredMemoryKind::Task,
                 label: None,
                 value,
             });
@@ -4722,16 +4806,52 @@ mod tests {
         extract_telegram_actions, feedback_mutes_alerts, feedback_raises_interest,
         format_structured_memory_context, is_paloma_command, markdown_to_telegram_html,
         merge_telegram_chat_metadata, mission_label, normalize_paloma_natural_command,
+        paloma_alert_body, paloma_alert_event_kind, paloma_alert_importance_for_mission,
         paloma_alert_kind_for_status, paloma_command_error_response, paloma_role_for_user,
         parse_paloma_selector_and_payload, redact_for_telegram, render_telegram_chunk,
         sanitize_telegram_visible_text, scope_for_extracted_memory, telegram_action_target_matches,
         telegram_chat_display_title, truncate_for_telegram, verify_internal_telegram_action_token,
         workflow_reply_text, workflow_request_delivery_text, Chat, ExtractedTelegramMemory,
         Mission, MissionMode, MissionStatus, TelegramAction, TelegramActionKind, TelegramBridge,
-        TelegramMemorySubject, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-        TelegramStructuredMemoryScope, TelegramUserRole,
+        TelegramMemorySubject, TelegramMissionInterestLevel, TelegramStructuredMemoryEntry,
+        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramUserRole,
     };
+    use crate::api::mission_store::StoredEvent;
     use uuid::Uuid;
+
+    fn test_mission(title: &str, status: MissionStatus) -> Mission {
+        Mission {
+            id: Uuid::new_v4(),
+            status,
+            title: Some(title.to_string()),
+            short_description: None,
+            metadata_updated_at: None,
+            metadata_source: None,
+            metadata_model: None,
+            metadata_version: None,
+            workspace_id: Uuid::new_v4(),
+            workspace_name: None,
+            agent: None,
+            model_override: None,
+            model_effort: None,
+            backend: "opencode".to_string(),
+            config_profile: None,
+            history: vec![],
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+            updated_at: "2026-05-20T00:00:00Z".to_string(),
+            interrupted_at: None,
+            resumable: false,
+            desktop_sessions: vec![],
+            session_id: None,
+            terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
+            mission_mode: MissionMode::Task,
+            goal_mode: false,
+            goal_objective: None,
+            first_viewed_at: None,
+        }
+    }
 
     #[test]
     fn truncate_for_telegram_preserves_valid_html_boundaries() {
@@ -4881,47 +5001,63 @@ mod tests {
     }
 
     #[test]
-    fn paloma_alert_kind_only_covers_terminal_attention_states() {
+    fn paloma_alert_kind_covers_attention_states() {
         assert_eq!(
             paloma_alert_kind_for_status(MissionStatus::Completed),
             Some("mission_completed")
+        );
+        assert_eq!(
+            paloma_alert_kind_for_status(MissionStatus::AwaitingUser),
+            Some("mission_awaiting_user")
+        );
+        assert_eq!(
+            paloma_alert_kind_for_status(MissionStatus::NotFeasible),
+            Some("mission_not_feasible")
         );
         assert_eq!(paloma_alert_kind_for_status(MissionStatus::Active), None);
     }
 
     #[test]
+    fn paloma_alert_body_includes_latest_attention_context() {
+        let mission = test_mission("Checkout fix", MissionStatus::AwaitingUser);
+        let events = vec![StoredEvent {
+            id: 1,
+            mission_id: mission.id,
+            sequence: 1,
+            event_type: "assistant_message".to_string(),
+            timestamp: "2026-05-20T00:01:00Z".to_string(),
+            event_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            content: "Please confirm the deploy window.".to_string(),
+            metadata: serde_json::json!({}),
+        }];
+
+        let body = paloma_alert_body(&mission, &events);
+
+        assert!(body.contains("waiting for your input"));
+        assert!(body.contains("Please confirm the deploy window"));
+    }
+
+    #[test]
+    fn paloma_alert_event_kind_is_state_specific_and_subscription_can_raise_importance() {
+        let mission = test_mission("Checkout fix", MissionStatus::Completed);
+
+        assert!(paloma_alert_event_kind(&mission, "mission_completed")
+            .starts_with("mission_completed:2026-05-20T00-00-00Z"));
+        assert_eq!(
+            paloma_alert_importance_for_mission(&mission, TelegramMissionInterestLevel::Normal),
+            "low"
+        );
+        assert_eq!(
+            paloma_alert_importance_for_mission(&mission, TelegramMissionInterestLevel::High),
+            "high"
+        );
+    }
+
+    #[test]
     fn mission_label_uses_public_metadata_without_ids() {
-        let mission = Mission {
-            id: Uuid::new_v4(),
-            status: MissionStatus::Active,
-            title: Some("Proof deployment".to_string()),
-            short_description: None,
-            metadata_updated_at: None,
-            metadata_source: None,
-            metadata_model: None,
-            metadata_version: None,
-            workspace_id: Uuid::new_v4(),
-            workspace_name: None,
-            agent: None,
-            model_override: None,
-            model_effort: None,
-            backend: "opencode".to_string(),
-            config_profile: None,
-            history: vec![],
-            created_at: "2026-05-20T00:00:00Z".to_string(),
-            updated_at: "2026-05-20T00:00:00Z".to_string(),
-            interrupted_at: None,
-            resumable: false,
-            desktop_sessions: vec![],
-            session_id: None,
-            terminal_reason: None,
-            parent_mission_id: None,
-            working_directory: None,
-            mission_mode: MissionMode::Task,
-            goal_mode: false,
-            goal_objective: None,
-            first_viewed_at: None,
-        };
+        let mission = test_mission("Proof deployment", MissionStatus::Active);
         assert_eq!(mission_label(&mission), "Proof deployment");
     }
 
@@ -5133,6 +5269,20 @@ mod tests {
         assert_eq!(entries[0].kind, TelegramStructuredMemoryKind::Preference);
         assert_eq!(entries[0].label, None);
         assert_eq!(entries[0].value, "les réponses courtes");
+    }
+
+    #[test]
+    fn extract_structured_memory_captures_explicit_notes_and_tasks() {
+        let note_entries =
+            extract_structured_memory_from_text("Please remember that staging deploys need Alice.");
+        assert_eq!(note_entries.len(), 1);
+        assert_eq!(note_entries[0].kind, TelegramStructuredMemoryKind::Note);
+        assert_eq!(note_entries[0].value, "staging deploys need Alice");
+
+        let task_entries = extract_structured_memory_from_text("Remind me to check CI tomorrow.");
+        assert_eq!(task_entries.len(), 1);
+        assert_eq!(task_entries[0].kind, TelegramStructuredMemoryKind::Task);
+        assert_eq!(task_entries[0].value, "check CI tomorrow");
     }
 
     #[test]
