@@ -186,6 +186,10 @@ struct Mission: Codable, Identifiable, Hashable {
     var canResume: Bool {
         resumable && status.canResume
     }
+
+    var hasFinishedSuccessfully: Bool {
+        status == .completed || status == .acknowledged
+    }
 }
 
 enum TaskStatus: String, Codable, CaseIterable {

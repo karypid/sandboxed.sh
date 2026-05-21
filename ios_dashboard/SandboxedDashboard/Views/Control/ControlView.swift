@@ -1282,6 +1282,7 @@ struct ControlView: View {
     }
 
     private var latestVisibleThought: ChatMessage? {
+        guard viewingMissionIsRunning else { return nil }
         messages.last { message in
             guard message.isThinking else { return false }
             return !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -3467,12 +3468,25 @@ struct ControlView: View {
             if let statusStr = data["status"] as? String,
                let missionId = data["mission_id"] as? String {
                 let newStatus = MissionStatus(rawValue: statusStr) ?? .unknown
+                let recentCompletedStatusKnown = recentMissions.contains(where: {
+                    $0.id == missionId && $0.hasFinishedSuccessfully
+                })
+                let completedStatusAlreadyKnown =
+                    (viewingMission?.id == missionId && viewingMission?.hasFinishedSuccessfully == true)
+                    || (currentMission?.id == missionId && currentMission?.hasFinishedSuccessfully == true)
+                    || recentCompletedStatusKnown
+                if newStatus == .interrupted && completedStatusAlreadyKnown {
+                    return
+                }
 
                 // If mission is no longer active AND it's the currently viewed mission,
                 // mark all pending tools as cancelled
                 if newStatus != .active && viewingMissionId == missionId {
                     finalizeActiveThinkingMessages()
                     markActiveToolCallsAsCompleted(withState: .cancelled)
+                }
+                if newStatus != .active {
+                    runningMissions.removeAll { $0.missionId == missionId }
                 }
 
                 // Update the viewing mission status if it matches
@@ -4940,10 +4954,14 @@ private struct MissionSwitcherSheet: View {
     }
 
     private var filteredRunning: [RunningMissionInfo] {
-        if normalizedSearchQuery.isEmpty {
-            return runningMissions
+        let liveCandidates = runningMissions.filter { info in
+            guard let mission = missionById[info.missionId] else { return true }
+            return !mission.hasFinishedSuccessfully
         }
-        return runningMissions
+        if normalizedSearchQuery.isEmpty {
+            return liveCandidates
+        }
+        return liveCandidates
             .compactMap { info -> (RunningMissionInfo, Double)? in
                 let score = runningMissionSearchScore(
                     info,
@@ -5644,11 +5662,11 @@ private struct MissionRow: View {
 
     private var statusColor: Color {
         if isRunning {
-            return Theme.success
+            return Theme.accent
         }
         switch status {
         case .pending: return Theme.warning
-        case .active: return Theme.success
+        case .active: return Theme.accent
         case .awaitingUser: return Theme.warning
         case .acknowledged: return Theme.success
         case .completed: return Theme.textMuted
@@ -5661,7 +5679,7 @@ private struct MissionRow: View {
 
     private var statusIcon: String {
         if isRunning {
-            return "play.circle.fill"
+            return "arrow.trianglehead.2.clockwise"
         }
         switch status {
         case .pending: return "clock.fill"
@@ -5710,10 +5728,10 @@ private struct MissionRow: View {
             if isRunning, let state = runningState {
                 Text(state)
                     .font(.caption2)
-                    .foregroundStyle(Theme.textMuted)
+                    .foregroundStyle(Theme.accent)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(Theme.backgroundSecondary)
+                    .background(Theme.accent.opacity(0.12))
                     .clipShape(Capsule())
             } else {
                 Text(status.displayLabel)
@@ -5749,11 +5767,20 @@ private struct MissionRow: View {
                     }
                 }
 
-                Image(systemName: statusIcon)
-                    .font(.system(size: 18))
-                    .foregroundStyle(statusColor)
-                    .symbolEffect(.pulse, options: (isRunning && runningState == "running") ? .repeating : .nonRepeating)
-                    .frame(width: 24, height: 24)
+                Group {
+                    if isRunning && runningState == "running" {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .tint(Theme.accent)
+                            .scaleEffect(0.7)
+                    } else {
+                        Image(systemName: statusIcon)
+                            .font(.system(size: 18))
+                            .foregroundStyle(statusColor)
+                            .symbolEffect(.pulse, options: (isRunning && runningState == "running") ? .repeating : .nonRepeating)
+                    }
+                }
+                .frame(width: 24, height: 24)
 
                 VStack(alignment: .leading, spacing: 2) {
                     // Title (or short id when there is no title) is the primary

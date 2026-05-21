@@ -132,18 +132,19 @@ struct RunningMissionsBar: View {
                 onSelectMission(mission.missionId)
             } label: {
                 HStack(spacing: 6) {
-                    // Status dot with animation
-                    Circle()
-                        .fill(statusColor(for: mission))
-                        .frame(width: 6, height: 6)
-                        .overlay {
-                            if mission.isRunning && !isStalled {
-                                Circle()
-                                    .stroke(statusColor(for: mission).opacity(0.5), lineWidth: 1.5)
-                                    .frame(width: 10, height: 10)
-                                    .opacity(0.6)
-                            }
-                        }
+                    // Running missions use the blue spinner treatment from
+                    // the mission switcher, so they do not read as completed.
+                    if mission.isRunning && !isStalled {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .tint(Theme.accent)
+                            .scaleEffect(0.55)
+                            .frame(width: 10, height: 10)
+                    } else {
+                        Circle()
+                            .fill(statusColor(for: mission))
+                            .frame(width: 6, height: 6)
+                    }
 
                     // Mission title or short ID
                     Text(mission.displayLabel)
@@ -217,7 +218,7 @@ struct RunningMissionsBar: View {
         } else if mission.isStalled {
             return Theme.warning
         } else if mission.isRunning {
-            return Theme.success
+            return Theme.accent
         } else {
             return Theme.warning
         }

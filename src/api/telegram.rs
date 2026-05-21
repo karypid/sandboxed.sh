@@ -64,7 +64,9 @@ struct TelegramReplyRecord {
 const TELEGRAM_UPDATE_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_REPLY_DEDUP_TTL: Duration = Duration::from_secs(15 * 60);
 const TELEGRAM_SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const PALOMA_ALERT_RECENCY_WINDOW_MINUTES: i64 = 60;
+const PALOMA_LONG_RUNNING_MINUTES: i64 = 30;
+const PALOMA_USER_MESSAGE_QUIET_MINUTES: i64 = 30;
+const PALOMA_LONG_RUNNING_ALERT_BUCKET_MINUTES: i64 = 30;
 const PALOMA_ALERT_DIGEST_LIMIT: usize = 12;
 const DEFAULT_PALOMA_OWNER_TELEGRAM_ID: i64 = 1_139_694_048;
 const DEFAULT_PALOMA_TRUSTED_FRIEND_TELEGRAM_ID: i64 = 0;
@@ -680,12 +682,7 @@ async fn apply_paloma_interest_feedback(
 
 fn paloma_alert_kind_for_status(status: MissionStatus) -> Option<&'static str> {
     match status {
-        MissionStatus::AwaitingUser => Some("mission_awaiting_user"),
-        MissionStatus::Completed => Some("mission_completed"),
-        MissionStatus::Failed => Some("mission_failed"),
-        MissionStatus::Blocked => Some("mission_blocked"),
-        MissionStatus::Interrupted => Some("mission_interrupted"),
-        MissionStatus::NotFeasible => Some("mission_not_feasible"),
+        MissionStatus::Active => Some("mission_long_running"),
         _ => None,
     }
 }
@@ -698,15 +695,29 @@ fn paloma_alert_importance_for_mission(
         return "high";
     }
     match mission.status {
-        MissionStatus::Failed | MissionStatus::Blocked | MissionStatus::Interrupted => "high",
-        MissionStatus::AwaitingUser | MissionStatus::NotFeasible => "normal",
-        MissionStatus::Completed if mission.parent_mission_id.is_some() => "normal",
-        MissionStatus::Completed => "low",
+        MissionStatus::Active => "normal",
         _ => "low",
     }
 }
 
-fn paloma_alert_event_kind(mission: &Mission, base_kind: &str, events: &[StoredEvent]) -> String {
+fn parse_paloma_event_time(value: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn paloma_alert_event_kind_at(
+    mission: &Mission,
+    base_kind: &str,
+    events: &[StoredEvent],
+    now: chrono::DateTime<Utc>,
+) -> String {
+    if mission.status == MissionStatus::Active && base_kind == "mission_long_running" {
+        let bucket_seconds = PALOMA_LONG_RUNNING_ALERT_BUCKET_MINUTES * 60;
+        let bucket = now.timestamp().div_euclid(bucket_seconds);
+        return format!("{base_kind}:{bucket}");
+    }
+
     let status = mission.status.to_string();
     let updated = events
         .iter()
@@ -724,13 +735,42 @@ fn paloma_alert_event_kind(mission: &Mission, base_kind: &str, events: &[StoredE
     format!("{base_kind}:{}", updated.replace([':', '.', '+'], "-"))
 }
 
-fn paloma_alert_transition_is_recent(mission: &Mission) -> bool {
-    let updated = mission.updated_at.as_str();
-    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated) else {
+fn paloma_latest_user_message_at(events: &[StoredEvent]) -> Option<chrono::DateTime<Utc>> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "user_message")
+        .and_then(|event| parse_paloma_event_time(&event.timestamp))
+}
+
+fn paloma_mission_started_at(mission: &Mission) -> Option<chrono::DateTime<Utc>> {
+    parse_paloma_event_time(&mission.created_at)
+        .or_else(|| parse_paloma_event_time(&mission.updated_at))
+}
+
+fn paloma_should_alert_long_running_mission_at(
+    mission: &Mission,
+    events: &[StoredEvent],
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    if mission.status != MissionStatus::Active {
+        return false;
+    }
+    let Some(started_at) = paloma_mission_started_at(mission) else {
         return true;
     };
-    Utc::now() - updated_at.with_timezone(&Utc)
-        <= ChronoDuration::minutes(PALOMA_ALERT_RECENCY_WINDOW_MINUTES)
+    if now - started_at < ChronoDuration::minutes(PALOMA_LONG_RUNNING_MINUTES) {
+        return false;
+    }
+    if paloma_latest_user_message_at(events)
+        .map(|last_user_message_at| {
+            now - last_user_message_at < ChronoDuration::minutes(PALOMA_USER_MESSAGE_QUIET_MINUTES)
+        })
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    true
 }
 
 fn paloma_latest_attention_line(mission: &Mission, events: &[StoredEvent]) -> Option<String> {
@@ -748,6 +788,7 @@ fn paloma_latest_attention_line(mission: &Mission, events: &[StoredEvent]) -> Op
 fn paloma_alert_body(mission: &Mission, events: &[StoredEvent]) -> String {
     let title = mission_label(mission);
     let lead = match mission.status {
+        MissionStatus::Active => format!("{title} is still running."),
         MissionStatus::AwaitingUser => format!("{title} is waiting for your input."),
         MissionStatus::Completed => format!("{title} completed."),
         MissionStatus::Failed => format!("{title} failed."),
@@ -860,9 +901,6 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
         let Some(base_kind) = paloma_alert_kind_for_status(mission.status) else {
             continue;
         };
-        if !paloma_alert_transition_is_recent(&mission) {
-            continue;
-        }
         let interest = subscriptions
             .get(&mission.id)
             .copied()
@@ -876,6 +914,10 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
             .get_events(mission.id, None, Some(40), None)
             .await
             .unwrap_or_default();
+        let alert_now = Utc::now();
+        if !paloma_should_alert_long_running_mission_at(&mission, &events, alert_now) {
+            continue;
+        }
         let body = paloma_alert_body(&mission, &events);
         let now = now_string();
         let _ = ctx
@@ -884,7 +926,7 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
                 id: Uuid::new_v4(),
                 telegram_user_id: owner_id,
                 mission_id: Some(mission.id),
-                event_kind: paloma_alert_event_kind(&mission, base_kind, &events),
+                event_kind: paloma_alert_event_kind_at(&mission, base_kind, &events, alert_now),
                 importance: paloma_alert_importance_for_mission(&mission, interest).to_string(),
                 title,
                 body,
@@ -4950,19 +4992,20 @@ mod tests {
         extract_telegram_actions, feedback_mutes_alerts, feedback_raises_interest,
         format_structured_memory_context, is_paloma_command, markdown_to_telegram_html,
         merge_telegram_chat_metadata, mission_label, normalize_paloma_natural_command,
-        paloma_alert_body, paloma_alert_digest_text, paloma_alert_event_kind,
+        paloma_alert_body, paloma_alert_digest_text, paloma_alert_event_kind_at,
         paloma_alert_importance_for_mission, paloma_alert_kind_for_status,
-        paloma_alert_transition_is_recent, paloma_command_error_response, paloma_role_for_user,
-        parse_paloma_selector_and_payload, redact_for_telegram, render_telegram_chunk,
-        sanitize_telegram_visible_text, scope_for_extracted_memory, telegram_action_target_matches,
-        telegram_chat_display_title, truncate_for_telegram, verify_internal_telegram_action_token,
-        workflow_reply_text, workflow_request_delivery_text, Chat, ExtractedTelegramMemory,
-        Mission, MissionMode, MissionStatus, TelegramAction, TelegramActionKind, TelegramAlert,
-        TelegramBridge, TelegramMemorySubject, TelegramMissionInterestLevel,
-        TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
-        TelegramUserRole,
+        paloma_command_error_response, paloma_role_for_user,
+        paloma_should_alert_long_running_mission_at, parse_paloma_selector_and_payload,
+        redact_for_telegram, render_telegram_chunk, sanitize_telegram_visible_text,
+        scope_for_extracted_memory, telegram_action_target_matches, telegram_chat_display_title,
+        truncate_for_telegram, verify_internal_telegram_action_token, workflow_reply_text,
+        workflow_request_delivery_text, Chat, ExtractedTelegramMemory, Mission, MissionMode,
+        MissionStatus, TelegramAction, TelegramActionKind, TelegramAlert, TelegramBridge,
+        TelegramMemorySubject, TelegramMissionInterestLevel, TelegramStructuredMemoryEntry,
+        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramUserRole,
     };
-    use crate::api::mission_store::{now_string, StoredEvent};
+    use crate::api::mission_store::StoredEvent;
+    use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
     fn test_mission(title: &str, status: MissionStatus) -> Mission {
@@ -5172,23 +5215,23 @@ mod tests {
     #[test]
     fn paloma_alert_kind_covers_attention_states() {
         assert_eq!(
-            paloma_alert_kind_for_status(MissionStatus::Completed),
-            Some("mission_completed")
+            paloma_alert_kind_for_status(MissionStatus::Active),
+            Some("mission_long_running")
         );
+        assert_eq!(paloma_alert_kind_for_status(MissionStatus::Completed), None);
         assert_eq!(
             paloma_alert_kind_for_status(MissionStatus::AwaitingUser),
-            Some("mission_awaiting_user")
+            None
         );
         assert_eq!(
             paloma_alert_kind_for_status(MissionStatus::NotFeasible),
-            Some("mission_not_feasible")
+            None
         );
-        assert_eq!(paloma_alert_kind_for_status(MissionStatus::Active), None);
     }
 
     #[test]
     fn paloma_alert_body_includes_latest_attention_context() {
-        let mission = test_mission("Checkout fix", MissionStatus::AwaitingUser);
+        let mission = test_mission("Checkout fix", MissionStatus::Active);
         let events = vec![StoredEvent {
             id: 1,
             mission_id: mission.id,
@@ -5204,7 +5247,7 @@ mod tests {
 
         let body = paloma_alert_body(&mission, &events);
 
-        assert!(body.contains("waiting for your input"));
+        assert!(body.contains("still running"));
         assert!(body.contains("Please confirm the deploy window"));
     }
 
@@ -5268,46 +5311,70 @@ mod tests {
     }
 
     #[test]
-    fn paloma_alert_backfill_guard_skips_old_terminal_missions() {
-        let mut old = test_mission("Old outage", MissionStatus::Failed);
-        old.updated_at = "2026-01-01T00:00:00Z".to_string();
-        assert!(!paloma_alert_transition_is_recent(&old));
+    fn paloma_alert_only_surfaces_long_running_quiet_active_missions() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 20, 1, 0, 0).unwrap();
 
-        let mut recent = test_mission("Current outage", MissionStatus::Failed);
-        recent.updated_at = now_string();
-        assert!(paloma_alert_transition_is_recent(&recent));
+        let mut active = test_mission("Long build", MissionStatus::Active);
+        active.created_at = "2026-05-20T00:00:00Z".to_string();
+        assert!(paloma_should_alert_long_running_mission_at(
+            &active,
+            &[],
+            now
+        ));
 
-        let mut stale_metadata_recent_status = test_mission("Recent status", MissionStatus::Failed);
-        stale_metadata_recent_status.metadata_updated_at = Some("2026-01-01T00:00:00Z".to_string());
-        stale_metadata_recent_status.updated_at = now_string();
-        assert!(paloma_alert_transition_is_recent(
-            &stale_metadata_recent_status
+        let mut fresh = active.clone();
+        fresh.created_at = "2026-05-20T00:45:00Z".to_string();
+        assert!(!paloma_should_alert_long_running_mission_at(
+            &fresh,
+            &[],
+            now
+        ));
+
+        let recent_user_message = vec![StoredEvent {
+            id: 1,
+            mission_id: active.id,
+            sequence: 1,
+            event_type: "user_message".to_string(),
+            timestamp: "2026-05-20T00:45:00Z".to_string(),
+            event_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            content: "any update?".to_string(),
+            metadata: serde_json::json!({}),
+        }];
+        assert!(!paloma_should_alert_long_running_mission_at(
+            &active,
+            &recent_user_message,
+            now
+        ));
+
+        let completed = test_mission("Done", MissionStatus::Completed);
+        assert!(!paloma_should_alert_long_running_mission_at(
+            &completed,
+            &[],
+            now
         ));
     }
 
     #[test]
-    fn paloma_alert_event_kind_is_state_specific_and_subscription_can_raise_importance() {
-        let mission = test_mission("Checkout fix", MissionStatus::Completed);
-        let events = vec![StoredEvent {
-            id: 1,
-            mission_id: mission.id,
-            sequence: 1,
-            event_type: "mission_status_changed".to_string(),
-            timestamp: "2026-05-20T00:00:00Z".to_string(),
-            event_id: None,
-            tool_call_id: None,
-            tool_name: None,
-            content: String::new(),
-            metadata: serde_json::json!({ "status": "completed" }),
-        }];
+    fn paloma_alert_event_kind_is_bucketed_and_subscription_can_raise_importance() {
+        let mission = test_mission("Checkout fix", MissionStatus::Active);
+        let events = Vec::new();
+        let first_bucket = Utc.with_ymd_and_hms(2026, 5, 20, 1, 5, 0).unwrap();
+        let same_bucket = Utc.with_ymd_and_hms(2026, 5, 20, 1, 29, 0).unwrap();
+        let next_bucket = Utc.with_ymd_and_hms(2026, 5, 20, 1, 31, 0).unwrap();
 
-        assert!(
-            paloma_alert_event_kind(&mission, "mission_completed", &events)
-                .starts_with("mission_completed:2026-05-20T00-00-00Z")
+        assert_eq!(
+            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, first_bucket),
+            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, same_bucket)
+        );
+        assert_ne!(
+            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, first_bucket),
+            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, next_bucket)
         );
         assert_eq!(
             paloma_alert_importance_for_mission(&mission, TelegramMissionInterestLevel::Normal),
-            "low"
+            "normal"
         );
         assert_eq!(
             paloma_alert_importance_for_mission(&mission, TelegramMissionInterestLevel::High),
@@ -5347,7 +5414,12 @@ mod tests {
         ];
 
         assert_eq!(
-            paloma_alert_event_kind(&mission, "mission_awaiting_user", &events),
+            paloma_alert_event_kind_at(
+                &mission,
+                "mission_awaiting_user",
+                &events,
+                Utc.with_ymd_and_hms(2026, 5, 20, 1, 0, 0).unwrap()
+            ),
             "mission_awaiting_user:2026-05-20T00-05-00Z"
         );
     }

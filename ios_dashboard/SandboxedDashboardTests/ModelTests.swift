@@ -130,6 +130,7 @@ final class ModelTests: XCTestCase {
         let source = try controlViewSource()
 
         XCTAssertTrue(source.contains("control-inline-thinking"))
+        XCTAssertTrue(source.contains("guard viewingMissionIsRunning else { return nil }"))
         XCTAssertTrue(source.contains("thoughts-timeline"))
         XCTAssertTrue(source.contains("thought-latest"))
         XCTAssertTrue(source.contains("thoughts-bottom"))
@@ -154,6 +155,8 @@ final class ModelTests: XCTestCase {
         XCTAssertTrue(source.contains("controlDroppedEvents"))
         XCTAssertTrue(source.contains("goal_role"))
         XCTAssertTrue(source.contains("goal-deliverable-"))
+        XCTAssertTrue(source.contains("completedStatusAlreadyKnown"))
+        XCTAssertTrue(source.contains("runningMissions.removeAll { $0.missionId == missionId }"))
     }
 
     func testSharedControlReducerFixturesReplayOnIOS() throws {
