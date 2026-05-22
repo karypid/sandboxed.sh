@@ -1584,7 +1584,18 @@ pub trait MissionStore: Send + Sync {
         Err("Not supported".to_string())
     }
 
-    /// Mark an alert as failed.
+    /// Acknowledge queued alerts for a mission so they will not be delivered.
+    async fn acknowledge_pending_telegram_alerts_for_mission(
+        &self,
+        telegram_user_id: i64,
+        mission_id: Uuid,
+        acknowledged_at: &str,
+    ) -> Result<usize, String> {
+        let _ = (telegram_user_id, mission_id, acknowledged_at);
+        Ok(0)
+    }
+
+    /// Record a delivery failure without removing the alert from the retry queue.
     async fn mark_telegram_alert_failed(&self, id: Uuid, error: &str) -> Result<(), String> {
         let _ = (id, error);
         Err("Not supported".to_string())

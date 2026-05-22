@@ -995,13 +995,23 @@ struct ControlView: View {
     private var viewingMissionIsRunning: Bool {
         guard let viewingId = viewingMissionId else {
             // No specific mission being viewed - fall back to global state
+            if let currentMission, missionIsTerminalForInlineThinking(currentMission) {
+                return false
+            }
             return runState != .idle
+        }
+        if let viewingMission, viewingMission.id == viewingId, missionIsTerminalForInlineThinking(viewingMission) {
+            return false
         }
         // Check if this specific mission is in the running missions list
         guard let missionInfo = runningMissions.first(where: { $0.missionId == viewingId }) else {
             return false
         }
         return missionInfo.state == "running" || missionInfo.state == "waiting_for_tool"
+    }
+
+    private func missionIsTerminalForInlineThinking(_ mission: Mission) -> Bool {
+        mission.status.statusType == .completed || mission.status.statusType == .failed
     }
     
     private var agentWorkingIndicator: some View {
@@ -1282,8 +1292,10 @@ struct ControlView: View {
     }
 
     private var latestVisibleThought: ChatMessage? {
-        messages.last { message in
+        guard viewingMissionIsRunning else { return nil }
+        return messages.last { message in
             guard message.isThinking else { return false }
+            guard !message.thinkingDone else { return false }
             return !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
@@ -3467,12 +3479,25 @@ struct ControlView: View {
             if let statusStr = data["status"] as? String,
                let missionId = data["mission_id"] as? String {
                 let newStatus = MissionStatus(rawValue: statusStr) ?? .unknown
+                let recentCompletedStatusKnown = recentMissions.contains(where: {
+                    $0.id == missionId && $0.hasFinishedSuccessfully
+                })
+                let completedStatusAlreadyKnown =
+                    (viewingMission?.id == missionId && viewingMission?.hasFinishedSuccessfully == true)
+                    || (currentMission?.id == missionId && currentMission?.hasFinishedSuccessfully == true)
+                    || recentCompletedStatusKnown
+                if newStatus == .interrupted && completedStatusAlreadyKnown {
+                    return
+                }
 
                 // If mission is no longer active AND it's the currently viewed mission,
                 // mark all pending tools as cancelled
                 if newStatus != .active && viewingMissionId == missionId {
                     finalizeActiveThinkingMessages()
                     markActiveToolCallsAsCompleted(withState: .cancelled)
+                }
+                if newStatus != .active {
+                    runningMissions.removeAll { $0.missionId == missionId }
                 }
 
                 // Update the viewing mission status if it matches
@@ -4940,10 +4965,14 @@ private struct MissionSwitcherSheet: View {
     }
 
     private var filteredRunning: [RunningMissionInfo] {
-        if normalizedSearchQuery.isEmpty {
-            return runningMissions
+        let liveCandidates = runningMissions.filter { info in
+            guard let mission = missionById[info.missionId] else { return true }
+            return !mission.hasFinishedSuccessfully
         }
-        return runningMissions
+        if normalizedSearchQuery.isEmpty {
+            return liveCandidates
+        }
+        return liveCandidates
             .compactMap { info -> (RunningMissionInfo, Double)? in
                 let score = runningMissionSearchScore(
                     info,
@@ -5716,10 +5745,10 @@ private struct MissionRow: View {
             if isRunning, let state = runningState {
                 Text(state)
                     .font(.caption2)
-                    .foregroundStyle(Theme.textMuted)
+                    .foregroundStyle(Theme.info)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(Theme.backgroundSecondary)
+                    .background(Theme.info.opacity(0.12))
                     .clipShape(Capsule())
             } else {
                 Text(status.displayLabel)

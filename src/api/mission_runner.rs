@@ -263,7 +263,10 @@ pub fn inject_telegram_identity_into_claude_md(
             "A CLI tool is available via `{cmd}` for sending Telegram messages \
              and scheduling reminders. Use it ONLY when the user explicitly asks \
              you to send a message, set a reminder, post in another chat, or ask \
-             someone in another chat for information. For normal replies, \
+             someone in another chat for information. You may also use it when a \
+             Telegram conversation creates an obvious follow-up obligation, such as \
+             a promised reminder, a timed check-in, or a request that must be routed \
+             to another chat before you can answer. For normal replies, \
              acknowledgements, and factual answers, do NOT use it.\n\n\
              Commands:\n\
              - `{cmd} reply \"MESSAGE\"` — immediate message to the current chat\n\
@@ -272,7 +275,8 @@ pub fn inject_telegram_identity_into_claude_md(
              - `{cmd} remind-title SECONDS \"CHAT TITLE\" \"MESSAGE\"` — delayed message to another chat\n\
              - `{cmd} ask-title \"CHAT TITLE\" \"MESSAGE\"` — cross-chat request: ask another chat, wait for reply, summarize back\n\n\
              The task is incomplete until the command succeeds. Never simulate an action \
-             by merely replying with the text or saying you will do it later.\n\
+             by merely replying with the text or saying you will do it later. If a Telegram \
+             action command fails, report the failure and what still needs to happen.\n\
              Never echo internal prefixes like `[Telegram from ...]` or `[Instructions: ...]`.\n",
             cmd = action_cmd,
         ));
@@ -284,7 +288,11 @@ pub fn inject_telegram_identity_into_claude_md(
          When a `[Structured memory]` block is present in the user \
          message, it contains facts, notes, and preferences that you \
          previously stored about the user, the chat, or the channel. \
-         Use this information to personalise your responses. \
+         Use this information to personalise your responses and to avoid \
+         re-asking for facts the user has already provided. Treat user-scoped \
+         memory as portable across chats, and chat-scoped memory as local to \
+         the current Telegram conversation. If current user text conflicts \
+         with memory, trust the latest user text and mention the change briefly. \
          If the user asks about your memory, describe what you \
          currently know based on the structured memory block.\n",
     );
