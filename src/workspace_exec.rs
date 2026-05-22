@@ -776,7 +776,12 @@ impl WorkspaceExec {
         // file to flip the safe default on.
         let use_target_root = std::env::var("SANDBOXED_SH_NSENTER_USE_TARGET_ROOT")
             .ok()
-            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
         if use_target_root {
             // `--root` with no arg = use the *target* process's root, i.e.

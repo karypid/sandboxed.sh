@@ -65,6 +65,69 @@ pub enum CostSource {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionSignal {
+    NativeTerminal,
+    SessionIdle,
+    ProcessExit,
+    TextFallback,
+    RecoveredSoftError,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    AgentError,
+    AuthError,
+    CapacityLimited,
+    ProviderError,
+    RateLimited,
+    TransportError,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionEvidence {
+    pub terminal_reason: Option<TerminalReason>,
+    pub completion_signal: CompletionSignal,
+    pub completion_confidence: CompletionConfidence,
+    pub native_terminal_seen: bool,
+    pub pending_tools: Option<usize>,
+    pub transport_failure_stage: Option<String>,
+    pub provider_error_source: Option<String>,
+    pub failure_class: Option<FailureClass>,
+    pub classification_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Complete {
+        signal: CompletionSignal,
+        confidence: CompletionConfidence,
+        message: Option<String>,
+    },
+    Failed {
+        reason: TerminalReason,
+        source: Option<FailureClass>,
+        message: Option<String>,
+    },
+    Interrupted {
+        reason: TerminalReason,
+        message: Option<String>,
+    },
+}
+
 /// Result of an agent executing a task.
 ///
 /// # Invariants

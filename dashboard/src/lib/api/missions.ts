@@ -11,6 +11,7 @@ import { generateMissionTitle } from "../llm";
 // ---------------------------------------------------------------------------
 
 export type MissionStatus =
+  | "pending"
   | "active"
   | "awaiting_user"
   | "acknowledged"

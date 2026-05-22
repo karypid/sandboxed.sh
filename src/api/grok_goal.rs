@@ -56,6 +56,10 @@ pub const VAR_OBJECTIVE: &str = "goal_objective";
 pub const VAR_ITERATION: &str = "goal_iteration";
 /// Variable key under which we store consecutive missing-sentinel count.
 pub const VAR_MISSING_COUNT: &str = "goal_missing_count";
+/// Variable key under which we store the last parsed sentinel label.
+pub const VAR_LAST_SENTINEL: &str = "goal_last_sentinel";
+/// Variable key under which we store the scheduler decision for the last turn.
+pub const VAR_LAST_DECISION: &str = "goal_last_decision";
 
 // ─── Sentinel parsing ────────────────────────────────────────────────────────
 
@@ -195,6 +199,8 @@ fn initial_variables(objective: &str, iteration: u32) -> HashMap<String, String>
     v.insert(VAR_OBJECTIVE.to_string(), objective.to_string());
     v.insert(VAR_ITERATION.to_string(), iteration.to_string());
     v.insert(VAR_MISSING_COUNT.to_string(), "0".to_string());
+    v.insert(VAR_LAST_SENTINEL.to_string(), "none".to_string());
+    v.insert(VAR_LAST_DECISION.to_string(), "started".to_string());
     v
 }
 
@@ -220,6 +226,15 @@ pub fn missing_count_of(row: &Automation) -> u32 {
         .get(VAR_MISSING_COUNT)
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0)
+}
+
+pub fn sentinel_label(sentinel: &GoalSentinel) -> &'static str {
+    match sentinel {
+        GoalSentinel::Complete => "complete",
+        GoalSentinel::Continue => "continue",
+        GoalSentinel::Aborted { .. } => "aborted",
+        GoalSentinel::Missing => "missing",
+    }
 }
 
 /// Create the AgentFinished automation row that drives the loop. Idempotent
@@ -273,6 +288,27 @@ pub async fn update_counters(
         .await
         .map(|_| ())
         .map_err(|e| format!("update_automation failed: {}", e))
+}
+
+/// Persist the last parsed Grok sentinel and scheduler decision. This makes
+/// missing-sentinel loops postmortem-debuggable without scraping logs.
+pub async fn record_decision(
+    mission_store: &Arc<dyn MissionStore>,
+    row: &mut Automation,
+    sentinel: &GoalSentinel,
+    decision: &str,
+) -> Result<(), String> {
+    row.variables.insert(
+        VAR_LAST_SENTINEL.to_string(),
+        sentinel_label(sentinel).to_string(),
+    );
+    row.variables
+        .insert(VAR_LAST_DECISION.to_string(), decision.to_string());
+    mission_store
+        .update_automation(row.clone())
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("record_decision failed: {}", e))
 }
 
 /// Mark the goal automation inactive. Used on Complete / Aborted /
@@ -355,6 +391,26 @@ mod tests {
             parse_goal_sentinel("<goal_continue />"),
             GoalSentinel::Continue
         );
+    }
+
+    #[test]
+    fn initial_goal_variables_include_debug_decision_state() {
+        let variables = initial_variables("ship it", 1);
+
+        assert_eq!(
+            variables.get(VAR_LAST_SENTINEL).map(String::as_str),
+            Some("none")
+        );
+        assert_eq!(
+            variables.get(VAR_LAST_DECISION).map(String::as_str),
+            Some("started")
+        );
+    }
+
+    #[test]
+    fn sentinel_label_names_missing_for_low_confidence_continue() {
+        assert_eq!(sentinel_label(&GoalSentinel::Missing), "missing");
+        assert_eq!(sentinel_label(&GoalSentinel::Continue), "continue");
     }
 
     #[test]

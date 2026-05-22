@@ -148,6 +148,8 @@ struct AssistantMessageMetadata {
     shared_files: Option<Vec<crate::api::control::SharedFile>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     resumable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_evidence: Option<crate::agents::CompletionEvidence>,
 }
 
 struct AssistantMessageMetadataInput<'a> {
@@ -159,6 +161,7 @@ struct AssistantMessageMetadataInput<'a> {
     model_normalized: &'a Option<String>,
     shared_files: &'a Option<Vec<crate::api::control::SharedFile>>,
     resumable: bool,
+    completion_evidence: &'a Option<crate::agents::CompletionEvidence>,
 }
 
 fn assistant_message_metadata(input: AssistantMessageMetadataInput<'_>) -> serde_json::Value {
@@ -175,6 +178,7 @@ fn assistant_message_metadata(input: AssistantMessageMetadataInput<'_>) -> serde
         model_normalized: input.model_normalized.clone(),
         shared_files: input.shared_files.clone(),
         resumable: input.resumable,
+        completion_evidence: input.completion_evidence.clone(),
     };
     serde_json::to_value(metadata).expect("assistant metadata should serialize")
 }
@@ -3395,6 +3399,7 @@ impl MissionStore for SqliteMissionStore {
                 model_normalized,
                 shared_files,
                 resumable,
+                completion_evidence,
                 ..
             } => (
                 "assistant_message",
@@ -3411,6 +3416,7 @@ impl MissionStore for SqliteMissionStore {
                     model_normalized,
                     shared_files,
                     resumable: *resumable,
+                    completion_evidence,
                 }),
             ),
             AgentEvent::Thinking { content, done, .. } => (
@@ -8095,7 +8101,9 @@ fn row_to_telegram_workflow_event(
 #[cfg(test)]
 mod tests {
     use super::{assistant_message_metadata, AssistantMessageMetadataInput, SqliteMissionStore};
-    use crate::agents::CostSource;
+    use crate::agents::{
+        CompletionConfidence, CompletionEvidence, CompletionSignal, CostSource, TerminalReason,
+    };
     use crate::api::mission_store::{
         MissionMode, MissionStatus, MissionStore, TelegramAlert, TelegramAlertPreference,
         TelegramChannel, TelegramConversation, TelegramConversationMessage,
@@ -8651,6 +8659,17 @@ mod tests {
 
     #[test]
     fn assistant_message_metadata_uses_normalized_cost_shape() {
+        let completion_evidence = Some(CompletionEvidence {
+            terminal_reason: Some(TerminalReason::Completed),
+            completion_signal: CompletionSignal::NativeTerminal,
+            completion_confidence: CompletionConfidence::High,
+            native_terminal_seen: true,
+            pending_tools: None,
+            transport_failure_stage: None,
+            provider_error_source: None,
+            failure_class: None,
+            classification_source: "structured".to_string(),
+        });
         let metadata = assistant_message_metadata(AssistantMessageMetadataInput {
             success: true,
             cost_cents: 42,
@@ -8665,6 +8684,7 @@ mod tests {
             model_normalized: &Some("gpt-4o".to_string()),
             shared_files: &None,
             resumable: false,
+            completion_evidence: &completion_evidence,
         });
 
         assert_eq!(
@@ -8685,6 +8705,17 @@ mod tests {
                 },
                 "model": "gpt-4o",
                 "model_normalized": "gpt-4o",
+                "completion_evidence": {
+                    "terminal_reason": "Completed",
+                    "completion_signal": "native_terminal",
+                    "completion_confidence": "high",
+                    "native_terminal_seen": true,
+                    "pending_tools": null,
+                    "transport_failure_stage": null,
+                    "provider_error_source": null,
+                    "failure_class": null,
+                    "classification_source": "structured",
+                },
             })
         );
     }
@@ -8700,6 +8731,7 @@ mod tests {
             model_normalized: &None,
             shared_files: &None,
             resumable: false,
+            completion_evidence: &None,
         });
 
         assert_eq!(
@@ -9409,6 +9441,7 @@ mod tests {
                     mission_id: Some(mission.id),
                     shared_files: None,
                     resumable: false,
+                    completion_evidence: None,
                 },
             )
             .await
@@ -9440,6 +9473,7 @@ mod tests {
                     mission_id: Some(mission.id),
                     shared_files: None,
                     resumable: false,
+                    completion_evidence: None,
                 },
             )
             .await
@@ -9845,6 +9879,7 @@ mod tests {
                         mission_id: Some(mission.id),
                         shared_files: None,
                         resumable: false,
+                        completion_evidence: None,
                     },
                 )
                 .await
@@ -9943,6 +9978,7 @@ mod tests {
                         mission_id: Some(mission.id),
                         shared_files: None,
                         resumable: false,
+                        completion_evidence: None,
                     },
                 )
                 .await

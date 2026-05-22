@@ -25,12 +25,14 @@ enum StatusType {
 
     var color: Color {
         switch self {
-        case .pending, .idle:
+        case .pending:
+            return Theme.warning
+        case .idle:
             return Theme.textMuted
         case .running, .active, .connecting:
             return Theme.accent
         case .awaitingUser:
-            return Theme.warning
+            return Theme.info
         case .completed, .connected:
             return Theme.success
         case .failed, .error, .interrupted, .blocked:
@@ -65,9 +67,9 @@ enum StatusType {
 
     var icon: String {
         switch self {
-        case .pending: return "clock"
+        case .pending: return "clock.fill"
         case .running, .connecting: return "arrow.trianglehead.2.clockwise"
-        case .active: return "circle.fill"
+        case .active: return "arrow.trianglehead.2.clockwise"
         case .awaitingUser: return "hand.wave.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed, .error: return "xmark.circle.fill"

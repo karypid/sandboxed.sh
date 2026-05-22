@@ -15,17 +15,20 @@ struct WorkerSheetView: View {
 
     private var activeWorkers: [Mission] {
         workers.filter { m in
-            m.status == .active || m.status == .pending || m.status == .blocked ||
+            m.status == .active || m.status == .pending || m.status == .awaitingUser ||
             runningWorkers.contains { $0.missionId == m.id }
         }
     }
 
     private var completedWorkers: [Mission] {
-        workers.filter { $0.status == .completed }
+        workers.filter { $0.status == .completed || $0.status == .acknowledged }
     }
 
     private var failedWorkers: [Mission] {
-        workers.filter { $0.status == .failed || $0.status == .notFeasible || $0.status == .interrupted }
+        workers.filter { m in
+            m.status == .failed || m.status == .notFeasible ||
+            m.status == .interrupted || m.status == .blocked
+        }
     }
 
     var body: some View {
@@ -193,9 +196,9 @@ struct WorkerSheetView: View {
                 return info.isStalled ? Theme.warning : Theme.accent
             }
             switch mission.status {
-            case .completed: return Theme.success
-            case .failed, .notFeasible: return Theme.error
-            case .interrupted: return Theme.warning
+            case .completed, .acknowledged: return Theme.success
+            case .awaitingUser: return Theme.info
+            case .failed, .notFeasible, .interrupted, .blocked: return Theme.error
             default: return Theme.textMuted
             }
         }()

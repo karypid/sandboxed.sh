@@ -2672,6 +2672,8 @@ pub enum AgentEvent {
         /// Whether the mission can be resumed after this failure (only relevant when success=false)
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         resumable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        completion_evidence: Option<crate::agents::CompletionEvidence>,
     },
     /// Agent thinking/reasoning (streaming)
     Thinking {
@@ -5288,6 +5290,9 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
                     .and_then(|m| m.get("resumable"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                completion_evidence: meta
+                    .and_then(|m| m.get("completion_evidence"))
+                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
             })
         }
         "thinking" => Some(AgentEvent::Thinking {
@@ -5332,6 +5337,7 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
             mission_id,
             shared_files: None,
             resumable: false,
+            completion_evidence: None,
         }),
         "tool_call" => Some(AgentEvent::ToolCall {
             tool_call_id: event
@@ -7381,6 +7387,12 @@ async fn post_turn_handle_grok_goal(
     );
     match sentinel {
         super::grok_goal::GoalSentinel::Complete => {
+            if let Err(e) =
+                super::grok_goal::record_decision(mission_store, &mut row, &sentinel, "complete")
+                    .await
+            {
+                tracing::warn!("grok_goal: record_decision failed: {}", e);
+            }
             if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
                 tracing::warn!("grok_goal: disable_goal failed: {}", e);
             }
@@ -7390,7 +7402,13 @@ async fn post_turn_handle_grok_goal(
                 mission_id: Some(mission_id),
             });
         }
-        super::grok_goal::GoalSentinel::Aborted { reason } => {
+        super::grok_goal::GoalSentinel::Aborted { ref reason } => {
+            if let Err(e) =
+                super::grok_goal::record_decision(mission_store, &mut row, &sentinel, "aborted")
+                    .await
+            {
+                tracing::warn!("grok_goal: record_decision failed: {}", e);
+            }
             if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
                 tracing::warn!("grok_goal: disable_goal failed: {}", e);
             }
@@ -7408,6 +7426,16 @@ async fn post_turn_handle_grok_goal(
                 0
             };
             if new_missing >= super::grok_goal::MAX_MISSING_SENTINELS {
+                if let Err(e) = super::grok_goal::record_decision(
+                    mission_store,
+                    &mut row,
+                    &sentinel,
+                    "aborted:no_goal_sentinel",
+                )
+                .await
+                {
+                    tracing::warn!("grok_goal: record_decision failed: {}", e);
+                }
                 if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
                     tracing::warn!("grok_goal: disable_goal failed: {}", e);
                 }
@@ -7420,6 +7448,16 @@ async fn post_turn_handle_grok_goal(
             }
             let next_iter = iteration.saturating_add(1);
             if next_iter > super::grok_goal::MAX_ITERATIONS {
+                if let Err(e) = super::grok_goal::record_decision(
+                    mission_store,
+                    &mut row,
+                    &sentinel,
+                    "budget_limited",
+                )
+                .await
+                {
+                    tracing::warn!("grok_goal: record_decision failed: {}", e);
+                }
                 if let Err(e) = super::grok_goal::disable_goal(mission_store, &mut row).await {
                     tracing::warn!("grok_goal: disable_goal failed: {}", e);
                 }
@@ -7435,6 +7473,17 @@ async fn post_turn_handle_grok_goal(
                     .await
             {
                 tracing::warn!("grok_goal: update_counters failed: {}", e);
+            }
+            let decision = if was_missing {
+                "continue:missing_sentinel"
+            } else {
+                "continue"
+            };
+            if let Err(e) =
+                super::grok_goal::record_decision(mission_store, &mut row, &sentinel, decision)
+                    .await
+            {
+                tracing::warn!("grok_goal: record_decision failed: {}", e);
             }
             let _ = events_tx.send(AgentEvent::GoalIteration {
                 iteration: next_iter,
@@ -7575,6 +7624,91 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
     }
 }
 
+fn completion_evidence_for_agent_result(
+    result: &crate::agents::AgentResult,
+) -> crate::agents::CompletionEvidence {
+    use crate::agents::{CompletionConfidence, CompletionEvidence, CompletionSignal, FailureClass};
+
+    let terminal_reason = result.terminal_reason;
+    let data = result.data.as_ref();
+    let native_terminal_seen = data
+        .and_then(|v| v.get("native_terminal_seen"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(matches!(
+            terminal_reason,
+            Some(TerminalReason::TurnComplete | TerminalReason::Completed)
+        ));
+    let pending_tools = data
+        .and_then(|v| v.get("pending_tools"))
+        .and_then(|v| v.as_u64())
+        .and_then(|v| usize::try_from(v).ok());
+    let transport_failure_stage = data
+        .and_then(|v| v.get("transport_failure_stage"))
+        .or_else(|| data.and_then(|v| v.get("claudecode_transport_failure")))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let provider_error_source = data
+        .and_then(|v| v.get("provider_error_source"))
+        .or_else(|| data.and_then(|v| v.get("error_source")))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+
+    let failure_class = match terminal_reason {
+        Some(TerminalReason::AuthError) => Some(FailureClass::AuthError),
+        Some(TerminalReason::RateLimited) => Some(FailureClass::RateLimited),
+        Some(TerminalReason::CapacityLimited) => Some(FailureClass::CapacityLimited),
+        Some(TerminalReason::LlmError) if transport_failure_stage.is_some() => {
+            Some(FailureClass::TransportError)
+        }
+        Some(TerminalReason::LlmError) => Some(FailureClass::ProviderError),
+        Some(
+            TerminalReason::Stalled | TerminalReason::InfiniteLoop | TerminalReason::MaxIterations,
+        ) => Some(FailureClass::AgentError),
+        _ => None,
+    };
+
+    let completion_signal = match terminal_reason {
+        Some(TerminalReason::TurnComplete | TerminalReason::Completed) if native_terminal_seen => {
+            CompletionSignal::NativeTerminal
+        }
+        Some(TerminalReason::TurnComplete | TerminalReason::Completed) => {
+            CompletionSignal::TextFallback
+        }
+        Some(_) => CompletionSignal::ProcessExit,
+        None => CompletionSignal::Unknown,
+    };
+    let completion_confidence = match completion_signal {
+        CompletionSignal::NativeTerminal => CompletionConfidence::High,
+        CompletionSignal::SessionIdle => CompletionConfidence::Medium,
+        CompletionSignal::ProcessExit | CompletionSignal::TextFallback => {
+            if result.success {
+                CompletionConfidence::Low
+            } else {
+                CompletionConfidence::High
+            }
+        }
+        CompletionSignal::RecoveredSoftError => CompletionConfidence::Low,
+        CompletionSignal::Unknown => CompletionConfidence::Low,
+    };
+    let classification_source = match completion_signal {
+        CompletionSignal::TextFallback | CompletionSignal::RecoveredSoftError => "text_fallback",
+        CompletionSignal::Unknown => "unknown",
+        _ => "structured",
+    };
+
+    CompletionEvidence {
+        terminal_reason,
+        completion_signal,
+        completion_confidence,
+        native_terminal_seen,
+        pending_tools,
+        transport_failure_stage,
+        provider_error_source,
+        failure_class,
+        classification_source: classification_source.to_string(),
+    }
+}
+
 fn is_bare_llm_error_output(output: &str) -> bool {
     if looks_like_structured_provider_error(output) {
         return true;
@@ -7667,6 +7801,7 @@ async fn maybe_finalize_terminal_mission(
     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
     mission_id: Uuid,
     terminal_reason: Option<TerminalReason>,
+    completion_confidence: Option<crate::agents::CompletionConfidence>,
     complete_turn_without_follow_up: bool,
     log_context: &str,
 ) {
@@ -7706,6 +7841,18 @@ async fn maybe_finalize_terminal_mission(
                     status = ?mission.status,
                     context = log_context,
                     "Skipping mission finalization because mission already has terminal status"
+                );
+                return;
+            }
+
+            if new_status == MissionStatus::Completed
+                && completion_confidence == Some(crate::agents::CompletionConfidence::Low)
+            {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    reason = ?reason,
+                    context = log_context,
+                    "Skipping mission completion because completion evidence is low confidence"
                 );
                 return;
             }
@@ -9875,6 +10022,7 @@ async fn control_actor_loop(
                     // Runner cleared itself; cancel the force-clear watchdog.
                     runner_force_clear_deadline = None;
                     let mut completed_terminal_reason = None;
+                    let mut completed_completion_confidence = None;
                     // Captured for the post-turn `grok_goal` sentinel hook (see
                     // `post_turn_handle_grok_goal`), which runs after this
                     // `match` closes — `agent_result` itself is out of scope
@@ -9883,7 +10031,11 @@ async fn control_actor_loop(
                     match res {
                         Ok((_mid, _user_msg, mut agent_result)) => {
                             maybe_recover_soft_llm_error(&mut agent_result);
+                            let completion_evidence =
+                                completion_evidence_for_agent_result(&agent_result);
                             completed_terminal_reason = agent_result.terminal_reason;
+                            completed_completion_confidence =
+                                Some(completion_evidence.completion_confidence);
                             completed_agent_output = agent_result.output.clone();
                             // Only append assistant to local history if this mission is still the current mission.
                             // Note: User message was already added before execution started.
@@ -9950,6 +10102,7 @@ async fn control_actor_loop(
                                     &events_tx,
                                     mission_id,
                                     agent_result.terminal_reason,
+                                    Some(completion_evidence.completion_confidence),
                                     false,
                                     "turn finished before follow-up enqueue",
                                 )
@@ -10013,6 +10166,7 @@ async fn control_actor_loop(
                                 mission_id: completed_mission_id,
                                 shared_files,
                                 resumable,
+                                completion_evidence: Some(completion_evidence),
                             });
                             if let Some(mission_id) = completed_mission_id {
                                 // Update automation executions based on agent outcome
@@ -10156,6 +10310,7 @@ async fn control_actor_loop(
                                 &events_tx,
                                 mission_id,
                                 completed_terminal_reason,
+                                completed_completion_confidence,
                                 true,
                                 "turn finished with no same-mission follow-up queued",
                             )
@@ -10285,6 +10440,7 @@ async fn control_actor_loop(
                     if runner.check_finished() {
                         if let Some((_msg_id, _user_msg, mut result)) = runner.poll_completion().await {
                             maybe_recover_soft_llm_error(&mut result);
+                            let completion_evidence = completion_evidence_for_agent_result(&result);
                             tracing::info!(
                                 "Parallel mission {} completed (success: {}, cost: {} cents)",
                                 mission_id, result.success, result.cost_cents
@@ -10340,6 +10496,7 @@ async fn control_actor_loop(
                                 mission_id: Some(*mission_id),
                                 shared_files,
                                 resumable,
+                                completion_evidence: Some(completion_evidence.clone()),
                             });
 
                             // Update automation executions based on agent outcome
@@ -10476,6 +10633,7 @@ async fn control_actor_loop(
                                         &events_tx,
                                         *mission_id,
                                         result.terminal_reason,
+                                        Some(completion_evidence.completion_confidence),
                                         true,
                                         "parallel turn finished with no follow-up queued",
                                     )
@@ -14532,6 +14690,7 @@ mod tests {
                 mission_id: Some(mission_id),
                 shared_files: None,
                 resumable: false,
+                completion_evidence: None,
             },
             &mut buffers,
         );
@@ -14630,6 +14789,7 @@ mod tests {
             mission_id: Some(mission_id),
             shared_files: None,
             resumable: false,
+            completion_evidence: None,
         };
 
         let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
@@ -14660,6 +14820,7 @@ mod tests {
             mission_id: Some(mission_id),
             shared_files: None,
             resumable: false,
+            completion_evidence: None,
         };
 
         let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
@@ -17613,6 +17774,7 @@ Investigate <service/> failures.
             &events_tx,
             mission.id,
             Some(TerminalReason::LlmError),
+            None,
             false,
             "shutdown race test",
         )
@@ -17627,6 +17789,81 @@ Investigate <service/> failures.
         assert_eq!(updated.terminal_reason, None);
         assert!(updated.resumable);
         assert!(events_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn maybe_finalize_terminal_mission_skips_low_confidence_completed() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("Weak completion"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("mission should be active");
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel(8);
+
+        maybe_finalize_terminal_mission(
+            &store,
+            &events_tx,
+            mission.id,
+            Some(TerminalReason::Completed),
+            Some(crate::agents::CompletionConfidence::Low),
+            true,
+            "low confidence completion test",
+        )
+        .await;
+
+        let updated = store
+            .get_mission(mission.id)
+            .await
+            .expect("mission lookup should succeed")
+            .expect("mission should exist");
+        assert_eq!(updated.status, MissionStatus::Active);
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn completion_evidence_marks_recovered_text_completion_low_confidence() {
+        let result = crate::agents::AgentResult::success("substantive output", 0)
+            .with_terminal_reason(TerminalReason::TurnComplete)
+            .with_data(serde_json::json!({ "native_terminal_seen": false }));
+
+        let evidence = completion_evidence_for_agent_result(&result);
+
+        assert_eq!(evidence.terminal_reason, Some(TerminalReason::TurnComplete));
+        assert_eq!(
+            evidence.completion_signal,
+            crate::agents::CompletionSignal::TextFallback
+        );
+        assert_eq!(
+            evidence.completion_confidence,
+            crate::agents::CompletionConfidence::Low
+        );
+        assert!(!evidence.native_terminal_seen);
+        assert_eq!(evidence.classification_source, "text_fallback");
+    }
+
+    #[test]
+    fn completion_evidence_marks_process_failures_with_failure_class() {
+        let result = crate::agents::AgentResult::failure("rate limit", 0)
+            .with_terminal_reason(TerminalReason::RateLimited);
+
+        let evidence = completion_evidence_for_agent_result(&result);
+
+        assert_eq!(
+            evidence.completion_signal,
+            crate::agents::CompletionSignal::ProcessExit
+        );
+        assert_eq!(
+            evidence.failure_class,
+            Some(crate::agents::FailureClass::RateLimited)
+        );
+        assert_eq!(
+            evidence.completion_confidence,
+            crate::agents::CompletionConfidence::High
+        );
     }
 
     #[test]

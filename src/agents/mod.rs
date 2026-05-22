@@ -12,7 +12,10 @@ use std::sync::Arc;
 pub use opencode::OpenCodeAgent;
 
 pub use context::AgentContext;
-pub use types::{AgentError, AgentId, AgentResult, AgentType, CostSource, TerminalReason};
+pub use types::{
+    AgentError, AgentId, AgentResult, AgentType, CompletionConfidence, CompletionEvidence,
+    CompletionSignal, CostSource, FailureClass, TerminalReason, TurnOutcome,
+};
 
 use crate::task::Task;
 use async_trait::async_trait;

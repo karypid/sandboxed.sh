@@ -31,8 +31,10 @@ enum MissionStatus: String, Codable, CaseIterable {
         case .awaitingUser: return .awaitingUser
         case .acknowledged: return .completed
         case .completed: return .completed
-        case .failed: return .failed
-        case .interrupted, .blocked, .notFeasible, .unknown: return .failed
+        case .failed, .notFeasible: return .failed
+        case .interrupted: return .interrupted
+        case .blocked: return .blocked
+        case .unknown: return .idle
         }
     }
 

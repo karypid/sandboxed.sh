@@ -102,6 +102,7 @@ export function categorizeMissions<T extends { id: string; status: MissionStatus
  * Status display utilities
  */
 export const STATUS_DOT_COLORS: Record<MissionStatus, string> = {
+  pending: 'bg-amber-400',
   active: 'bg-indigo-400',
   awaiting_user: 'bg-sky-400',
   acknowledged: 'bg-emerald-400',
@@ -113,6 +114,7 @@ export const STATUS_DOT_COLORS: Record<MissionStatus, string> = {
 };
 
 export const STATUS_TEXT_COLORS: Record<MissionStatus, string> = {
+  pending: 'text-amber-400',
   active: 'text-indigo-400',
   awaiting_user: 'text-sky-400',
   acknowledged: 'text-emerald-400',
@@ -124,6 +126,7 @@ export const STATUS_TEXT_COLORS: Record<MissionStatus, string> = {
 };
 
 export const STATUS_LABELS: Record<MissionStatus, string> = {
+  pending: 'Pending',
   active: 'Active',
   awaiting_user: 'Needs You',
   acknowledged: 'Acknowledged',
@@ -155,26 +158,10 @@ export function getMissionTextColor(status: MissionStatus, isActuallyRunning: bo
   return STATUS_TEXT_COLORS[status] || 'text-white/40';
 }
 
-/**
- * Icon mapping for mission statuses.
- * Import the icons where needed and use this mapping.
- * Example: const Icon = STATUS_ICONS[mission.status] || Clock;
- */
-export const STATUS_ICONS = {
-  pending: 'Clock',
-  active: 'Loader',
-  running: 'Loader',
-  awaiting_user: 'Bell',
-  acknowledged: 'CheckCircle',
-  completed: 'CheckCircle',
-  failed: 'XCircle',
-  cancelled: 'Ban',
-  interrupted: 'Ban',
-  blocked: 'Ban',
-  not_feasible: 'XCircle',
-} as const;
-
-export type StatusIconName = (typeof STATUS_ICONS)[keyof typeof STATUS_ICONS];
+// NOTE: Lucide-component status icons live in
+// `@/components/ui/status-icons` (STATUS_ICONS + getStatusIcon). The previous
+// string-typed STATUS_ICONS map here was unused by any consumer (kept
+// duplicated icon names out of sync with the lucide map) — deleted.
 
 /**
  * Get mission title from mission data.

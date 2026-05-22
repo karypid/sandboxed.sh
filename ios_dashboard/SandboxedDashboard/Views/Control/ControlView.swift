@@ -5696,18 +5696,18 @@ private struct MissionRow: View {
 
     private var statusIcon: String {
         if isRunning {
-            return "arrow.triangle.2.circlepath"
+            return "arrow.trianglehead.2.clockwise"
         }
         switch status {
         case .pending: return "clock.fill"
-        case .active: return "arrow.triangle.2.circlepath"
+        case .active: return "arrow.trianglehead.2.clockwise"
         case .awaitingUser: return "hand.wave.fill"
         case .acknowledged: return "checkmark.circle.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed: return "xmark.circle.fill"
         case .interrupted: return "pause.circle.fill"
         case .blocked: return "exclamationmark.triangle.fill"
-        case .notFeasible: return "questionmark.circle.fill"
+        case .notFeasible: return "xmark.circle.fill"
         case .unknown: return "questionmark.circle.fill"
         }
     }
