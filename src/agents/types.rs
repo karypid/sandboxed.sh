@@ -128,6 +128,37 @@ pub enum TurnOutcome {
     },
 }
 
+impl TurnOutcome {
+    pub fn terminal_reason(&self) -> TerminalReason {
+        match self {
+            Self::Complete { .. } => TerminalReason::TurnComplete,
+            Self::Failed { reason, .. } | Self::Interrupted { reason, .. } => *reason,
+        }
+    }
+
+    pub fn completion_signal(&self) -> CompletionSignal {
+        match self {
+            Self::Complete { signal, .. } => *signal,
+            Self::Failed { .. } | Self::Interrupted { .. } => CompletionSignal::ProcessExit,
+        }
+    }
+
+    pub fn completion_confidence(&self) -> CompletionConfidence {
+        match self {
+            Self::Complete { confidence, .. } => *confidence,
+            Self::Failed { .. } | Self::Interrupted { .. } => CompletionConfidence::High,
+        }
+    }
+
+    pub fn failure_class(&self) -> Option<FailureClass> {
+        match self {
+            Self::Complete { .. } => None,
+            Self::Failed { source, .. } => *source,
+            Self::Interrupted { .. } => Some(FailureClass::AgentError),
+        }
+    }
+}
+
 /// Result of an agent executing a task.
 ///
 /// # Invariants
@@ -198,6 +229,48 @@ impl AgentResult {
     /// Add additional data to the result.
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
         self.data = Some(data);
+        self
+    }
+
+    /// Attach typed turn-outcome metadata while preserving existing backend
+    /// diagnostics in `data`.
+    pub fn with_turn_outcome(mut self, outcome: TurnOutcome) -> Self {
+        self.terminal_reason = Some(outcome.terminal_reason());
+        let data = self.data.get_or_insert_with(|| serde_json::json!({}));
+        if !data.is_object() {
+            *data = serde_json::json!({});
+        }
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("turn_outcome".to_string(), serde_json::json!(outcome));
+            obj.insert(
+                "completion_signal".to_string(),
+                serde_json::json!(outcome.completion_signal()),
+            );
+            obj.insert(
+                "completion_confidence".to_string(),
+                serde_json::json!(outcome.completion_confidence()),
+            );
+            obj.insert(
+                "native_terminal_seen".to_string(),
+                serde_json::json!(matches!(
+                    outcome.completion_signal(),
+                    CompletionSignal::NativeTerminal
+                )),
+            );
+            obj.insert(
+                "failure_class".to_string(),
+                serde_json::json!(outcome.failure_class()),
+            );
+            obj.insert(
+                "classification_source".to_string(),
+                serde_json::json!(match outcome.completion_signal() {
+                    CompletionSignal::TextFallback | CompletionSignal::RecoveredSoftError =>
+                        "text_fallback",
+                    CompletionSignal::Unknown => "unknown",
+                    _ => "structured",
+                }),
+            );
+        }
         self
     }
 
@@ -275,5 +348,47 @@ pub enum AgentError {
 impl From<crate::task::TaskError> for AgentError {
     fn from(e: crate::task::TaskError) -> Self {
         Self::TaskError(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_outcome_metadata_preserves_existing_backend_data() {
+        let result = AgentResult::success("done", 0)
+            .with_data(serde_json::json!({ "backend": "codex" }))
+            .with_turn_outcome(TurnOutcome::Complete {
+                signal: CompletionSignal::NativeTerminal,
+                confidence: CompletionConfidence::High,
+                message: None,
+            });
+
+        let data = result.data.expect("metadata");
+        assert_eq!(result.terminal_reason, Some(TerminalReason::TurnComplete));
+        assert_eq!(data["backend"], "codex");
+        assert_eq!(data["completion_signal"], "native_terminal");
+        assert_eq!(data["completion_confidence"], "high");
+        assert_eq!(data["native_terminal_seen"], true);
+        assert_eq!(data["classification_source"], "structured");
+        assert_eq!(data["turn_outcome"]["outcome"], "complete");
+    }
+
+    #[test]
+    fn failed_turn_outcome_metadata_sets_failure_class() {
+        let result =
+            AgentResult::failure("rate limited", 0).with_turn_outcome(TurnOutcome::Failed {
+                reason: TerminalReason::RateLimited,
+                source: Some(FailureClass::RateLimited),
+                message: None,
+            });
+
+        let data = result.data.expect("metadata");
+        assert_eq!(result.terminal_reason, Some(TerminalReason::RateLimited));
+        assert_eq!(data["completion_signal"], "process_exit");
+        assert_eq!(data["completion_confidence"], "high");
+        assert_eq!(data["failure_class"], "rate_limited");
+        assert_eq!(data["turn_outcome"]["outcome"], "failed");
     }
 }

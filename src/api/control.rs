@@ -7387,9 +7387,14 @@ async fn post_turn_handle_grok_goal(
     );
     match sentinel {
         super::grok_goal::GoalSentinel::Complete => {
-            if let Err(e) =
-                super::grok_goal::record_decision(mission_store, &mut row, &sentinel, "complete")
-                    .await
+            if let Err(e) = super::grok_goal::record_decision(
+                mission_store,
+                &mut row,
+                &sentinel,
+                "complete",
+                "high",
+            )
+            .await
             {
                 tracing::warn!("grok_goal: record_decision failed: {}", e);
             }
@@ -7403,9 +7408,14 @@ async fn post_turn_handle_grok_goal(
             });
         }
         super::grok_goal::GoalSentinel::Aborted { ref reason } => {
-            if let Err(e) =
-                super::grok_goal::record_decision(mission_store, &mut row, &sentinel, "aborted")
-                    .await
+            if let Err(e) = super::grok_goal::record_decision(
+                mission_store,
+                &mut row,
+                &sentinel,
+                "aborted",
+                "high",
+            )
+            .await
             {
                 tracing::warn!("grok_goal: record_decision failed: {}", e);
             }
@@ -7431,6 +7441,7 @@ async fn post_turn_handle_grok_goal(
                     &mut row,
                     &sentinel,
                     "aborted:no_goal_sentinel",
+                    "low",
                 )
                 .await
                 {
@@ -7453,6 +7464,7 @@ async fn post_turn_handle_grok_goal(
                     &mut row,
                     &sentinel,
                     "budget_limited",
+                    "medium",
                 )
                 .await
                 {
@@ -7479,9 +7491,14 @@ async fn post_turn_handle_grok_goal(
             } else {
                 "continue"
             };
-            if let Err(e) =
-                super::grok_goal::record_decision(mission_store, &mut row, &sentinel, decision)
-                    .await
+            if let Err(e) = super::grok_goal::record_decision(
+                mission_store,
+                &mut row,
+                &sentinel,
+                decision,
+                if was_missing { "low" } else { "high" },
+            )
+            .await
             {
                 tracing::warn!("grok_goal: record_decision failed: {}", e);
             }
@@ -7653,7 +7670,11 @@ fn completion_evidence_for_agent_result(
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
 
-    let failure_class = match terminal_reason {
+    let failure_class_from_data = data
+        .and_then(|v| v.get("failure_class"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .flatten();
+    let failure_class = failure_class_from_data.or(match terminal_reason {
         Some(TerminalReason::AuthError) => Some(FailureClass::AuthError),
         Some(TerminalReason::RateLimited) => Some(FailureClass::RateLimited),
         Some(TerminalReason::CapacityLimited) => Some(FailureClass::CapacityLimited),
@@ -7665,9 +7686,12 @@ fn completion_evidence_for_agent_result(
             TerminalReason::Stalled | TerminalReason::InfiniteLoop | TerminalReason::MaxIterations,
         ) => Some(FailureClass::AgentError),
         _ => None,
-    };
+    });
 
-    let completion_signal = match terminal_reason {
+    let completion_signal_from_data = data
+        .and_then(|v| v.get("completion_signal"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let completion_signal = completion_signal_from_data.unwrap_or(match terminal_reason {
         Some(TerminalReason::TurnComplete | TerminalReason::Completed) if native_terminal_seen => {
             CompletionSignal::NativeTerminal
         }
@@ -7676,25 +7700,34 @@ fn completion_evidence_for_agent_result(
         }
         Some(_) => CompletionSignal::ProcessExit,
         None => CompletionSignal::Unknown,
-    };
-    let completion_confidence = match completion_signal {
-        CompletionSignal::NativeTerminal => CompletionConfidence::High,
-        CompletionSignal::SessionIdle => CompletionConfidence::Medium,
-        CompletionSignal::ProcessExit | CompletionSignal::TextFallback => {
-            if result.success {
-                CompletionConfidence::Low
-            } else {
-                CompletionConfidence::High
+    });
+    let completion_confidence_from_data = data
+        .and_then(|v| v.get("completion_confidence"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let completion_confidence =
+        completion_confidence_from_data.unwrap_or(match completion_signal {
+            CompletionSignal::NativeTerminal => CompletionConfidence::High,
+            CompletionSignal::SessionIdle => CompletionConfidence::Medium,
+            CompletionSignal::ProcessExit | CompletionSignal::TextFallback => {
+                if result.success {
+                    CompletionConfidence::Low
+                } else {
+                    CompletionConfidence::High
+                }
             }
-        }
-        CompletionSignal::RecoveredSoftError => CompletionConfidence::Low,
-        CompletionSignal::Unknown => CompletionConfidence::Low,
-    };
-    let classification_source = match completion_signal {
-        CompletionSignal::TextFallback | CompletionSignal::RecoveredSoftError => "text_fallback",
-        CompletionSignal::Unknown => "unknown",
-        _ => "structured",
-    };
+            CompletionSignal::RecoveredSoftError => CompletionConfidence::Low,
+            CompletionSignal::Unknown => CompletionConfidence::Low,
+        });
+    let classification_source = data
+        .and_then(|v| v.get("classification_source"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(match completion_signal {
+            CompletionSignal::TextFallback | CompletionSignal::RecoveredSoftError => {
+                "text_fallback"
+            }
+            CompletionSignal::Unknown => "unknown",
+            _ => "structured",
+        });
 
     CompletionEvidence {
         terminal_reason,

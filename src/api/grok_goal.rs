@@ -60,6 +60,8 @@ pub const VAR_MISSING_COUNT: &str = "goal_missing_count";
 pub const VAR_LAST_SENTINEL: &str = "goal_last_sentinel";
 /// Variable key under which we store the scheduler decision for the last turn.
 pub const VAR_LAST_DECISION: &str = "goal_last_decision";
+/// Variable key under which we store confidence for the last goal decision.
+pub const VAR_LAST_CONFIDENCE: &str = "goal_last_confidence";
 
 // ─── Sentinel parsing ────────────────────────────────────────────────────────
 
@@ -201,6 +203,7 @@ fn initial_variables(objective: &str, iteration: u32) -> HashMap<String, String>
     v.insert(VAR_MISSING_COUNT.to_string(), "0".to_string());
     v.insert(VAR_LAST_SENTINEL.to_string(), "none".to_string());
     v.insert(VAR_LAST_DECISION.to_string(), "started".to_string());
+    v.insert(VAR_LAST_CONFIDENCE.to_string(), "high".to_string());
     v
 }
 
@@ -297,6 +300,7 @@ pub async fn record_decision(
     row: &mut Automation,
     sentinel: &GoalSentinel,
     decision: &str,
+    confidence: &str,
 ) -> Result<(), String> {
     row.variables.insert(
         VAR_LAST_SENTINEL.to_string(),
@@ -304,6 +308,8 @@ pub async fn record_decision(
     );
     row.variables
         .insert(VAR_LAST_DECISION.to_string(), decision.to_string());
+    row.variables
+        .insert(VAR_LAST_CONFIDENCE.to_string(), confidence.to_string());
     mission_store
         .update_automation(row.clone())
         .await
@@ -404,6 +410,10 @@ mod tests {
         assert_eq!(
             variables.get(VAR_LAST_DECISION).map(String::as_str),
             Some("started")
+        );
+        assert_eq!(
+            variables.get(VAR_LAST_CONFIDENCE).map(String::as_str),
+            Some("high")
         );
     }
 

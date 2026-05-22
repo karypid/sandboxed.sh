@@ -21,7 +21,10 @@ use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::agents::{AgentRef, AgentResult, TerminalReason};
+use crate::agents::{
+    AgentRef, AgentResult, CompletionConfidence, CompletionSignal, FailureClass, TerminalReason,
+    TurnOutcome,
+};
 use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
@@ -57,6 +60,66 @@ fn cancel_or_shutdown_failure() -> AgentResult {
     } else {
         AgentResult::failure("Mission cancelled".to_string(), 0)
             .with_terminal_reason(TerminalReason::Cancelled)
+    }
+}
+
+fn failure_class_for_terminal_reason(reason: TerminalReason) -> FailureClass {
+    match reason {
+        TerminalReason::AuthError => FailureClass::AuthError,
+        TerminalReason::CapacityLimited => FailureClass::CapacityLimited,
+        TerminalReason::RateLimited => FailureClass::RateLimited,
+        TerminalReason::Stalled | TerminalReason::InfiniteLoop | TerminalReason::MaxIterations => {
+            FailureClass::AgentError
+        }
+        TerminalReason::Cancelled | TerminalReason::ServerShutdown => FailureClass::AgentError,
+        TerminalReason::LlmError => FailureClass::ProviderError,
+        TerminalReason::TurnComplete | TerminalReason::Completed => FailureClass::Unknown,
+    }
+}
+
+fn complete_turn_outcome(
+    signal: CompletionSignal,
+    confidence: CompletionConfidence,
+) -> TurnOutcome {
+    TurnOutcome::Complete {
+        signal,
+        confidence,
+        message: None,
+    }
+}
+
+fn failed_turn_outcome(reason: TerminalReason) -> TurnOutcome {
+    TurnOutcome::Failed {
+        reason,
+        source: Some(failure_class_for_terminal_reason(reason)),
+        message: None,
+    }
+}
+
+fn interrupted_turn_outcome(reason: TerminalReason) -> TurnOutcome {
+    TurnOutcome::Interrupted {
+        reason,
+        message: None,
+    }
+}
+
+fn turn_outcome_for_result(
+    result: &AgentResult,
+    success_signal: CompletionSignal,
+    success_confidence: CompletionConfidence,
+) -> TurnOutcome {
+    if result.success {
+        complete_turn_outcome(success_signal, success_confidence)
+    } else {
+        let reason = result.terminal_reason.unwrap_or(TerminalReason::LlmError);
+        if matches!(
+            reason,
+            TerminalReason::Cancelled | TerminalReason::ServerShutdown
+        ) {
+            interrupted_turn_outcome(reason)
+        } else {
+            failed_turn_outcome(reason)
+        }
     }
 }
 
@@ -6076,6 +6139,12 @@ pub fn run_claudecode_turn<'a>(
                 &pending_tool_names,
             ));
         }
+        let outcome = turn_outcome_for_result(
+            &result,
+            CompletionSignal::NativeTerminal,
+            CompletionConfidence::High,
+        );
+        result = result.with_turn_outcome(outcome);
         if let Some(model) = model_for_cost {
             result = result.with_model(model.to_string());
         }
@@ -12991,6 +13060,22 @@ pub async fn run_opencode_turn(
     } else {
         AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::TurnComplete)
     };
+    let success_signal = if sse_complete_seen {
+        CompletionSignal::NativeTerminal
+    } else if session_idle_seen {
+        CompletionSignal::SessionIdle
+    } else {
+        CompletionSignal::ProcessExit
+    };
+    let success_confidence = if sse_complete_seen {
+        CompletionConfidence::High
+    } else if session_idle_seen {
+        CompletionConfidence::Medium
+    } else {
+        CompletionConfidence::Low
+    };
+    let outcome = turn_outcome_for_result(&result, success_signal, success_confidence);
+    result = result.with_turn_outcome(outcome);
     if model_used.is_none() {
         if let Some(model) = resolved_model.as_deref() {
             if !model.starts_with("builtin/") {
@@ -13710,6 +13795,10 @@ pub async fn run_grok_turn(
             .with_cost_source(cost_source)
             .with_terminal_reason(TerminalReason::LlmError)
     };
+    let success_signal = CompletionSignal::ProcessExit;
+    let success_confidence = CompletionConfidence::Low;
+    let outcome = turn_outcome_for_result(&result, success_signal, success_confidence);
+    result = result.with_turn_outcome(outcome);
     if token_usage.has_usage() {
         result = result.with_usage(token_usage);
     }
@@ -14552,6 +14641,12 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
         AgentResult::failure(final_message, cost_cents).with_terminal_reason(reason)
     };
 
+    let outcome = turn_outcome_for_result(
+        &result,
+        CompletionSignal::NativeTerminal,
+        CompletionConfidence::High,
+    );
+    result = result.with_turn_outcome(outcome);
     result = result.with_cost_source(cost_source);
     if usage.has_usage() {
         result = result.with_usage(usage);
@@ -14968,6 +15063,12 @@ pub async fn run_gemini_turn(
         AgentResult::failure(final_message, cost_cents).with_terminal_reason(reason)
     };
 
+    let outcome = turn_outcome_for_result(
+        &result,
+        CompletionSignal::ProcessExit,
+        CompletionConfidence::Low,
+    );
+    result = result.with_turn_outcome(outcome);
     result = result.with_cost_source(cost_source);
     if usage.has_usage() {
         result = result.with_usage(usage);
