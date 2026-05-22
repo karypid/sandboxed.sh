@@ -2097,6 +2097,27 @@ impl SqliteMissionStore {
             .map_err(|e| format!("Failed to add driver column: {}", e))?;
         }
 
+        // Cleanup: drop stale inactive harness-loop automations. These are
+        // per-`/goal`-cycle UI artifacts that the native_loop_observer now
+        // deletes on terminal status; this purges any rows accumulated under
+        // the old "deactivate-and-keep" behavior (one mission had 50+ such
+        // rows for a single recurring interval). Cascade FK removes the
+        // matching automation_executions. Safe to run on every startup —
+        // idempotent and only affects rows that should not exist under the
+        // current model.
+        let purged: usize = conn
+            .execute(
+                "DELETE FROM automations WHERE active = 0 AND driver = 'harness_loop'",
+                [],
+            )
+            .map_err(|e| format!("Failed to purge inactive harness_loop rows: {}", e))?;
+        if purged > 0 {
+            tracing::info!(
+                "Cleanup: purged {} inactive harness_loop automation rows",
+                purged
+            );
+        }
+
         Ok(())
     }
 }
@@ -8105,12 +8126,14 @@ mod tests {
         CompletionConfidence, CompletionEvidence, CompletionSignal, CostSource, TerminalReason,
     };
     use crate::api::mission_store::{
-        MissionMode, MissionStatus, MissionStore, TelegramAlert, TelegramAlertPreference,
-        TelegramChannel, TelegramConversation, TelegramConversationMessage,
-        TelegramConversationMessageDirection, TelegramMissionInterestLevel,
-        TelegramMissionSubscription, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-        TelegramStructuredMemoryScope, TelegramTriggerMode, TelegramUser, TelegramUserRole,
-        TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
+        now_string, Automation, AutomationDriver, CommandSource, FreshSession, MissionMode,
+        MissionStatus, MissionStore, RetryConfig, StopPolicy, TelegramAlert,
+        TelegramAlertPreference, TelegramChannel, TelegramConversation,
+        TelegramConversationMessage, TelegramConversationMessageDirection,
+        TelegramMissionInterestLevel, TelegramMissionSubscription, TelegramStructuredMemoryEntry,
+        TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramTriggerMode,
+        TelegramUser, TelegramUserRole, TelegramWorkflow, TelegramWorkflowEvent,
+        TelegramWorkflowKind, TelegramWorkflowStatus, TriggerType,
     };
     use crate::cost::TokenUsage;
     use rusqlite::params;
@@ -10304,6 +10327,132 @@ mod tests {
             stale.iter().all(|m| m.id != mission.id),
             "freshly-created mission with current updated_at and no events \
              must not be flagged stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_purges_inactive_harness_loop_rows_on_reopen() {
+        use std::collections::HashMap;
+
+        // Keep the tempdir alive across two `new()` calls so we exercise the
+        // migration path on an existing DB.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().to_path_buf();
+
+        let store = SqliteMissionStore::new(path.clone(), "test-user")
+            .await
+            .expect("first open");
+
+        let mission = store
+            .create_mission(
+                Some("goal mission"),
+                None,
+                None,
+                None,
+                None,
+                Some("codex"),
+                None,
+            )
+            .await
+            .expect("mission");
+
+        // Seed: one inactive harness_loop row (the stale UI artifact we want
+        // gone), one inactive scheduler row (user-defined, must be kept),
+        // and one active harness_loop row (in-progress loop, must be kept).
+        let stale_harness = Automation {
+            id: Uuid::new_v4(),
+            mission_id: mission.id,
+            command_source: CommandSource::NativeLoop {
+                harness: "codex".to_string(),
+                command: "goal".to_string(),
+                args: json!({ "objective": "old cycle" }),
+            },
+            trigger: TriggerType::AgentFinished,
+            variables: HashMap::new(),
+            active: false,
+            created_at: now_string(),
+            last_triggered_at: None,
+            retry_config: RetryConfig::default(),
+            stop_policy: StopPolicy::Never,
+            fresh_session: FreshSession::Keep,
+            consecutive_failures: 0,
+            driver: AutomationDriver::HarnessLoop,
+        };
+        let preserved_scheduler = Automation {
+            id: Uuid::new_v4(),
+            mission_id: mission.id,
+            command_source: CommandSource::Inline {
+                content: "user-paused automation".into(),
+            },
+            trigger: TriggerType::AgentFinished,
+            variables: HashMap::new(),
+            active: false,
+            created_at: now_string(),
+            last_triggered_at: None,
+            retry_config: RetryConfig::default(),
+            stop_policy: StopPolicy::Never,
+            fresh_session: FreshSession::Keep,
+            consecutive_failures: 0,
+            driver: AutomationDriver::Scheduler,
+        };
+        let preserved_active_harness = Automation {
+            id: Uuid::new_v4(),
+            mission_id: mission.id,
+            command_source: CommandSource::NativeLoop {
+                harness: "codex".to_string(),
+                command: "goal".to_string(),
+                args: json!({ "objective": "running cycle" }),
+            },
+            trigger: TriggerType::AgentFinished,
+            variables: HashMap::new(),
+            active: true,
+            created_at: now_string(),
+            last_triggered_at: None,
+            retry_config: RetryConfig::default(),
+            stop_policy: StopPolicy::Never,
+            fresh_session: FreshSession::Keep,
+            consecutive_failures: 0,
+            driver: AutomationDriver::HarnessLoop,
+        };
+        let stale_id = stale_harness.id;
+        let preserved_scheduler_id = preserved_scheduler.id;
+        let preserved_active_id = preserved_active_harness.id;
+        store
+            .create_automation(stale_harness)
+            .await
+            .expect("seed stale");
+        store
+            .create_automation(preserved_scheduler)
+            .await
+            .expect("seed user-paused");
+        store
+            .create_automation(preserved_active_harness)
+            .await
+            .expect("seed active");
+
+        // Drop the store to release the SQLite connection, then re-open —
+        // this triggers `run_migrations` against the existing schema.
+        drop(store);
+
+        let store = SqliteMissionStore::new(path, "test-user")
+            .await
+            .expect("reopen triggers migration");
+        let rows = store
+            .get_mission_automations(mission.id)
+            .await
+            .expect("list");
+        let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+        assert!(
+            !ids.contains(&stale_id),
+            "stale inactive harness_loop row should be purged by migration"
+        );
+        assert!(
+            ids.contains(&preserved_scheduler_id),
+            "inactive scheduler row is user-defined and must survive migration"
+        );
+        assert!(
+            ids.contains(&preserved_active_id),
+            "active harness_loop row represents an in-progress loop and must survive"
         );
     }
 }

@@ -8,7 +8,11 @@
 //!      (idempotent — reuses an existing row for the same harness/command).
 //!   2. Each `Iteration` observation writes a `Success` AutomationExecution.
 //!   3. A terminal `Completed` observation closes the most recent execution
-//!      and (when status is final) sets the automation inactive.
+//!      and (when status is final) **deletes** the automation row. The row is
+//!      a UI artifact representing an in-progress goal loop, not a
+//!      user-defined automation — keeping it as `active=0` pollutes the panel
+//!      (one piled-up row per `/goal` cycle). Cascade FK drops the iteration
+//!      executions; the mission event stream retains the full history.
 //!
 //! Phase 1 doesn't drive the harness — it observes. The user-typed `/goal X`
 //! already triggers the harness path; this task ensures the panel sees it.
@@ -100,16 +104,18 @@ async fn handle_event(
         LoopObservation::Completed { status, summary } => {
             record_completion_execution(store, automation_id, mission_id, &status, summary).await?;
             if is_terminal_status(&status) {
-                if let Err(e) = store.update_automation_active(automation_id, false).await {
+                // Delete (not just deactivate) — see module doc. Cascade FK
+                // drops the iteration executions; mission events keep history.
+                if let Err(e) = store.delete_automation(automation_id).await {
                     tracing::warn!(
                         automation_id = %automation_id,
                         error = %e,
-                        "Failed to deactivate completed native-loop automation"
+                        "Failed to delete completed native-loop automation"
                     );
                 }
                 // Evict from cache so a subsequent `/goal` on the same mission
-                // creates a fresh automation row instead of appending iterations
-                // to the deactivated one.
+                // creates a fresh automation row instead of reattaching to the
+                // deleted one.
                 cache.remove(&mission_id);
             }
         }
@@ -232,4 +238,229 @@ async fn record_completion_execution(
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::mission_store::SqliteMissionStore;
+
+    async fn store_with_codex_mission() -> (Arc<dyn MissionStore>, Uuid) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let raw = SqliteMissionStore::new(temp.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let store: Arc<dyn MissionStore> = Arc::new(raw);
+        let mission = store
+            .create_mission(
+                Some("goal-loop"),
+                None,
+                None,
+                None,
+                None,
+                Some("codex"),
+                None,
+            )
+            .await
+            .expect("mission");
+        std::mem::forget(temp); // keep dir alive for the test's lifetime
+        (store, mission.id)
+    }
+
+    #[tokio::test]
+    async fn iteration_event_materializes_active_native_loop_row() {
+        let (store, mission_id) = store_with_codex_mission().await;
+        let mut cache = HashMap::new();
+
+        let event = AgentEvent::GoalIteration {
+            iteration: 1,
+            objective: "ship the feature".to_string(),
+            mission_id: Some(mission_id),
+        };
+        handle_event(&store, &event, &mut cache)
+            .await
+            .expect("handle iteration");
+
+        let automations = store
+            .get_mission_automations(mission_id)
+            .await
+            .expect("list");
+        assert_eq!(automations.len(), 1);
+        assert!(automations[0].active);
+        assert!(matches!(
+            automations[0].command_source,
+            CommandSource::NativeLoop { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_complete_status_deletes_native_loop_row() {
+        let (store, mission_id) = store_with_codex_mission().await;
+        let mut cache = HashMap::new();
+
+        handle_event(
+            &store,
+            &AgentEvent::GoalIteration {
+                iteration: 1,
+                objective: "ship".into(),
+                mission_id: Some(mission_id),
+            },
+            &mut cache,
+        )
+        .await
+        .expect("iter");
+
+        handle_event(
+            &store,
+            &AgentEvent::GoalStatus {
+                status: "complete".into(),
+                objective: "ship".into(),
+                mission_id: Some(mission_id),
+            },
+            &mut cache,
+        )
+        .await
+        .expect("complete");
+
+        let automations = store
+            .get_mission_automations(mission_id)
+            .await
+            .expect("list");
+        assert!(
+            automations.is_empty(),
+            "completed native_loop row should be deleted, found {} row(s)",
+            automations.len()
+        );
+        assert!(
+            !cache.contains_key(&mission_id),
+            "cache should be evicted after terminal status"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_aborted_and_cleared_also_delete_row() {
+        for status in ["aborted", "cleared"] {
+            let (store, mission_id) = store_with_codex_mission().await;
+            let mut cache = HashMap::new();
+
+            handle_event(
+                &store,
+                &AgentEvent::GoalIteration {
+                    iteration: 1,
+                    objective: "ship".into(),
+                    mission_id: Some(mission_id),
+                },
+                &mut cache,
+            )
+            .await
+            .expect("iter");
+
+            handle_event(
+                &store,
+                &AgentEvent::GoalStatus {
+                    status: status.into(),
+                    objective: "ship".into(),
+                    mission_id: Some(mission_id),
+                },
+                &mut cache,
+            )
+            .await
+            .expect("terminal");
+
+            let automations = store
+                .get_mission_automations(mission_id)
+                .await
+                .expect("list");
+            assert!(
+                automations.is_empty(),
+                "status '{}' should delete row, found {}",
+                status,
+                automations.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nonterminal_status_keeps_row_active() {
+        // `paused` / `budget_limited` are not terminal: the loop may resume.
+        // The row must stay so subsequent iterations reattach to it.
+        let (store, mission_id) = store_with_codex_mission().await;
+        let mut cache = HashMap::new();
+
+        handle_event(
+            &store,
+            &AgentEvent::GoalIteration {
+                iteration: 1,
+                objective: "ship".into(),
+                mission_id: Some(mission_id),
+            },
+            &mut cache,
+        )
+        .await
+        .expect("iter");
+
+        handle_event(
+            &store,
+            &AgentEvent::GoalStatus {
+                status: "paused".into(),
+                objective: "ship".into(),
+                mission_id: Some(mission_id),
+            },
+            &mut cache,
+        )
+        .await
+        .expect("paused");
+
+        let automations = store
+            .get_mission_automations(mission_id)
+            .await
+            .expect("list");
+        assert_eq!(automations.len(), 1);
+        assert!(automations[0].active);
+    }
+
+    #[tokio::test]
+    async fn second_goal_cycle_creates_a_fresh_row_after_completion() {
+        // Regression guard for the original bug: the panel was accumulating
+        // a new inactive row per `/goal` cycle. After the fix, each cycle
+        // owns at most one row, deleted on completion.
+        let (store, mission_id) = store_with_codex_mission().await;
+        let mut cache = HashMap::new();
+
+        for cycle in 0..3 {
+            handle_event(
+                &store,
+                &AgentEvent::GoalIteration {
+                    iteration: 1,
+                    objective: format!("cycle {}", cycle),
+                    mission_id: Some(mission_id),
+                },
+                &mut cache,
+            )
+            .await
+            .expect("iter");
+
+            handle_event(
+                &store,
+                &AgentEvent::GoalStatus {
+                    status: "complete".into(),
+                    objective: format!("cycle {}", cycle),
+                    mission_id: Some(mission_id),
+                },
+                &mut cache,
+            )
+            .await
+            .expect("complete");
+        }
+
+        let automations = store
+            .get_mission_automations(mission_id)
+            .await
+            .expect("list");
+        assert!(
+            automations.is_empty(),
+            "three completed cycles should leave zero rows, found {}",
+            automations.len()
+        );
+    }
 }

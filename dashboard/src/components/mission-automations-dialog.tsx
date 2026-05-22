@@ -198,6 +198,39 @@ export function clearInlinePrefillCache(
   libraryCommandContentRef.current = '';
 }
 
+/**
+ * Project the raw automation list for display.
+ *
+ * - Drops inactive `native_loop` rows. They're stale UI artifacts left over
+ *   from past `/goal` cycles (the backend now deletes them on terminal status,
+ *   but we filter here as belt-and-suspenders against stragglers in old DBs).
+ *   Active `native_loop` rows are kept so a running harness goal loop stays
+ *   visible.
+ * - Sorts active above inactive, then by `created_at` descending. Without
+ *   this, long-lived drivers (interval/webhook) get buried under freshly-
+ *   completed automation rows, which was the original "/goal keeps firing"
+ *   foot-gun: the active interval was below 13 newer inactive children.
+ */
+export function prepareVisibleAutomations<
+  A extends {
+    active: boolean;
+    created_at?: string;
+    command_source?: { type: string } | null;
+  }
+>(automations: A[]): A[] {
+  return automations
+    .filter(
+      (a) => !(a.command_source?.type === 'native_loop' && !a.active)
+    )
+    .slice()
+    .sort((a, b) => {
+      if (a.active !== b.active) return a.active ? -1 : 1;
+      const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return bTime - aTime;
+    });
+}
+
 export function MissionAutomationsDialog({
   open,
   missionId,
@@ -883,7 +916,7 @@ export function MissionAutomationsDialog({
 
   const isMissionDataReady = !!missionId && loadedMissionId === missionId;
   const showLoadingPlaceholder = !!missionId && (!isMissionDataReady || (loading && !hasLoaded));
-  const visibleAutomations = isMissionDataReady ? automations : [];
+  const visibleAutomations = isMissionDataReady ? prepareVisibleAutomations(automations) : [];
   const visibleError = isMissionDataReady ? error : null;
   const selectClass =
     'rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer';
