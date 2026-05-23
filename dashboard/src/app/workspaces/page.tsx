@@ -259,10 +259,16 @@ export default function WorkspacesPage() {
     };
   }, [mutateWorkspaces, selectedWorkspaceId, selectedWorkspaceStatus]);
 
-  // Auto-scroll build log to bottom when new content arrives
+  // Auto-scroll build log to bottom when new content arrives, but only
+  // if the user is already at (or near) the bottom. Otherwise the user
+  // gets yanked away from the line they're trying to read every time
+  // the 3-second poll fetches more log output.
   useEffect(() => {
-    if (buildLogRef.current) {
-      buildLogRef.current.scrollTop = buildLogRef.current.scrollHeight;
+    const el = buildLogRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom <= 32) {
+      el.scrollTop = el.scrollHeight;
     }
   }, [buildLog?.content]);
 
