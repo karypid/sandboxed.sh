@@ -23,6 +23,14 @@ export type ChatItem =
       sharedFiles?: SharedFile[];
       resumable?: boolean;
       goalIteration?: number;
+      /**
+       * Raw terminal_reason from the backend's completion_evidence, when
+       * present. Lets the UI distinguish a real agent failure from a
+       * deploy-induced SIGTERM (terminal_reason === "ServerShutdown"),
+       * which the mission auto-resumes from. Without this distinction
+       * every restart looks like the agent crashed.
+       */
+      terminalReason?: string;
     }
   | {
       kind: "thinking";
@@ -224,6 +232,14 @@ export function eventsToItemsImpl(
         const assistantId = event.event_id ?? `event-${event.id}`;
         if (seenEventIds.has(assistantId)) break;
         seenEventIds.add(assistantId);
+        const ce =
+          (meta.completion_evidence as { terminal_reason?: unknown } | undefined) ?? undefined;
+        const terminalReason =
+          typeof ce?.terminal_reason === "string" ? ce.terminal_reason : undefined;
+        const resumable =
+          typeof (meta as { resumable?: unknown }).resumable === "boolean"
+            ? (meta as { resumable: boolean }).resumable
+            : undefined;
         items.push({
           kind: "assistant",
           id: assistantId,
@@ -233,6 +249,8 @@ export function eventsToItemsImpl(
           costSource,
           model: typeof meta.model === "string" ? meta.model : null,
           timestamp,
+          terminalReason,
+          resumable,
         });
         lastAssistantTimestamp = timestamp;
         break;

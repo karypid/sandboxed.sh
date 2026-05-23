@@ -20,6 +20,8 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use uuid::Uuid;
+
 use super::routes::AppState;
 use crate::util::home_dir;
 use crate::workspace::{Workspace, WorkspaceStatus, WorkspaceType};
@@ -308,6 +310,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/components/by-workspace", get(get_components_by_workspace))
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
+        .route("/deploy", post(deploy_sandboxed_sh))
 }
 
 /// Get information about all system components.
@@ -1419,6 +1422,365 @@ fn stream_sandboxed_update(
     }
 }
 
+/// Default debounce window between automated deploys. Agents loop fast;
+/// without this, three missions all firing `deploy_sandboxed_sh` produce
+/// three restarts in 90 seconds and kill every other in-flight turn.
+const DEPLOY_DEBOUNCE_SECS: u64 = 300;
+
+/// Marker file recording the wall-clock time of the last `/api/system/deploy`
+/// invocation. Stored under the API's state dir; mtime is the only field that
+/// matters. Persisted across restarts so the debounce survives the very
+/// restart it just scheduled.
+fn deploy_marker_path() -> std::path::PathBuf {
+    // Match the existing /var/lib/sandboxed-sh convention if present (prod),
+    // otherwise fall back to $HOME/.sandboxed-sh (dev / containers).
+    let varlib = std::path::Path::new("/var/lib/sandboxed-sh");
+    if varlib.exists() {
+        return varlib.join("last_deploy");
+    }
+    std::path::PathBuf::from(home_dir())
+        .join(".sandboxed-sh")
+        .join("last_deploy")
+}
+
+/// Result of evaluating the deploy debounce. Tested in isolation so we can
+/// trust the wall-clock math without touching the filesystem.
+#[derive(Debug, PartialEq, Eq)]
+enum DebounceDecision {
+    Allow,
+    /// Last deploy was `since_secs` ago, < `min_interval_secs`.
+    RefuseTooRecent {
+        since_secs: u64,
+    },
+}
+
+fn evaluate_debounce(
+    last_deploy_secs_ago: Option<u64>,
+    min_interval_secs: u64,
+    force: bool,
+) -> DebounceDecision {
+    if force {
+        return DebounceDecision::Allow;
+    }
+    match last_deploy_secs_ago {
+        Some(since) if since < min_interval_secs => {
+            DebounceDecision::RefuseTooRecent { since_secs: since }
+        }
+        _ => DebounceDecision::Allow,
+    }
+}
+
+/// Read `mtime` of the deploy marker, return seconds since it was written.
+/// `None` if the file doesn't exist or its mtime is in the future (clock skew).
+fn deploy_marker_age_secs(path: &std::path::Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    std::time::SystemTime::now()
+        .duration_since(mtime)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn touch_deploy_marker(path: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+    }
+    // Open with truncate to bump mtime; ignore any prior content.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| format!("touch {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeployRequest {
+    /// Mission ID of the caller. Used for self-protection: if this mission
+    /// is running on the same service we're about to restart, refuse unless
+    /// `force=true` (the agent explicitly accepts that its own turn dies).
+    #[serde(default)]
+    pub calling_mission_id: Option<Uuid>,
+    /// Bypass debounce + self-protection. Default false. Agents should only
+    /// set this when they've explicitly decided the restart is worth it
+    /// (e.g. emergency revert, the mission is about to finish anyway).
+    #[serde(default)]
+    pub force: bool,
+    /// Optional git ref to check out before building. Defaults to whatever
+    /// the local repo already has checked out (treat as "deploy current
+    /// source state").
+    #[serde(default)]
+    pub git_ref: Option<String>,
+    /// Skip the cargo build and assume `target/debug/<exe>` is already
+    /// up-to-date. Useful for CI flows that build elsewhere.
+    #[serde(default)]
+    pub skip_build: bool,
+}
+
+/// Reasons we may refuse a deploy without doing any I/O. Surfaced to the MCP
+/// tool so the agent can decide whether to retry with `force=true`.
+#[derive(Debug, PartialEq, Eq)]
+enum DeployRefusal {
+    /// Calling mission lives on this service; restarting it would kill the
+    /// caller. Returned as a refusal so an LLM can't accidentally request
+    /// self-destruction; the agent can retry with `force=true` if it knows
+    /// what it's doing.
+    SelfTarget,
+    /// Last deploy was too recent (see [`DEPLOY_DEBOUNCE_SECS`]).
+    Debounced { since_secs: u64 },
+}
+
+impl DeployRefusal {
+    fn http_status(&self) -> StatusCode {
+        match self {
+            DeployRefusal::SelfTarget => StatusCode::CONFLICT,
+            DeployRefusal::Debounced { .. } => StatusCode::TOO_MANY_REQUESTS,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            DeployRefusal::SelfTarget => {
+                "Calling mission runs on the service this deploy would restart. \
+                 Pass force=true if killing your own turn is acceptable, or run the deploy from a \
+                 different service (e.g. dev → prod)."
+                    .to_string()
+            }
+            DeployRefusal::Debounced { since_secs } => format!(
+                "Last deploy was {}s ago; this service is in debounce window ({}s). \
+                 Pass force=true to override.",
+                since_secs, DEPLOY_DEBOUNCE_SECS
+            ),
+        }
+    }
+}
+
+/// Pure helper exercised by tests. Returns the refusal that should fire (if
+/// any) given the inputs the handler computed from state + request.
+fn evaluate_deploy_request(
+    calling_mission_on_this_service: bool,
+    last_deploy_secs_ago: Option<u64>,
+    force: bool,
+) -> Option<DeployRefusal> {
+    if !force && calling_mission_on_this_service {
+        return Some(DeployRefusal::SelfTarget);
+    }
+    match evaluate_debounce(last_deploy_secs_ago, DEPLOY_DEBOUNCE_SECS, force) {
+        DebounceDecision::Allow => None,
+        DebounceDecision::RefuseTooRecent { since_secs } => {
+            Some(DeployRefusal::Debounced { since_secs })
+        }
+    }
+}
+
+/// Hot-swap-with-rails entry point invoked by the orchestrator MCP's
+/// `deploy_sandboxed_sh` tool.
+///
+/// Differences from `/components/sandboxed_sh/update`:
+///   - Self-protection: refuses to restart the very service hosting the
+///     caller unless `force=true`.
+///   - Debounce: refuses to restart twice within [`DEPLOY_DEBOUNCE_SECS`]
+///     unless `force=true`.
+///   - Detached restart: schedules the systemctl restart via a backgrounded
+///     `setsid`/`nohup` so the SSE response can flush before the process
+///     dies. (The existing update endpoint kills the SSE mid-stream.)
+///
+/// Self-protection is checked synchronously and returns 409 before any
+/// disk work happens, so a misfiring agent can't accidentally chainsaw
+/// the host by retrying in a loop.
+pub async fn deploy_sandboxed_sh(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DeployRequest>,
+) -> Result<Sse<UpdateStream>, (StatusCode, String)> {
+    // Synchronous safety checks BEFORE we open SSE. A 4xx here is easier for
+    // the MCP to surface than an early-error SSE event.
+    let calling_on_self = match req.calling_mission_id {
+        None => false,
+        Some(mid) => {
+            // The simplest "is this mission on my service?" check is "does
+            // this API instance's mission_store know about it?". A
+            // cross-service deployer (dev → prod) hits prod's API with a
+            // mission that lives on dev — prod's store won't have it, so
+            // self-protection won't fire. That's the correct outcome.
+            let store = state.control.get_mission_store().await;
+            store.get_mission(mid).await.ok().flatten().is_some()
+        }
+    };
+
+    let marker = deploy_marker_path();
+    let last_age = deploy_marker_age_secs(&marker);
+
+    if let Some(refusal) = evaluate_deploy_request(calling_on_self, last_age, req.force) {
+        return Err((refusal.http_status(), refusal.message()));
+    }
+
+    // Record the deploy intent BEFORE the actual work so a crash mid-build
+    // still counts as "recently attempted" for debounce purposes. The mtime
+    // is what matters; content is unused.
+    if let Err(e) = touch_deploy_marker(&marker) {
+        tracing::warn!(
+            "deploy: failed to touch debounce marker {}: {}",
+            marker.display(),
+            e
+        );
+    }
+
+    Ok(Sse::new(Box::pin(stream_deploy(state, req))))
+}
+
+/// The actual deploy stream — git checkout (optional), build (optional),
+/// versioned install, then a detached `systemctl restart`. Mirrors
+/// `stream_sandboxed_update` but skips the "stop service first" step so the
+/// SSE response can deliver the final "deployed" event before the new
+/// binary takes over.
+fn stream_deploy(
+    state: Arc<AppState>,
+    req: DeployRequest,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        yield sse("log", "Starting deploy with safety rails", Some(0));
+
+        let repo_path_str = resolve_sandboxed_repo_path(&state).await;
+        let repo_path = std::path::Path::new(&repo_path_str);
+
+        if let Err(err) = ensure_repo_present(repo_path).await {
+            yield sse("error", format!("Failed to prepare source repo: {}", err), None);
+            return;
+        }
+        yield sse("log", format!("Source repo: {}", repo_path.display()), Some(5));
+
+        if let Some(git_ref) = req.git_ref.as_deref() {
+            yield sse("log", format!("Fetching + checking out {}", git_ref), Some(10));
+            let fetch = Command::new("git")
+                .args(["fetch", "--tags", "origin"])
+                .current_dir(repo_path)
+                .output()
+                .await;
+            if let Ok(o) = fetch {
+                if !o.status.success() {
+                    yield sse("error", format!("git fetch failed: {}", String::from_utf8_lossy(&o.stderr)), None);
+                    return;
+                }
+            }
+            let checkout = Command::new("git")
+                .args(["checkout", git_ref])
+                .current_dir(repo_path)
+                .output()
+                .await;
+            match checkout {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    yield sse("error", format!("git checkout {} failed: {}", git_ref, String::from_utf8_lossy(&o.stderr)), None);
+                    return;
+                }
+                Err(e) => {
+                    yield sse("error", format!("git checkout {} error: {}", git_ref, e), None);
+                    return;
+                }
+            }
+        }
+
+        let current_exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                yield sse("error", format!("Failed to detect current binary path: {}", e), None);
+                return;
+            }
+        };
+        let exe_name = current_exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let service_name = format!("{}.service", exe_name);
+        let install_dest = current_exe.to_string_lossy().to_string();
+
+        if !req.skip_build {
+            yield sse("log", format!("Building {} (cargo build)", exe_name), Some(25));
+            let build_cmd = format!(
+                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin workspace-mcp --bin desktop-mcp",
+                exe_name
+            );
+            match Command::new("bash")
+                .args(["-c", &build_cmd])
+                .current_dir(repo_path)
+                .output()
+                .await
+            {
+                Ok(output) if output.status.success() => {
+                    yield sse("log", "Build complete", Some(60));
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let tail: Vec<&str> = stderr.lines().rev().take(15).collect();
+                    let summary = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+                    yield sse("error", format!("Build failed:\n{}", summary), None);
+                    return;
+                }
+                Err(e) => {
+                    yield sse("error", format!("cargo build error: {}", e), None);
+                    return;
+                }
+            }
+        } else {
+            yield sse("log", "skip_build=true; using existing target/debug binary", Some(60));
+        }
+
+        // Resolve commit sha for the "deployed" event so the agent has
+        // something concrete to confirm.
+        let sha = match Command::new("git")
+            .args(["rev-parse", "--short=12", "HEAD"])
+            .current_dir(repo_path)
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => "unknown".to_string(),
+        };
+
+        yield sse("log", format!("Installing {} (versioned, atomic symlink swap)", exe_name), Some(75));
+        if let Err(e) = install_versioned_binary(repo_path, &exe_name, &sha, &install_dest).await {
+            yield sse("error", format!("Install failed: {}", e), None);
+            return;
+        }
+        yield sse("log", "Binary installed and symlink retargeted", Some(90));
+
+        // Schedule the restart in a fully detached process so this SSE
+        // response can flush its final event before systemd SIGTERMs us.
+        // `setsid` + `nohup` + `&` puts the restart in a new session that
+        // outlives the API process, so the queued `systemctl restart` runs
+        // even after our PID exits.
+        let restart_cmd = format!(
+            "sleep 2 && systemctl restart {} >/dev/null 2>&1",
+            service_name
+        );
+        if let Err(e) = Command::new("setsid")
+            .args(["nohup", "bash", "-c", &restart_cmd])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            yield sse(
+                "error",
+                format!("Binary installed but failed to schedule restart: {}. Run `systemctl restart {}` manually.", e, service_name),
+                None,
+            );
+            return;
+        }
+
+        yield sse(
+            "deployed",
+            format!(
+                "Deployed commit {}; service {} will restart in ~2s",
+                sha, service_name
+            ),
+            Some(100),
+        );
+        // Give the client a beat to receive the final event before the
+        // restart tears down our TCP connection.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Install a new binary into a versioned dir and flip a symlink at
 /// `install_dest` to point at it. The version dir lives under
 /// `<install_dest_parent>/versions/<tag>/` so a single `ls` shows what's
@@ -2029,7 +2391,137 @@ fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::co
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_version_token, is_safe_repo_path, normalize_repo_path, select_repo_path};
+    use super::{
+        evaluate_debounce, evaluate_deploy_request, extract_version_token, is_safe_repo_path,
+        normalize_repo_path, select_repo_path, DebounceDecision, DeployRefusal,
+        DEPLOY_DEBOUNCE_SECS,
+    };
+
+    // ─── Deploy safety rails ────────────────────────────────────────────────
+
+    #[test]
+    fn debounce_allows_when_no_prior_deploy() {
+        assert_eq!(evaluate_debounce(None, 300, false), DebounceDecision::Allow);
+    }
+
+    #[test]
+    fn debounce_allows_when_outside_window() {
+        assert_eq!(
+            evaluate_debounce(Some(301), 300, false),
+            DebounceDecision::Allow
+        );
+        assert_eq!(
+            evaluate_debounce(Some(3_600), 300, false),
+            DebounceDecision::Allow
+        );
+    }
+
+    #[test]
+    fn debounce_refuses_when_inside_window() {
+        assert_eq!(
+            evaluate_debounce(Some(60), 300, false),
+            DebounceDecision::RefuseTooRecent { since_secs: 60 }
+        );
+        assert_eq!(
+            evaluate_debounce(Some(0), 300, false),
+            DebounceDecision::RefuseTooRecent { since_secs: 0 }
+        );
+    }
+
+    #[test]
+    fn debounce_force_overrides_window() {
+        assert_eq!(
+            evaluate_debounce(Some(0), 300, true),
+            DebounceDecision::Allow
+        );
+        assert_eq!(
+            evaluate_debounce(Some(60), 300, true),
+            DebounceDecision::Allow
+        );
+    }
+
+    #[test]
+    fn deploy_refuses_self_target_by_default() {
+        let r = evaluate_deploy_request(true, None, false);
+        assert_eq!(r, Some(DeployRefusal::SelfTarget));
+    }
+
+    #[test]
+    fn deploy_self_target_force_allows() {
+        // force=true bypasses self-protection (caller explicitly accepts
+        // the in-flight turn dying). Still respects debounce unless the
+        // debounce is also force-bypassed, which it is.
+        assert_eq!(evaluate_deploy_request(true, None, true), None);
+    }
+
+    #[test]
+    fn deploy_cross_service_no_self_protection() {
+        // calling_on_self=false → no self-target refusal, no debounce
+        // hit, no refusal at all.
+        assert_eq!(evaluate_deploy_request(false, None, false), None);
+        assert_eq!(evaluate_deploy_request(false, Some(10_000), false), None);
+    }
+
+    #[test]
+    fn deploy_debounce_kicks_in_after_self_protection_passes() {
+        // calling_on_self=false, but a deploy fired 30s ago — debounce
+        // should refuse even though the self check passed.
+        assert_eq!(
+            evaluate_deploy_request(false, Some(30), false),
+            Some(DeployRefusal::Debounced { since_secs: 30 })
+        );
+    }
+
+    #[test]
+    fn deploy_force_bypasses_both_self_and_debounce() {
+        assert_eq!(evaluate_deploy_request(true, Some(0), true), None);
+    }
+
+    #[test]
+    fn deploy_self_protection_checked_before_debounce() {
+        // When both refusals would fire, return the more semantically
+        // meaningful one (self-target) so the agent sees the actual reason
+        // instead of being told "wait a bit and retry" only to discover
+        // it'd kill itself.
+        let r = evaluate_deploy_request(true, Some(30), false);
+        assert_eq!(r, Some(DeployRefusal::SelfTarget));
+    }
+
+    #[test]
+    fn deploy_refusal_self_target_returns_409() {
+        assert_eq!(
+            DeployRefusal::SelfTarget.http_status(),
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn deploy_refusal_debounced_returns_429() {
+        assert_eq!(
+            DeployRefusal::Debounced { since_secs: 10 }.http_status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn deploy_refusal_messages_mention_force_override() {
+        // Both refusals should tell the caller how to override, otherwise
+        // an LLM with no context will retry the same request forever.
+        assert!(DeployRefusal::SelfTarget.message().contains("force=true"));
+        assert!(DeployRefusal::Debounced { since_secs: 5 }
+            .message()
+            .contains("force=true"));
+    }
+
+    #[test]
+    fn deploy_debounce_constant_at_least_one_minute() {
+        // Sanity: a value below 60s would render the safety useless given
+        // typical agent retry behavior. If you genuinely need to lower
+        // this, change the test deliberately.
+        assert!(DEPLOY_DEBOUNCE_SECS >= 60);
+    }
+
+    // ─── Pre-existing helpers ───────────────────────────────────────────────
 
     #[test]
     fn extract_version_token_basic_semver() {

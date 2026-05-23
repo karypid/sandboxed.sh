@@ -167,6 +167,133 @@ ssh -i ~/.ssh/cursor root@88.99.4.254 "systemctl restart sandboxed-sh"
 - Build on the server (has 8 cores) rather than transferring the binary
 - Install `sccache` for caching compiled dependencies across builds
 
+## Hot-Swapping via the MCP (preferred over raw systemctl)
+
+Missions should never call `systemctl restart sandboxed-sh-prod` directly.
+Each restart SIGTERMs every codex/claude session under the service, which
+auto-resumes from the backend but loses the in-flight turn's progress.
+Worse, an agent in a retry loop can chainsaw the host (the original
+incident: 5 deploys + 2 rollbacks in 90 minutes).
+
+The orchestrator MCP exposes a `deploy_sandboxed_sh` tool that hits the
+internal `/api/system/deploy` endpoint with the safety rails:
+
+- **Self-protection** — refuses by default if the calling mission lives on
+  the service being restarted. Override with `force=true` only if you
+  accept that your own turn will be SIGTERM'd.
+- **Debounce** — refuses if another deploy fired in the last 5 minutes.
+  Override with `force=true`.
+- **Atomic install** via versioned symlink swap + a detached
+  `setsid`/`nohup` restart so the response flushes before the service
+  dies.
+
+From inside an agent that has the orchestrator MCP, the call shape is:
+
+```jsonc
+{
+  "tool": "deploy_sandboxed_sh",
+  "arguments": {
+    "git_ref": "origin/master",   // optional; omit to use current checkout
+    "skip_build": false,          // optional; true if you built elsewhere
+    "force": false                // override safety rails
+  }
+}
+```
+
+Successful response:
+
+```jsonc
+{
+  "deployed": true,
+  "summary": "Deployed commit abc123def456; service sandboxed-sh-prod will restart in ~2s",
+  "logs": ["Building sandboxed-sh-prod ...", "Build complete", ...]
+}
+```
+
+A refusal (HTTP 409 self-target or 429 debounce) surfaces a message that
+explains the override knob, so an agent can decide whether to retry with
+`force=true` or back off.
+
+## Locking down the SSH backdoor
+
+Mission containers ship with an SSH private key (`SSH_PRIVATE_KEY_B64` in
+their env) whose public counterpart is in `/root/.ssh/authorized_keys` on
+the host. Agents have been using this to `ssh root@<host> "systemctl
+restart ..."`, which bypasses the MCP's safety rails. Restrict the key to
+the one command we actually want it to run.
+
+### Step 1 — identify the agent key
+
+```bash
+ssh -i ~/.ssh/cursor root@95.216.112.253 \
+  'cat /root/.ssh/authorized_keys'
+```
+
+The agent key is the one whose fingerprint matches the `SSH_PRIVATE_KEY_B64`
+baked into mission containers (it's a fixed key, not per-mission). Look
+for the entry that has *no* `command="..."` restriction and isn't your own
+`cursor` admin key.
+
+### Step 2 — restrict it
+
+Edit `/root/.ssh/authorized_keys` and prepend the agent key entry with the
+following options (one line, no leading whitespace):
+
+```
+command="/usr/local/bin/sandboxed-agent-ssh",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-pty <ssh-ed25519 ...>
+```
+
+The `command=` clause makes SSH **only** run that program, regardless of
+what the client requested. The remaining flags drop attack surface.
+
+### Step 3 — create the dispatcher
+
+`/usr/local/bin/sandboxed-agent-ssh` should be a small shell script that
+accepts a tightly-scoped set of "subcommands" (e.g. log tailing, mission
+status queries) and rejects everything else. **Deploy is intentionally
+NOT in this list** — agents must go through the MCP for that.
+
+A minimal version:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  "status:prod")
+    systemctl is-active sandboxed-sh-prod
+    ;;
+  "status:dev")
+    systemctl is-active sandboxed-sh-dev
+    ;;
+  "logs:prod:"*)
+    n="${SSH_ORIGINAL_COMMAND#logs:prod:}"
+    journalctl -u sandboxed-sh-prod --no-pager -n "${n:-100}"
+    ;;
+  *)
+    echo "agent-ssh: command refused: ${SSH_ORIGINAL_COMMAND:-<none>}" >&2
+    exit 126
+    ;;
+esac
+```
+
+Make it executable: `chmod +x /usr/local/bin/sandboxed-agent-ssh`.
+
+### Step 4 — verify
+
+From a mission container shell:
+
+```bash
+ssh -o StrictHostKeyChecking=no root@<host> "systemctl restart sandboxed-sh-prod"
+# expect: "agent-ssh: command refused: systemctl restart sandboxed-sh-prod"
+# expect: exit 126
+
+ssh -o StrictHostKeyChecking=no root@<host> "status:prod"
+# expect: "active"
+```
+
+After this lands, all deploys go through the MCP and the chainsaw incident
+can't recur.
+
 ## Mission Database
 
 Located at `~/.sandboxed-sh/missions/missions.db` on the server.

@@ -217,6 +217,19 @@ fn default_poll_interval() -> u64 {
     10
 }
 
+#[derive(Deserialize, Default)]
+struct DeploySandboxedShParams {
+    /// Bypass self-protection + debounce safety rails.
+    #[serde(default)]
+    force: bool,
+    /// Optional git ref to check out before building.
+    #[serde(default)]
+    git_ref: Option<String>,
+    /// Skip cargo build (binary assumed current at target/debug/<exe>).
+    #[serde(default)]
+    skip_build: bool,
+}
+
 // =============================================================================
 // JWT helpers (lightweight – mirrors auth.rs Claims)
 // =============================================================================
@@ -608,6 +621,41 @@ impl OrchestratorMcp {
                         "poll_interval_seconds": {
                             "type": "integer",
                             "description": "Seconds between status checks (default: 10)"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "deploy_sandboxed_sh".to_string(),
+                description:
+                    "Build and hot-swap the sandboxed.sh binary on the host this mission's API \
+                     runs on, with safety rails:\n\
+                     • Self-protection: refuses by default if your own mission lives on the \
+                       service being restarted (passing force=true acknowledges that your turn \
+                       will be SIGTERM'd).\n\
+                     • Debounce: refuses if another deploy fired in the last few minutes \
+                       (force=true overrides).\n\
+                     • Atomic install via versioned symlink + detached restart so the SSE \
+                       response flushes before the service dies.\n\
+                     Replaces calling `systemctl restart` directly from a shell. Returns the \
+                     deployed commit sha on success."
+                        .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "force": {
+                            "type": "boolean",
+                            "description": "Bypass self-protection AND debounce. Only set this when you've explicitly decided the restart is worth killing your own turn / breaking the cooldown.",
+                            "default": false
+                        },
+                        "git_ref": {
+                            "type": "string",
+                            "description": "Optional git ref (tag/branch/sha) to check out before building. Omit to deploy whatever the local repo currently has checked out."
+                        },
+                        "skip_build": {
+                            "type": "boolean",
+                            "description": "Skip the cargo build step and assume target/debug/<binary> is already current. Useful when the build was done elsewhere.",
+                            "default": false
                         }
                     }
                 }),
@@ -1315,6 +1363,87 @@ impl OrchestratorMcp {
         }
     }
 
+    /// Hot-swap the sandboxed.sh binary by hitting the API's
+    /// `/api/system/deploy` endpoint. The endpoint enforces self-protection
+    /// (refuses to kill the caller) and debounce, so the LLM can't
+    /// accidentally chainsaw the host by retrying in a loop.
+    ///
+    /// We propagate `mission_id` so the server-side self-protection check
+    /// can find the calling mission in its store. The SSE stream is
+    /// consumed eagerly until we see a `deployed` event or the stream
+    /// closes (the new binary takes over and our connection drops).
+    async fn deploy_sandboxed_sh(&self, params: DeploySandboxedShParams) -> Result<Value, String> {
+        let body = json!({
+            "calling_mission_id": self.mission_id,
+            "force": params.force,
+            "git_ref": params.git_ref,
+            "skip_build": params.skip_build,
+        });
+
+        let response = self.api_post("/api/system/deploy", body).await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Deploy refused (HTTP {}): {}",
+                status.as_u16(),
+                text
+            ));
+        }
+
+        // Stream SSE until "deployed" or EOF. We deliberately don't fail
+        // on EOF-after-deployed: the service restart we asked for is
+        // *expected* to kill our connection.
+        use futures::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut buf = String::new();
+        let mut logs: Vec<String> = Vec::new();
+        let mut deployed_message: Option<String> = None;
+        let mut error_message: Option<String> = None;
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| format!("SSE stream error: {}", e))?;
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(idx) = buf.find("\n\n") {
+                let event_block = buf[..idx].to_string();
+                buf.drain(..=idx + 1);
+                for line in event_block.lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if let Ok(v) = serde_json::from_str::<Value>(data) {
+                            let kind = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("");
+                            let msg = v
+                                .get("message")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            match kind {
+                                "deployed" => {
+                                    deployed_message = Some(msg);
+                                }
+                                "error" => {
+                                    error_message = Some(msg);
+                                }
+                                _ => {
+                                    logs.push(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = error_message {
+            return Err(format!("Deploy failed: {}", err));
+        }
+        Ok(json!({
+            "deployed": deployed_message.is_some(),
+            "summary": deployed_message,
+            "logs": logs,
+            "hint": "If the API connection dropped right after 'deployed', that's the expected restart firing.",
+        }))
+    }
+
     async fn handle_call(&self, method: &str, params: Value) -> Result<Value, String> {
         match method {
             "get_workspace_layout" => Ok(self.get_workspace_layout()),
@@ -1379,6 +1508,11 @@ impl OrchestratorMcp {
                 let params: WaitForAnyWorkerParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.wait_for_any_worker(params).await
+            }
+            "deploy_sandboxed_sh" => {
+                let params: DeploySandboxedShParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.deploy_sandboxed_sh(params).await
             }
             _ => Err(format!("Unknown method: {}", method)),
         }

@@ -28,6 +28,7 @@ import {
 } from "@/components/enhanced-input";
 import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
 import { PerfOverlay } from "@/components/perf-overlay";
+import { deriveAssistantTurnStatus } from "@/lib/assistant-turn-status";
 import { perfBus } from "@/lib/perf-bus";
 import { isStreamContinuation } from "@/lib/stream-continuation";
 import {
@@ -822,6 +823,7 @@ function formatTime(timestamp: number): string {
   const date = new Date(timestamp);
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
+
 
 function statusLabel(state: ControlRunState): {
   label: string;
@@ -3306,7 +3308,11 @@ const ChatItemRow = memo(function ChatItemRow({
   }
 
   if (item.kind === "assistant") {
-    const MessageStatusIcon = item.success ? CheckCircle : XCircle;
+    const turnStatus = deriveAssistantTurnStatus(item);
+    // ServerShutdown turns auto-resume — render with the check icon so the
+    // visual weight matches "this is being handled", not "agent died".
+    const MessageStatusIcon =
+      item.success || item.terminalReason === "ServerShutdown" ? CheckCircle : XCircle;
     const displayModel = item.model
       ? item.model.includes("/")
         ? item.model.split("/").pop()
@@ -3327,18 +3333,9 @@ const ChatItemRow = memo(function ChatItemRow({
         <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
           <div className="mb-2 flex items-center gap-2 text-xs text-white/40">
             <MessageStatusIcon
-              className={cn(
-                "h-3 w-3",
-                item.success ? "text-emerald-400" : "text-red-400",
-              )}
+              className={cn("h-3 w-3", turnStatus.iconClass)}
             />
-            <span>
-              {item.success
-                ? item.goalIteration && item.goalIteration > 0
-                  ? `Iteration ${item.goalIteration}`
-                  : "Turn complete"
-                : "Failed"}
-            </span>
+            <span>{turnStatus.label}</span>
             {displayModel && (
               <>
                 <span>•</span>
@@ -3395,7 +3392,7 @@ const ChatItemRow = memo(function ChatItemRow({
               ))}
             </div>
           )}
-          {!item.success && item.resumable && (
+          {turnStatus.showResume && item.resumable && (
             <div className="mt-3 flex gap-2">
               <button
                 onClick={onResume}
