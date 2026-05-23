@@ -10,6 +10,8 @@ import {
   RotateCcw,
   AlertTriangle,
   MessageSquarePlus,
+  ChevronRight,
+  ChevronDown,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { searchMissions, type Mission, type RunningMissionInfo } from '@/lib/api';
@@ -632,6 +634,10 @@ export function MissionSwitcher({
     null
   );
   const [serverSearchLoading, setServerSearchLoading] = useState(false);
+  // Boss missions whose grouped worker rows are currently expanded. Default
+  // empty (everything collapsed) so a boss with many workers doesn't take
+  // over the list. The chevron at the left of each boss row toggles this.
+  const [expandedBossIds, setExpandedBossIds] = useState<Set<string>>(() => new Set());
   const searchScoreCacheRef = useRef<Map<string, number>>(new Map());
   const latestSearchRequestIdRef = useRef(0);
   const normalizedSearchQuery = useMemo(
@@ -780,6 +786,41 @@ export function MissionSwitcher({
     return items;
   }, [currentMissionId, runningMissions, runningMissionIds, recentMissions, bossMissionWorkerIds, missionById]);
 
+  // Bosses that have at least one worker row grouped under them in this
+  // session's items list. These are the rows that get a chevron toggle.
+  // Computed from the unfiltered `allItems` so the chevron stays visible
+  // even while the workers are collapsed out of view.
+  const bossesWithGroupedWorkers = useMemo(() => {
+    const set = new Set<string>();
+    for (const item of allItems) {
+      if (item.isWorkerOf) set.add(item.isWorkerOf);
+    }
+    return set;
+  }, [allItems]);
+
+  // Worker-count by boss id (only counting workers actually grouped in this
+  // items list), used for the "· N workers" pill on collapsed boss rows.
+  const workerCountByBossId = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const item of allItems) {
+      if (item.isWorkerOf) {
+        counts.set(item.isWorkerOf, (counts.get(item.isWorkerOf) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }, [allItems]);
+
+  // Apply collapse visibility: hide workers when their boss is collapsed.
+  // During an active search, every match is shown regardless of expansion —
+  // hiding match-relevant workers would silently lie about what's there.
+  const visibleItems = useMemo(() => {
+    if (normalizedSearchQuery) return allItems;
+    return allItems.filter((item) => {
+      if (!item.isWorkerOf) return true;
+      return expandedBossIds.has(item.isWorkerOf);
+    });
+  }, [allItems, expandedBossIds, normalizedSearchQuery]);
+
   useEffect(() => {
     if (!open) return;
     if (!normalizedSearchQuery) {
@@ -818,10 +859,10 @@ export function MissionSwitcher({
 
   // Filter items by search query
   const filteredItems = useMemo(() => {
-    if (!normalizedSearchQuery) return allItems;
+    if (!normalizedSearchQuery) return visibleItems;
 
     const cache = searchScoreCacheRef.current;
-    const scored = allItems.flatMap((item) => {
+    const scored = visibleItems.flatMap((item) => {
       if (!item.mission) {
         if (!item.runningInfo) {
           return [];
@@ -848,7 +889,7 @@ export function MissionSwitcher({
       return bUpdatedAt.localeCompare(aUpdatedAt);
     });
     return scored.map(({ item }) => item);
-  }, [allItems, normalizedSearchQuery, workspaceNameById, serverScoreByMissionId]);
+  }, [visibleItems, normalizedSearchQuery, workspaceNameById, serverScoreByMissionId]);
 
   const renderedRows = useMemo<MissionSwitcherRow[]>(() => {
     const rows: MissionSwitcherRow[] = [];
@@ -885,6 +926,34 @@ export function MissionSwitcher({
     estimateSize: (index) => (renderedRows[index]?.kind === 'section' ? 34 : 72),
     overscan: 8,
   });
+
+  // Bosses whose worker rows are visually present right now. When the user
+  // hasn't searched, this is just the explicitly-expanded set. During search
+  // we treat any boss with at least one matching worker as expanded so the
+  // chevron stays in sync with what the list actually shows.
+  const bossesShowingWorkers = useMemo(() => {
+    const set = new Set<string>();
+    if (normalizedSearchQuery) {
+      for (const item of filteredItems) {
+        if (item.isWorkerOf) set.add(item.isWorkerOf);
+      }
+      return set;
+    }
+    for (const id of expandedBossIds) set.add(id);
+    return set;
+  }, [filteredItems, expandedBossIds, normalizedSearchQuery]);
+
+  const toggleBossExpansion = useCallback((bossId: string) => {
+    setExpandedBossIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(bossId)) {
+        next.delete(bossId);
+      } else {
+        next.add(bossId);
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     searchScoreCacheRef.current.clear();
@@ -923,13 +992,30 @@ export function MissionSwitcher({
     setSelectedIndex(0);
   }, [searchQuery]);
 
-  // Keep selected index in bounds when async rescoring changes list size.
+  // Track the mission id currently under the cursor so that expansion changes
+  // (or async rescoring) can move the selectedIndex to follow the SAME item
+  // rather than blindly clamping to length-1 and landing on whatever row
+  // happens to be at the old index.
+  const selectedItemIdRef = useRef<string | null>(null);
   useEffect(() => {
-    setSelectedIndex((prev) => {
-      if (filteredItems.length <= 0) return 0;
-      return Math.min(prev, filteredItems.length - 1);
-    });
-  }, [filteredItems.length]);
+    selectedItemIdRef.current = filteredItems[selectedIndex]?.id ?? null;
+  }, [filteredItems, selectedIndex]);
+
+  useEffect(() => {
+    if (filteredItems.length <= 0) {
+      setSelectedIndex(0);
+      return;
+    }
+    const targetId = selectedItemIdRef.current;
+    if (targetId) {
+      const idx = filteredItems.findIndex((item) => item.id === targetId);
+      if (idx >= 0) {
+        setSelectedIndex(idx);
+        return;
+      }
+    }
+    setSelectedIndex((prev) => Math.min(prev, filteredItems.length - 1));
+  }, [filteredItems]);
 
   // Handle keyboard navigation
   useEffect(() => {
@@ -962,6 +1048,40 @@ export function MissionSwitcher({
           e.preventDefault();
           setSelectedIndex((prev) => Math.max(prev - 1, 0));
           break;
+        case 'ArrowRight': {
+          // Skip tree expansion when the user is editing search text — the
+          // arrow key needs to move the input cursor instead.
+          if (searchQuery) return;
+          const selected = filteredItems[selectedIndex];
+          if (!selected) return;
+          if (selected.isBoss && bossesWithGroupedWorkers.has(selected.id) && !expandedBossIds.has(selected.id)) {
+            e.preventDefault();
+            toggleBossExpansion(selected.id);
+          }
+          break;
+        }
+        case 'ArrowLeft': {
+          if (searchQuery) return;
+          const selected = filteredItems[selectedIndex];
+          if (!selected) return;
+          if (selected.isBoss && expandedBossIds.has(selected.id)) {
+            e.preventDefault();
+            toggleBossExpansion(selected.id);
+          } else if (selected.isWorkerOf) {
+            // Collapse parent and jump selection back to the boss row, the
+            // standard tree-view behavior when ← is pressed on a leaf.
+            const bossId = selected.isWorkerOf;
+            e.preventDefault();
+            setExpandedBossIds((prev) => {
+              if (!prev.has(bossId)) return prev;
+              const next = new Set(prev);
+              next.delete(bossId);
+              return next;
+            });
+            selectedItemIdRef.current = bossId;
+          }
+          break;
+        }
         case 'Enter':
           e.preventDefault();
           if (filteredItems[selectedIndex]) {
@@ -973,7 +1093,18 @@ export function MissionSwitcher({
 
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [open, onClose, filteredItems, selectedIndex, handleSelect, loadingMissionId]);
+  }, [
+    open,
+    onClose,
+    filteredItems,
+    selectedIndex,
+    handleSelect,
+    loadingMissionId,
+    searchQuery,
+    bossesWithGroupedWorkers,
+    expandedBossIds,
+    toggleBossExpansion,
+  ]);
 
   // Scroll selected item into view — only when the user actually navigates
   // (selectedIndex change) or types a new query (searchQuery change). We
@@ -1100,6 +1231,10 @@ export function MissionSwitcher({
                   ? getMissionCardDescription(mission, cardTitle)
                   : null;
                 const hasProgress = runningInfo && runningInfo.subtask_total > 0;
+                const hasGroupedWorkers =
+                  Boolean(item.isBoss) && bossesWithGroupedWorkers.has(item.id);
+                const isBossExpanded = bossesShowingWorkers.has(item.id);
+                const workerCount = workerCountByBossId.get(item.id) ?? 0;
 
                 return (
                   <div
@@ -1126,6 +1261,30 @@ export function MissionSwitcher({
                         loadingMissionId && !isLoading && 'opacity-50 pointer-events-none'
                       )}
                     >
+                      {/* Chevron toggle for boss rows that have grouped workers.
+                          Auto-shows as expanded during search (the workers are
+                          visible regardless of expandedBossIds), but only the
+                          explicit set drives clicks. */}
+                      {hasGroupedWorkers ? (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            toggleBossExpansion(item.id);
+                          }}
+                          aria-label={isBossExpanded ? 'Collapse workers' : 'Expand workers'}
+                          aria-expanded={isBossExpanded}
+                          className="-ml-0.5 p-0.5 rounded text-white/40 hover:text-white/80 hover:bg-white/[0.06] transition-colors shrink-0"
+                        >
+                          {isBossExpanded ? (
+                            <ChevronDown className="h-4 w-4" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4" />
+                          )}
+                        </button>
+                      ) : null}
+
                       {/* Status dot or loading spinner */}
                       {isLoading ? (
                         <Loader2 className="h-4 w-4 text-indigo-400 animate-spin shrink-0" />
@@ -1167,6 +1326,14 @@ export function MissionSwitcher({
                           {item.isBoss && (
                             <span className="inline-flex items-center rounded bg-violet-500/10 border border-violet-500/20 px-1 py-0.5 text-[8px] font-medium text-violet-400 shrink-0">
                               Boss
+                            </span>
+                          )}
+                          {hasGroupedWorkers && !isBossExpanded && workerCount > 0 && (
+                            <span
+                              className="inline-flex items-center rounded bg-white/[0.04] px-1 py-0.5 text-[9px] tabular-nums text-white/40 shrink-0"
+                              title={`${workerCount} hidden worker${workerCount === 1 ? '' : 's'}`}
+                            >
+                              · {workerCount}
                             </span>
                           )}
                           {isWorkerItem && (
