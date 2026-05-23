@@ -554,12 +554,48 @@ export type StreamControlOptions = {
   preferWebSocket?: boolean;
 };
 
+/**
+ * Belt-and-suspenders client-side guard against cross-mission stream
+ * contamination. The server is supposed to filter per `?mission=<id>` but
+ * has at least one documented "first-event race" fallback path that reads
+ * from a global broadcast and filters in-process — and the initial Status
+ * event sent on connect carries the *global* orchestrator mission_id, not
+ * the connection's filter. If anything content-bearing slips through, this
+ * applies mission B's text/thoughts to mission A's tab.
+ *
+ * We only drop content-bearing events. Orchestrator-wide events
+ * (status, fido_sign_request, stream_lagged) the server intentionally
+ * fans out to every connection regardless of mission filter, so the UI
+ * can show "another mission is now running" / global prompts — those
+ * must pass through.
+ */
+const ORCHESTRATOR_WIDE_EVENT_TYPES = new Set([
+  "status",
+  "fido_sign_request",
+  "stream_lagged",
+]);
+
+function shouldDropForMission(
+  data: unknown,
+  expectedMissionId: string | undefined,
+  eventType: string,
+): boolean {
+  if (!expectedMissionId) return false;
+  if (ORCHESTRATOR_WIDE_EVENT_TYPES.has(eventType)) return false;
+  if (!data || typeof data !== "object") return false;
+  const evMissionId = (data as { mission_id?: unknown }).mission_id;
+  if (evMissionId === undefined || evMissionId === null) return false;
+  if (typeof evMissionId !== "string") return false;
+  return evMissionId !== expectedMissionId;
+}
+
 export function streamControl(
   onEvent: (event: { type: string; data: unknown }) => void,
   onDiagnostics?: (update: StreamDiagnosticUpdate) => void,
   options?: StreamControlOptions,
 ): () => void {
   const controller = new AbortController();
+  let droppedCrossMission = 0;
   const decoder = new TextDecoder();
   let buffer = "";
   let bytesRead = 0;
@@ -681,7 +717,20 @@ export function streamControl(
 
             if (!data) continue;
             try {
-              onEvent({ type: eventType, data: JSON.parse(data) });
+              const parsed = JSON.parse(data);
+              if (shouldDropForMission(parsed, options?.missionId, eventType)) {
+                droppedCrossMission++;
+                if (
+                  droppedCrossMission === 1 ||
+                  droppedCrossMission % 25 === 0
+                ) {
+                  console.warn(
+                    `[streamControl] dropped cross-mission SSE event (count=${droppedCrossMission}, expected=${options?.missionId}, type=${eventType})`,
+                  );
+                }
+                continue;
+              }
+              onEvent({ type: eventType, data: parsed });
               onDiagnostics?.({
                 phase: "event",
                 url: streamUrl,
@@ -773,6 +822,18 @@ export function streamControl(
             data && typeof data === "object" && typeof data.type === "string"
               ? data.type
               : "message";
+          if (shouldDropForMission(data, options?.missionId, type)) {
+            droppedCrossMission++;
+            if (
+              droppedCrossMission === 1 ||
+              droppedCrossMission % 25 === 0
+            ) {
+              console.warn(
+                `[streamControl] dropped cross-mission WS event (count=${droppedCrossMission}, expected=${options?.missionId}, type=${type})`,
+              );
+            }
+            return;
+          }
           onEvent({ type, data });
           onDiagnostics?.({
             phase: "event",
