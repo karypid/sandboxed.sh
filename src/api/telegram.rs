@@ -86,6 +86,8 @@ const PALOMA_SCHEDULER_JOB_LEASE_SECONDS: i64 = 300;
 const PALOMA_LONG_RUNNING_MINUTES: i64 = 30;
 const PALOMA_USER_MESSAGE_QUIET_MINUTES: i64 = 30;
 const PALOMA_LONG_RUNNING_ALERT_BUCKET_MINUTES: i64 = 30;
+const PALOMA_OWNER_INTERACTION_DIGEST_QUIET_MINUTES: i64 = 10;
+const PALOMA_DIGEST_COOLDOWN_MINUTES: i64 = 10;
 const PALOMA_ALERT_DIGEST_LIMIT: usize = 12;
 const PALOMA_SESSION_QUEUE_MAX_PER_KEY: usize = 256;
 const DEFAULT_PALOMA_OWNER_TELEGRAM_ID: i64 = 1_139_694_048;
@@ -802,7 +804,10 @@ async fn apply_paloma_interest_feedback(
     ctx.mission_store
         .upsert_telegram_mission_subscription(subscription)
         .await?;
-    if level == TelegramMissionInterestLevel::Muted {
+    if matches!(
+        level,
+        TelegramMissionInterestLevel::Muted | TelegramMissionInterestLevel::High
+    ) {
         let _ = ctx
             .mission_store
             .acknowledge_pending_telegram_alerts_for_mission(
@@ -811,6 +816,13 @@ async fn apply_paloma_interest_feedback(
                 &now,
             )
             .await;
+    }
+    if matches!(
+        level,
+        TelegramMissionInterestLevel::Muted
+            | TelegramMissionInterestLevel::High
+            | TelegramMissionInterestLevel::Normal
+    ) {
         let _ = ctx
             .mission_store
             .update_telegram_user_last_alert_ack_at(user.telegram_user_id, &now)
@@ -839,7 +851,7 @@ async fn apply_paloma_interest_feedback(
         }
         TelegramMissionInterestLevel::High => {
             format!(
-                "Noted. I will prioritize updates for {}.",
+                "Marked {} high interest. I will still batch updates and respect quiet windows.",
                 mission_label(&mission)
             )
         }
@@ -889,6 +901,10 @@ async fn apply_paloma_failure_only_feedback(
     let _ = ctx
         .mission_store
         .acknowledge_pending_telegram_alerts_for_mission(user.telegram_user_id, mission.id, &now)
+        .await;
+    let _ = ctx
+        .mission_store
+        .update_telegram_user_last_alert_ack_at(user.telegram_user_id, &now)
         .await;
     Ok(redact_for_telegram(&format!(
         "Noted. I will only alert you if {} fails.",
@@ -974,6 +990,44 @@ fn paloma_mission_has_failure_only_preference(
     mission_id: Uuid,
 ) -> bool {
     planner::mission_has_failure_only_preference(preferences, mission_id)
+}
+
+fn paloma_timestamp_is_recent(
+    value: Option<&str>,
+    now: chrono::DateTime<Utc>,
+    minutes: i64,
+) -> bool {
+    value
+        .and_then(planner::parse_event_time)
+        .map(|timestamp| now - timestamp < ChronoDuration::minutes(minutes))
+        .unwrap_or(false)
+}
+
+async fn paloma_digest_suppression_reason_for_user(
+    ctx: &ChannelContext,
+    owner_id: i64,
+    now: chrono::DateTime<Utc>,
+) -> Option<&'static str> {
+    let cursor = ctx
+        .mission_store
+        .get_or_create_telegram_user_cursor(owner_id)
+        .await
+        .ok()?;
+    if paloma_timestamp_is_recent(
+        cursor.last_alert_ack_at.as_deref(),
+        now,
+        PALOMA_OWNER_INTERACTION_DIGEST_QUIET_MINUTES,
+    ) {
+        return Some("recent_owner_feedback");
+    }
+    if paloma_timestamp_is_recent(
+        cursor.last_digest_at.as_deref(),
+        now,
+        PALOMA_DIGEST_COOLDOWN_MINUTES,
+    ) {
+        return Some("recent_digest");
+    }
+    None
 }
 
 fn paloma_policy_snapshot_json(
@@ -1329,6 +1383,34 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
     if pending.is_empty() {
         return;
     }
+    let digest_checked_at = Utc::now();
+    if let Some(reason) =
+        paloma_digest_suppression_reason_for_user(ctx, owner_id, digest_checked_at).await
+    {
+        if let Some(first_alert) = pending.first() {
+            let snapshot = serde_json::json!({
+                "pending_alerts": pending.len(),
+                "digest_limit": PALOMA_ALERT_DIGEST_LIMIT,
+                "suppression_reason": reason,
+            })
+            .to_string();
+            let decision = decision_log::new_decision(
+                "scheduler",
+                first_alert.mission_id,
+                Some(owner_id),
+                "telegram",
+                "digest_suppressed",
+                "send_digest",
+                false,
+                Some(reason),
+                &snapshot,
+                None,
+                now_string(),
+            );
+            let _ = ctx.mission_store.create_paloma_decision(decision).await;
+        }
+        return;
+    }
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     let text = paloma_alert_digest_text(&pending);
     let digest_snapshot = serde_json::json!({
@@ -1481,6 +1563,35 @@ async fn flush_pending_paloma_digest(
         pending = eligible_pending;
     }
     if pending.is_empty() {
+        return Ok(0);
+    }
+    let digest_checked_at = Utc::now();
+    if let Some(reason) =
+        paloma_digest_suppression_reason_for_user(ctx, owner_id, digest_checked_at).await
+    {
+        if let Some(first_alert) = pending.first() {
+            let snapshot = serde_json::json!({
+                "pending_alerts": pending.len(),
+                "digest_limit": PALOMA_ALERT_DIGEST_LIMIT,
+                "source": "paloma_digest_flush",
+                "suppression_reason": reason,
+            })
+            .to_string();
+            let decision = decision_log::new_decision(
+                "scheduler",
+                first_alert.mission_id,
+                Some(owner_id),
+                "telegram",
+                "digest_suppressed",
+                "send_digest",
+                false,
+                Some(reason),
+                &snapshot,
+                None,
+                now_string(),
+            );
+            let _ = ctx.mission_store.create_paloma_decision(decision).await;
+        }
         return Ok(0);
     }
 
@@ -5997,7 +6108,7 @@ mod tests {
         paloma_command_error_response, paloma_mission_has_failure_only_preference,
         paloma_role_for_user, paloma_shared_summary_body,
         paloma_should_alert_long_running_mission_at, paloma_should_alert_mission_at,
-        paloma_status_event_is_new, paloma_status_seen_sequences,
+        paloma_status_event_is_new, paloma_status_seen_sequences, paloma_timestamp_is_recent,
         parse_paloma_selector_and_payload, redact_for_telegram, render_telegram_chunk,
         sanitize_telegram_visible_text, scope_for_extracted_memory,
         select_latest_awaiting_user_mission, should_silence_paloma_shared_command,
@@ -6790,6 +6901,24 @@ mod tests {
             TelegramMissionInterestLevel::Normal,
             now
         ));
+        let recent_user_message = vec![StoredEvent {
+            id: 1,
+            mission_id: awaiting.id,
+            sequence: 1,
+            event_type: "user_message".to_string(),
+            timestamp: "2026-05-20T00:45:00Z".to_string(),
+            event_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            content: "continue".to_string(),
+            metadata: serde_json::json!({}),
+        }];
+        assert!(!paloma_should_alert_mission_at(
+            &awaiting,
+            &recent_user_message,
+            TelegramMissionInterestLevel::Normal,
+            now
+        ));
 
         let mut completed = test_mission("Done", MissionStatus::Completed);
         completed.created_at = "2026-05-20T00:00:00Z".to_string();
@@ -6814,6 +6943,12 @@ mod tests {
             TelegramMissionInterestLevel::High,
             now
         ));
+        assert!(!paloma_should_alert_mission_at(
+            &short_completed,
+            &recent_user_message,
+            TelegramMissionInterestLevel::High,
+            now
+        ));
 
         let mut failed = test_mission("Failed deploy", MissionStatus::Failed);
         failed.created_at = "2026-05-20T00:00:00Z".to_string();
@@ -6823,6 +6958,30 @@ mod tests {
             TelegramMissionInterestLevel::Normal,
             now
         ));
+        assert!(paloma_should_alert_mission_at(
+            &failed,
+            &recent_user_message,
+            TelegramMissionInterestLevel::Normal,
+            now
+        ));
+    }
+
+    #[test]
+    fn paloma_recent_timestamp_helper_handles_digest_cooldowns() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 20, 1, 0, 0).unwrap();
+
+        assert!(paloma_timestamp_is_recent(
+            Some("2026-05-20T00:55:00Z"),
+            now,
+            10
+        ));
+        assert!(!paloma_timestamp_is_recent(
+            Some("2026-05-20T00:45:00Z"),
+            now,
+            10
+        ));
+        assert!(!paloma_timestamp_is_recent(Some("not a date"), now, 10));
+        assert!(!paloma_timestamp_is_recent(None, now, 10));
     }
 
     #[test]

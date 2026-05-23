@@ -61,6 +61,27 @@ pub fn evaluate_alert_policy(input: &PalomaPolicyInput) -> PalomaPolicyDecision 
             priority: "low",
         };
     }
+    let recently_messaged = input
+        .last_user_message_at
+        .map(|last| input.now - last < input.quiet_after_user_message)
+        .unwrap_or(false);
+    if recently_messaged
+        && matches!(
+            input.status,
+            MissionStatus::Active
+                | MissionStatus::AwaitingUser
+                | MissionStatus::Completed
+                | MissionStatus::Interrupted
+                | MissionStatus::NotFeasible
+        )
+    {
+        return PalomaPolicyDecision {
+            allowed: false,
+            reason_code: PalomaReasonCode::QuietWindow,
+            suppression_reason: Some("recent_user_message"),
+            priority: "normal",
+        };
+    }
 
     match input.status {
         MissionStatus::AwaitingUser => PalomaPolicyDecision {
@@ -83,18 +104,6 @@ pub fn evaluate_alert_policy(input: &PalomaPolicyInput) -> PalomaPolicyDecision 
                     allowed: false,
                     reason_code: PalomaReasonCode::NotActionable,
                     suppression_reason: Some("below_long_running_threshold"),
-                    priority: "normal",
-                };
-            }
-            if input
-                .last_user_message_at
-                .map(|last| input.now - last < input.quiet_after_user_message)
-                .unwrap_or(false)
-            {
-                return PalomaPolicyDecision {
-                    allowed: false,
-                    reason_code: PalomaReasonCode::QuietWindow,
-                    suppression_reason: Some("recent_user_message"),
                     priority: "normal",
                 };
             }
@@ -188,12 +197,23 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_user_alerts_by_default() {
+    fn awaiting_user_alerts_by_default_after_quiet_window() {
         let decision = evaluate_alert_policy(&input_for(MissionStatus::AwaitingUser));
 
         assert!(decision.allowed);
         assert_eq!(decision.reason_code, PalomaReasonCode::AwaitingUser);
         assert_eq!(decision.priority, "high");
+
+        let mut recently_messaged = input_for(MissionStatus::AwaitingUser);
+        recently_messaged.last_user_message_at =
+            Some(Utc.with_ymd_and_hms(2026, 5, 20, 0, 45, 0).unwrap());
+        let quiet_decision = evaluate_alert_policy(&recently_messaged);
+        assert!(!quiet_decision.allowed);
+        assert_eq!(quiet_decision.reason_code, PalomaReasonCode::QuietWindow);
+        assert_eq!(
+            quiet_decision.suppression_reason,
+            Some("recent_user_message")
+        );
     }
 
     #[test]
@@ -259,6 +279,23 @@ mod tests {
             missing_started_at_decision.suppression_reason,
             Some("terminal_not_long_running_or_high_interest")
         );
+
+        let mut recently_messaged_completed = input_for(MissionStatus::Completed);
+        recently_messaged_completed.interest = TelegramMissionInterestLevel::High;
+        recently_messaged_completed.last_user_message_at =
+            Some(Utc.with_ymd_and_hms(2026, 5, 20, 0, 45, 0).unwrap());
+        let recent_completed_decision = evaluate_alert_policy(&recently_messaged_completed);
+        assert!(!recent_completed_decision.allowed);
+        assert_eq!(
+            recent_completed_decision.suppression_reason,
+            Some("recent_user_message")
+        );
+
+        let mut recently_messaged_failed = input_for(MissionStatus::Failed);
+        recently_messaged_failed.last_user_message_at =
+            Some(Utc.with_ymd_and_hms(2026, 5, 20, 0, 45, 0).unwrap());
+        let recent_failed_decision = evaluate_alert_policy(&recently_messaged_failed);
+        assert!(recent_failed_decision.allowed);
     }
 
     #[test]
