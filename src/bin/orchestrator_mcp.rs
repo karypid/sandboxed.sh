@@ -225,9 +225,14 @@ struct DeploySandboxedShParams {
     /// Optional git ref to check out before building.
     #[serde(default)]
     git_ref: Option<String>,
-    /// Skip cargo build (binary assumed current at target/debug/<exe>).
+    /// Skip cargo build (binaries assumed current at <repo_path>/target/debug/).
     #[serde(default)]
     skip_build: bool,
+    /// Override the server's configured source repo. Required when the
+    /// build artifact lives outside the default location (e.g. an ad-hoc
+    /// worktree at /opt/sandboxed-sh-<name>/).
+    #[serde(default)]
+    repo_path: Option<String>,
 }
 
 // =============================================================================
@@ -635,8 +640,10 @@ impl OrchestratorMcp {
                        will be SIGTERM'd).\n\
                      • Debounce: refuses if another deploy fired in the last few minutes \
                        (force=true overrides).\n\
-                     • Atomic install via versioned symlink + detached restart so the SSE \
-                       response flushes before the service dies.\n\
+                     • Atomic install with .pre-deploy-<sha> backups + detached restart so the \
+                       SSE response flushes before the service dies. If the orchestrator-mcp \
+                       install fails, the main binary swap is rolled back so the system is \
+                       never in a half-applied state.\n\
                      Replaces calling `systemctl restart` directly from a shell. Returns the \
                      deployed commit sha on success."
                         .to_string(),
@@ -654,8 +661,12 @@ impl OrchestratorMcp {
                         },
                         "skip_build": {
                             "type": "boolean",
-                            "description": "Skip the cargo build step and assume target/debug/<binary> is already current. Useful when the build was done elsewhere.",
+                            "description": "Skip the cargo build step and assume <repo_path>/target/debug/sandboxed-sh and orchestrator-mcp are already current. Useful when the build was done elsewhere.",
                             "default": false
+                        },
+                        "repo_path": {
+                            "type": "string",
+                            "description": "Override the server's configured source repo path. Required when your build artifact lives outside the default location (e.g. a worktree at /opt/sandboxed-sh-<name>/)."
                         }
                     }
                 }),
@@ -1378,6 +1389,7 @@ impl OrchestratorMcp {
             "force": params.force,
             "git_ref": params.git_ref,
             "skip_build": params.skip_build,
+            "repo_path": params.repo_path,
         });
 
         let response = self.api_post("/api/system/deploy", body).await?;

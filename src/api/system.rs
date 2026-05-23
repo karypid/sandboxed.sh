@@ -1513,10 +1513,18 @@ pub struct DeployRequest {
     /// source state").
     #[serde(default)]
     pub git_ref: Option<String>,
-    /// Skip the cargo build and assume `target/debug/<exe>` is already
-    /// up-to-date. Useful for CI flows that build elsewhere.
+    /// Skip the cargo build and assume the binaries at
+    /// `<repo_path>/target/debug/` are current. Useful for flows that
+    /// build elsewhere (e.g. CI, or a separate build worktree).
     #[serde(default)]
     pub skip_build: bool,
+    /// Explicit source repo path. Overrides the server's configured
+    /// `resolve_sandboxed_repo_path` default. Required when the agent's
+    /// build artifact lives somewhere other than the server's default
+    /// "sandboxed.sh source" location (e.g. an ad-hoc worktree under
+    /// `/opt/sandboxed-sh-<name>/`).
+    #[serde(default)]
+    pub repo_path: Option<String>,
 }
 
 /// Reasons we may refuse a deploy without doing any I/O. Surfaced to the MCP
@@ -1642,11 +1650,14 @@ fn stream_deploy(
     async_stream::stream! {
         yield sse("log", "Starting deploy with safety rails", Some(0));
 
-        let repo_path_str = resolve_sandboxed_repo_path(&state).await;
+        let repo_path_str = match req.repo_path.as_deref() {
+            Some(p) => p.to_string(),
+            None => resolve_sandboxed_repo_path(&state).await,
+        };
         let repo_path = std::path::Path::new(&repo_path_str);
 
         if let Err(err) = ensure_repo_present(repo_path).await {
-            yield sse("error", format!("Failed to prepare source repo: {}", err), None);
+            yield sse("error", format!("Failed to prepare source repo at {}: {}", repo_path.display(), err), None);
             return;
         }
         yield sse("log", format!("Source repo: {}", repo_path.display()), Some(5));
@@ -1689,15 +1700,26 @@ fn stream_deploy(
                 return;
             }
         };
+        // `exe_name` is the *deployed* filename (e.g. `sandboxed-sh-prod` or
+        // `sandboxed-sh-dev`). The cargo bin name is always `sandboxed-sh`
+        // — Cargo writes to `target/debug/sandboxed-sh` regardless of how
+        // we rename it on install. Same for `orchestrator-mcp`.
         let exe_name = current_exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+        const MAIN_CARGO_BIN: &str = "sandboxed-sh";
+        const MCP_CARGO_BIN: &str = "orchestrator-mcp";
         let service_name = format!("{}.service", exe_name);
-        let install_dest = current_exe.to_string_lossy().to_string();
+        let install_dest_main = current_exe.to_string_lossy().to_string();
+        // Match the MCP install location: same dir as the main binary, fixed name.
+        let install_dest_mcp = current_exe
+            .parent()
+            .map(|p| p.join(MCP_CARGO_BIN).to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("/usr/local/bin/{}", MCP_CARGO_BIN));
 
         if !req.skip_build {
-            yield sse("log", format!("Building {} (cargo build)", exe_name), Some(25));
+            yield sse("log", format!("Building {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN), Some(25));
             let build_cmd = format!(
-                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin workspace-mcp --bin desktop-mcp",
-                exe_name
+                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin {}",
+                MAIN_CARGO_BIN, MCP_CARGO_BIN
             );
             match Command::new("bash")
                 .args(["-c", &build_cmd])
@@ -1721,7 +1743,21 @@ fn stream_deploy(
                 }
             }
         } else {
-            yield sse("log", "skip_build=true; using existing target/debug binary", Some(60));
+            yield sse("log", "skip_build=true; using existing target/debug/ binaries", Some(60));
+        }
+
+        // Verify both source binaries exist *before* touching anything live.
+        // Surfaces the "you pointed me at a path with no build" case as a
+        // clean refusal instead of a half-applied deploy.
+        let src_main = repo_path.join("target").join("debug").join(MAIN_CARGO_BIN);
+        let src_mcp = repo_path.join("target").join("debug").join(MCP_CARGO_BIN);
+        if !src_main.exists() {
+            yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_main.display()), None);
+            return;
+        }
+        if !src_mcp.exists() {
+            yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_mcp.display()), None);
+            return;
         }
 
         // Resolve commit sha for the "deployed" event so the agent has
@@ -1736,12 +1772,72 @@ fn stream_deploy(
             _ => "unknown".to_string(),
         };
 
-        yield sse("log", format!("Installing {} (versioned, atomic symlink swap)", exe_name), Some(75));
-        if let Err(e) = install_versioned_binary(repo_path, &exe_name, &sha, &install_dest).await {
-            yield sse("error", format!("Install failed: {}", e), None);
-            return;
+        // We do NOT use install_versioned_binary here because that helper
+        // assumes the source filename equals the deployed filename (e.g.
+        // src=target/debug/sandboxed-sh-prod, dest=/usr/local/bin/sandboxed-sh-prod).
+        // The cargo bin is always `sandboxed-sh`; the deployed name is
+        // service-specific. Doing a direct `install -m 0755 <src> <dest>`
+        // gives us the rename for free.
+        //
+        // Backup the live binaries to `.pre-deploy-<sha>` so a one-line
+        // rollback is `mv backup live && systemctl restart`. No versioned
+        // dir scheme — the existing manual ops use the .backup-<ts>
+        // convention, so we match it.
+        yield sse("log", format!("Installing {} → {}", src_main.display(), install_dest_main), Some(75));
+        let bkp_main = format!("{}.pre-deploy-{}", install_dest_main, sha);
+        if std::path::Path::new(&install_dest_main).exists() {
+            let _ = tokio::fs::copy(&install_dest_main, &bkp_main).await;
         }
-        yield sse("log", "Binary installed and symlink retargeted", Some(90));
+        let install_main = Command::new("install")
+            .args([
+                "-m", "0755",
+                src_main.to_string_lossy().as_ref(),
+                &install_dest_main,
+            ])
+            .output()
+            .await;
+        match install_main {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                yield sse("error", format!("Install of main binary failed: {}", String::from_utf8_lossy(&o.stderr)), None);
+                return;
+            }
+            Err(e) => {
+                yield sse("error", format!("install command error: {}", e), None);
+                return;
+            }
+        }
+
+        yield sse("log", format!("Installing {} → {}", src_mcp.display(), install_dest_mcp), Some(82));
+        let bkp_mcp = format!("{}.pre-deploy-{}", install_dest_mcp, sha);
+        if std::path::Path::new(&install_dest_mcp).exists() {
+            let _ = tokio::fs::copy(&install_dest_mcp, &bkp_mcp).await;
+        }
+        let install_mcp = Command::new("install")
+            .args([
+                "-m", "0755",
+                src_mcp.to_string_lossy().as_ref(),
+                &install_dest_mcp,
+            ])
+            .output()
+            .await;
+        match install_mcp {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                // Roll back the main binary swap before bailing — leaving
+                // the main binary swapped without its matching MCP is the
+                // worst possible half-applied state.
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                yield sse("error", format!("Install of orchestrator-mcp failed (main binary rolled back): {}", String::from_utf8_lossy(&o.stderr)), None);
+                return;
+            }
+            Err(e) => {
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                yield sse("error", format!("install command error (main rolled back): {}", e), None);
+                return;
+            }
+        }
+        yield sse("log", format!("Backups: {}, {}", bkp_main, bkp_mcp), Some(88));
 
         // Schedule the restart in a fully detached process so this SSE
         // response can flush its final event before systemd SIGTERMs us.
