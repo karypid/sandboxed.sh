@@ -975,16 +975,30 @@ export function MissionSwitcher({
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [open, onClose, filteredItems, selectedIndex, handleSelect, loadingMissionId]);
 
-  // Scroll selected item into view
+  // Scroll selected item into view — only when the user actually navigates
+  // (selectedIndex change) or types a new query (searchQuery change). We
+  // deliberately do NOT scroll on every `renderedRows` change: SWR refetches
+  // and late-arriving server search rescores cause new `renderedRows` array
+  // references on a 3–5s cadence, and if we re-ran `scrollToIndex` each time
+  // the user would be yanked back to the top whenever they manually scrolled
+  // down. The ref-based guard lets the effect re-run safely while only
+  // calling the virtualizer on real intent.
+  const prevSelectedIndexRef = useRef(selectedIndex);
+  const prevSearchQueryRef = useRef(searchQuery);
   useEffect(() => {
     if (!listRef.current) return;
+    const selectionChanged = prevSelectedIndexRef.current !== selectedIndex;
+    const searchChanged = prevSearchQueryRef.current !== searchQuery;
+    prevSelectedIndexRef.current = selectedIndex;
+    prevSearchQueryRef.current = searchQuery;
+    if (!selectionChanged && !searchChanged) return;
     const rowIndex = renderedRows.findIndex(
       (row) => row.kind === 'item' && row.itemIndex === selectedIndex
     );
     if (rowIndex >= 0) {
       rowVirtualizer.scrollToIndex(rowIndex, { align: 'auto' });
     }
-  }, [renderedRows, rowVirtualizer, selectedIndex]);
+  }, [renderedRows, rowVirtualizer, selectedIndex, searchQuery]);
 
   // Handle click outside
   useEffect(() => {
