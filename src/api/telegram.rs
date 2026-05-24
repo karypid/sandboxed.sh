@@ -11,18 +11,22 @@
 
 use crate::api::control::{AgentEvent, ControlCommand, MissionStatus};
 use crate::api::mission_store::{
-    now_string, Mission, MissionMode, MissionStore, StoredEvent, TelegramActionExecution,
-    TelegramActionExecutionKind, TelegramActionExecutionStatus, TelegramAlert,
-    TelegramAlertPreference, TelegramChannel, TelegramChatMission, TelegramConversation,
-    TelegramConversationMessage, TelegramConversationMessageDirection,
-    TelegramMissionInterestLevel, TelegramMissionSubscription, TelegramScheduledMessage,
-    TelegramScheduledMessageStatus, TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind,
-    TelegramStructuredMemoryScope, TelegramTriggerMode, TelegramUser, TelegramUserRole,
-    TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
+    now_string, Mission, MissionMode, MissionStore, PalomaMissionCard, PalomaUserPreferences,
+    StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
+    TelegramActionExecutionStatus, TelegramAlert, TelegramAlertPreference, TelegramChannel,
+    TelegramChatMission, TelegramConversation, TelegramConversationMessage,
+    TelegramConversationMessageDirection, TelegramMissionInterestLevel,
+    TelegramMissionSubscription, TelegramScheduledMessage, TelegramScheduledMessageStatus,
+    TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
+    TelegramTriggerMode, TelegramUser, TelegramUserRole, TelegramWorkflow, TelegramWorkflowEvent,
+    TelegramWorkflowKind, TelegramWorkflowStatus,
 };
 use crate::api::paloma::queue::{PalomaQueue, QueueKey, QueueMetrics};
 use crate::api::paloma::scheduler::{PalomaJobRegistry, PalomaJobState};
-use crate::api::paloma::{commands as paloma_commands, decision_log, digest, planner};
+use crate::api::paloma::{
+    commands as paloma_commands, cooldown, decision_log, digest, mission_card, planner,
+    preferences as paloma_prefs,
+};
 use chrono::{Duration as ChronoDuration, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -89,6 +93,11 @@ const PALOMA_LONG_RUNNING_ALERT_BUCKET_MINUTES: i64 = 30;
 const PALOMA_OWNER_INTERACTION_DIGEST_QUIET_MINUTES: i64 = 10;
 const PALOMA_DIGEST_COOLDOWN_MINUTES: i64 = 10;
 const PALOMA_ALERT_DIGEST_LIMIT: usize = 12;
+/// Telegram refuses `editMessageText` on messages older than 48h. Re-anchor
+/// before we hit that boundary so we never lose an in-flight update.
+const PALOMA_MISSION_CARD_REANCHOR_AFTER_HOURS: i64 = 47;
+/// Limit how many missions we consider for card rendering per scheduler tick.
+const PALOMA_MISSION_CARD_SCAN_LIMIT: usize = 80;
 const PALOMA_SESSION_QUEUE_MAX_PER_KEY: usize = 256;
 const DEFAULT_PALOMA_OWNER_TELEGRAM_ID: i64 = 1_139_694_048;
 const DEFAULT_PALOMA_TRUSTED_FRIEND_TELEGRAM_ID: i64 = 0;
@@ -816,6 +825,10 @@ async fn apply_paloma_interest_feedback(
                 &now,
             )
             .await;
+        let _ = ctx
+            .mission_store
+            .reset_paloma_cooldown_for_mission(mission.id)
+            .await;
     }
     if matches!(
         level,
@@ -901,6 +914,10 @@ async fn apply_paloma_failure_only_feedback(
     let _ = ctx
         .mission_store
         .acknowledge_pending_telegram_alerts_for_mission(user.telegram_user_id, mission.id, &now)
+        .await;
+    let _ = ctx
+        .mission_store
+        .reset_paloma_cooldown_for_mission(mission.id)
         .await;
     let _ = ctx
         .mission_store
@@ -1001,6 +1018,61 @@ fn paloma_timestamp_is_recent(
         .and_then(planner::parse_event_time)
         .map(|timestamp| now - timestamp < ChronoDuration::minutes(minutes))
         .unwrap_or(false)
+}
+
+/// Treat `mission_failed` alerts as critical for the failure-override-quiet
+/// preference. Other classes are best-effort updates that should respect
+/// quiet hours.
+fn paloma_pending_includes_critical(pending: &[TelegramAlert]) -> bool {
+    pending
+        .iter()
+        .any(|alert| alert.event_kind.starts_with("mission_failed"))
+}
+
+/// Apply the user's quiet-hours and rate-ceiling preferences to a pending
+/// digest. Returns `Some(reason)` to suppress; `None` to allow delivery.
+async fn paloma_preference_suppression_reason(
+    ctx: &ChannelContext,
+    owner_id: i64,
+    prefs: &PalomaUserPreferences,
+    pending: &[TelegramAlert],
+    now: chrono::DateTime<Utc>,
+) -> Option<&'static str> {
+    let has_critical = paloma_pending_includes_critical(pending);
+    if paloma_prefs::is_quiet_hours(prefs, now)
+        && !paloma_prefs::critical_overrides_quiet(prefs, has_critical)
+    {
+        return Some("quiet_hours");
+    }
+    let hour_window = (now - ChronoDuration::hours(1)).to_rfc3339();
+    let day_window = (now - ChronoDuration::hours(24)).to_rfc3339();
+    let sent_last_hour = ctx
+        .mission_store
+        .count_paloma_sent_alerts_since(owner_id, &hour_window)
+        .await
+        .unwrap_or(0);
+    let sent_last_day = ctx
+        .mission_store
+        .count_paloma_sent_alerts_since(owner_id, &day_window)
+        .await
+        .unwrap_or(0);
+    match paloma_prefs::check_rate_ceiling(prefs, sent_last_hour, sent_last_day) {
+        paloma_prefs::RateLimit::Allowed => None,
+        paloma_prefs::RateLimit::OverHourly => {
+            if has_critical && prefs.failure_override_quiet {
+                None
+            } else {
+                Some("rate_limit_hourly")
+            }
+        }
+        paloma_prefs::RateLimit::OverDaily => {
+            if has_critical && prefs.failure_override_quiet {
+                None
+            } else {
+                Some("rate_limit_daily")
+            }
+        }
+    }
 }
 
 async fn paloma_digest_suppression_reason_for_user(
@@ -1264,6 +1336,31 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, _http: &Client) {
             .await;
             continue;
         }
+        // Cooldown gate: per (mission, class) backoff. The first send of a
+        // class is always eligible; subsequent sends walk the ladder until
+        // the user replies, the mission status changes, or `/resume` is
+        // called.
+        let cooldown_state = ctx
+            .mission_store
+            .get_paloma_cooldown_state(owner_id, mission.id, base_kind)
+            .await
+            .ok()
+            .flatten();
+        if !cooldown::is_eligible(cooldown_state.as_ref(), alert_now) {
+            log_paloma_alert_decision(
+                ctx,
+                owner_id,
+                &mission,
+                base_kind,
+                "create_alert",
+                false,
+                Some("cooldown_active"),
+                policy_snapshot,
+                None,
+            )
+            .await;
+            continue;
+        }
         let body = paloma_alert_body(&mission, &events);
         log_paloma_alert_decision(
             ctx,
@@ -1278,7 +1375,7 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, _http: &Client) {
         )
         .await;
         let now = now_string();
-        let _ = ctx
+        let inserted = ctx
             .mission_store
             .create_telegram_alert_if_absent(TelegramAlert {
                 id: Uuid::new_v4(),
@@ -1296,6 +1393,23 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, _http: &Client) {
                 acknowledged_at: None,
             })
             .await;
+        // Only bump the cooldown ladder when we actually inserted a fresh
+        // alert. INSERT OR IGNORE returning None means a pending alert with
+        // the same event_kind already exists — that's the dedup path, and we
+        // must not advance the backoff for it.
+        if matches!(inserted, Ok(Some(_))) {
+            let next_state = cooldown::record_send(
+                cooldown_state.as_ref(),
+                owner_id,
+                mission.id,
+                base_kind,
+                alert_now,
+            );
+            let _ = ctx
+                .mission_store
+                .upsert_paloma_cooldown_state(next_state)
+                .await;
+        }
     }
 
     // Alert scanning only records pending alerts. Delivery is centralized in
@@ -1437,6 +1551,50 @@ async fn flush_pending_paloma_digest(
         return Ok(0);
     }
 
+    // User-preference gates: quiet hours + per-user rate ceiling.
+    let user_prefs = ctx
+        .mission_store
+        .get_paloma_user_preferences(owner_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| PalomaUserPreferences::default_for(owner_id, &now_string()));
+    if let Some(reason) = paloma_preference_suppression_reason(
+        ctx,
+        owner_id,
+        &user_prefs,
+        &pending,
+        digest_checked_at,
+    )
+    .await
+    {
+        if let Some(first_alert) = pending.first() {
+            let snapshot = serde_json::json!({
+                "pending_alerts": pending.len(),
+                "digest_limit": PALOMA_ALERT_DIGEST_LIMIT,
+                "source": "paloma_digest_flush",
+                "suppression_reason": reason,
+                "timezone": user_prefs.timezone,
+            })
+            .to_string();
+            let decision = decision_log::new_decision(
+                "scheduler",
+                first_alert.mission_id,
+                Some(owner_id),
+                "telegram",
+                "digest_suppressed",
+                "send_digest",
+                false,
+                Some(reason),
+                &snapshot,
+                None,
+                now_string(),
+            );
+            let _ = ctx.mission_store.create_paloma_decision(decision).await;
+        }
+        return Ok(0);
+    }
+
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     let text = paloma_alert_digest_text(&pending);
     let digest_snapshot = serde_json::json!({
@@ -1488,6 +1646,237 @@ async fn flush_pending_paloma_digest(
             Err(err)
         }
     }
+}
+
+/// Render the per-mission Telegram cards for the configured owner.
+///
+/// One card per mission, edited in place. Skips edits when the rendered
+/// content hash matches the persisted hash, so a flood of mission events
+/// translates into at most one Telegram API call per ~2s scheduler tick per
+/// mission whose visible state actually changed.
+async fn refresh_mission_cards(ctx: &ChannelContext, http: &Client) {
+    let Some(owner_id) =
+        configured_telegram_id("PALOMA_TELEGRAM_OWNER_ID", DEFAULT_PALOMA_OWNER_TELEGRAM_ID)
+    else {
+        return;
+    };
+
+    let missions = match ctx
+        .mission_store
+        .list_missions(PALOMA_MISSION_CARD_SCAN_LIMIT, 0)
+        .await
+    {
+        Ok(missions) => missions,
+        Err(err) => {
+            tracing::warn!("Failed to load missions for Paloma card refresh: {}", err);
+            return;
+        }
+    };
+
+    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+    let now = Utc::now();
+    let now_rfc = now_string();
+
+    for mission in missions {
+        // Assistant-mode missions are free-chat threads, not ops missions; the
+        // card model doesn't apply to them.
+        if mission.mission_mode == MissionMode::Assistant {
+            continue;
+        }
+
+        let existing = ctx
+            .mission_store
+            .get_paloma_mission_card(mission.id)
+            .await
+            .ok()
+            .flatten();
+        if existing.as_ref().is_some_and(|card| card.archived) {
+            continue;
+        }
+
+        let is_terminal_state = matches!(
+            mission.status,
+            MissionStatus::Completed
+                | MissionStatus::Failed
+                | MissionStatus::Blocked
+                | MissionStatus::Interrupted
+                | MissionStatus::NotFeasible
+                | MissionStatus::Acknowledged
+        );
+        // Don't post a brand-new card for a mission that is already terminal:
+        // there's nothing to track and the user doesn't need a tombstone for
+        // missions they never knew about.
+        if existing.is_none() && is_terminal_state {
+            continue;
+        }
+
+        let events = ctx
+            .mission_store
+            .get_events(mission.id, None, Some(40), None)
+            .await
+            .unwrap_or_default();
+        let title = mission_label(&mission);
+        let started_at = mission_card::mission_started_at(&mission, &events);
+        let latest_line = paloma_latest_attention_line(&mission, &events);
+        let content =
+            mission_card::render_card(&mission, &title, started_at, now, latest_line.as_deref());
+        let new_hash = mission_card::content_hash(&content);
+        let text = redact_for_telegram(&mission_card::card_to_telegram_text(&content));
+
+        match existing {
+            Some(existing_card) if existing_card.content_hash == new_hash => {
+                // Same render as last tick; nothing to do.
+                if content.archived {
+                    let _ = ctx
+                        .mission_store
+                        .archive_paloma_mission_card(mission.id)
+                        .await;
+                }
+                continue;
+            }
+            Some(existing_card) if mission_card_should_reanchor(&existing_card.anchor_ts, now) => {
+                // Telegram edit window is about to close. Post a fresh anchor
+                // message and replace the row's message_id.
+                let markup = mission_card_reply_markup(mission.id);
+                let display = truncate_for_telegram(&text);
+                match send_message_html_with_markup(
+                    http,
+                    &base_url,
+                    existing_card.chat_id,
+                    &display.html,
+                    None,
+                    markup,
+                )
+                .await
+                {
+                    Ok(message_id) => {
+                        let next = PalomaMissionCard {
+                            mission_id: mission.id,
+                            telegram_user_id: existing_card.telegram_user_id,
+                            channel_id: existing_card.channel_id,
+                            chat_id: existing_card.chat_id,
+                            message_id,
+                            content_hash: new_hash,
+                            anchor_ts: now_rfc.clone(),
+                            last_edit_ts: now_rfc.clone(),
+                            version: existing_card.version + 1,
+                            archived: content.archived,
+                        };
+                        let _ = ctx.mission_store.upsert_paloma_mission_card(next).await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            mission_id = %mission.id,
+                            "Paloma mission card re-anchor failed: {}",
+                            err
+                        );
+                    }
+                }
+            }
+            Some(existing_card) => {
+                let markup = mission_card_reply_markup(mission.id);
+                let display = truncate_for_telegram(&text);
+                match edit_message_with_markup(
+                    http,
+                    &base_url,
+                    existing_card.chat_id,
+                    existing_card.message_id,
+                    &display.html,
+                    markup,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let _ = ctx
+                            .mission_store
+                            .touch_paloma_mission_card(mission.id, &new_hash, &now_rfc)
+                            .await;
+                        if content.archived {
+                            let _ = ctx
+                                .mission_store
+                                .archive_paloma_mission_card(mission.id)
+                                .await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            mission_id = %mission.id,
+                            "Paloma mission card edit failed: {}",
+                            err
+                        );
+                    }
+                }
+            }
+            None => {
+                let markup = mission_card_reply_markup(mission.id);
+                let display = truncate_for_telegram(&text);
+                match send_message_html_with_markup(
+                    http,
+                    &base_url,
+                    owner_id,
+                    &display.html,
+                    None,
+                    markup,
+                )
+                .await
+                {
+                    Ok(message_id) => {
+                        let card = PalomaMissionCard {
+                            mission_id: mission.id,
+                            telegram_user_id: owner_id,
+                            channel_id: ctx.channel.id,
+                            chat_id: owner_id,
+                            message_id,
+                            content_hash: new_hash,
+                            anchor_ts: now_rfc.clone(),
+                            last_edit_ts: now_rfc.clone(),
+                            version: 1,
+                            archived: content.archived,
+                        };
+                        let _ = ctx.mission_store.upsert_paloma_mission_card(card).await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            mission_id = %mission.id,
+                            "Paloma mission card post failed: {}",
+                            err
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mission_card_should_reanchor(anchor_ts: &str, now: chrono::DateTime<Utc>) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(anchor_ts) {
+        Ok(parsed) => {
+            let age = now - parsed.with_timezone(&Utc);
+            age >= ChronoDuration::hours(PALOMA_MISSION_CARD_REANCHOR_AFTER_HOURS)
+        }
+        Err(_) => true,
+    }
+}
+
+/// Build a one-button URL `inline_keyboard` pointing at the mission's
+/// dashboard page, when `SANDBOXED_PUBLIC_URL` is configured.
+///
+/// URL buttons do not need a `callback_query` handler — they're plain web
+/// links — so they work today without the Phase 5 control plane. The other
+/// `CardButton` variants (Reply/Mute/Acknowledge) need callback routing and
+/// are intentionally deferred.
+fn mission_card_reply_markup(mission_id: Uuid) -> Option<serde_json::Value> {
+    let public_url = std::env::var("SANDBOXED_PUBLIC_URL").ok()?;
+    let trimmed = public_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let url = format!("{}/missions/{}", trimmed, mission_id);
+    Some(serde_json::json!({
+        "inline_keyboard": [[
+            { "text": "Open in dashboard", "url": url }
+        ]]
+    }))
 }
 
 async fn handle_paloma_command(
@@ -2044,6 +2433,33 @@ impl TelegramBridge {
                 .cloned()
                 .collect();
             for ctx in channels {
+                let card_job_name = paloma_channel_job_name("paloma_mission_cards", ctx.channel.id);
+                let card_job_started = now_string();
+                let card_job_lease_expires = paloma_scheduler_lease_expires_at();
+                if ctx
+                    .mission_store
+                    .claim_paloma_scheduler_job(
+                        &card_job_name,
+                        &lease_owner,
+                        &card_job_started,
+                        &card_job_lease_expires,
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    refresh_mission_cards(&ctx, &self.http).await;
+                    let _ = ctx
+                        .mission_store
+                        .finish_paloma_scheduler_job(
+                            &card_job_name,
+                            &lease_owner,
+                            &now_string(),
+                            None,
+                        )
+                        .await;
+                    self.record_paloma_job_success("paloma_mission_cards").await;
+                }
+
                 let alert_job_name = paloma_channel_job_name("paloma_alert_scan", ctx.channel.id);
                 let alert_job_started = now_string();
                 let alert_job_lease_expires = paloma_scheduler_lease_expires_at();
@@ -2587,6 +3003,8 @@ struct SendMessageRequest<'a> {
     reply_to_message_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parse_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2601,6 +3019,8 @@ struct EditMessageRequest<'a> {
     text: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     parse_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<serde_json::Value>,
 }
 
 /// Response from the Telegram `getFile` API.
@@ -5567,11 +5987,25 @@ async fn send_message_html(
     html: &str,
     reply_to: Option<i64>,
 ) -> Result<i64, String> {
+    send_message_html_with_markup(http, base_url, chat_id, html, reply_to, None).await
+}
+
+/// Send pre-rendered HTML text with an optional `reply_markup` payload (e.g.
+/// inline keyboard for the per-mission card).
+async fn send_message_html_with_markup(
+    http: &Client,
+    base_url: &str,
+    chat_id: i64,
+    html: &str,
+    reply_to: Option<i64>,
+    reply_markup: Option<serde_json::Value>,
+) -> Result<i64, String> {
     let body = SendMessageRequest {
         chat_id,
         text: html,
         reply_to_message_id: reply_to,
         parse_mode: Some("HTML"),
+        reply_markup,
     };
 
     let url = format!("{}/sendMessage", base_url);
@@ -5607,6 +6041,20 @@ async fn edit_message(
     message_id: i64,
     html: &str,
 ) -> Result<(), String> {
+    edit_message_with_markup(http, base_url, chat_id, message_id, html, None).await
+}
+
+/// Edit an existing message's text, replacing the inline reply markup. The
+/// markup is sent (even when `None`) so that buttons removed between renders
+/// actually disappear from the chat instead of lingering on the old message.
+async fn edit_message_with_markup(
+    http: &Client,
+    base_url: &str,
+    chat_id: i64,
+    message_id: i64,
+    html: &str,
+    reply_markup: Option<serde_json::Value>,
+) -> Result<(), String> {
     if html.is_empty() {
         return Ok(());
     }
@@ -5615,6 +6063,7 @@ async fn edit_message(
         message_id,
         text: html,
         parse_mode: Some("HTML"),
+        reply_markup,
     };
 
     let url = format!("{}/editMessageText", base_url);
@@ -6834,21 +7283,24 @@ mod tests {
     }
 
     #[test]
-    fn paloma_alert_event_kind_is_bucketed_and_subscription_can_raise_importance() {
+    fn paloma_alert_event_kind_collapses_long_running_into_single_key() {
+        // Long-running alerts are now deduplicated to one row per mission.
+        // The 30-minute bucket suffix is gone; cadence lives in
+        // `paloma_cooldown_state` instead, so the user can't get 11 "still
+        // running" alerts overnight just because the wall clock crossed
+        // bucket boundaries.
         let mission = test_mission("Checkout fix", MissionStatus::Active);
         let events = Vec::new();
-        let first_bucket = Utc.with_ymd_and_hms(2026, 5, 20, 1, 5, 0).unwrap();
-        let same_bucket = Utc.with_ymd_and_hms(2026, 5, 20, 1, 29, 0).unwrap();
-        let next_bucket = Utc.with_ymd_and_hms(2026, 5, 20, 1, 31, 0).unwrap();
+        let early = Utc.with_ymd_and_hms(2026, 5, 20, 1, 5, 0).unwrap();
+        let later = Utc.with_ymd_and_hms(2026, 5, 20, 4, 31, 0).unwrap();
 
-        assert_eq!(
-            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, first_bucket),
-            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, same_bucket)
-        );
-        assert_ne!(
-            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, first_bucket),
-            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, next_bucket)
-        );
+        let kind_early =
+            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, early);
+        let kind_later =
+            paloma_alert_event_kind_at(&mission, "mission_long_running", &events, later);
+
+        assert_eq!(kind_early, "mission_long_running");
+        assert_eq!(kind_early, kind_later);
         assert_eq!(
             paloma_alert_importance_for_mission(&mission, TelegramMissionInterestLevel::Normal),
             "normal"
