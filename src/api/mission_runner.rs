@@ -14219,8 +14219,25 @@ pub async fn run_codex_turn(
         }
     }
 
-    let prepared_oauth_account = match override_credential {
+    let oauth_account_to_prepare = match override_credential {
         Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(account)) => {
+            Some((*account).clone())
+        }
+        Some(crate::api::ai_providers::CodexCredentialOverride::ApiKey(_)) => None,
+        None => {
+            if crate::api::ai_providers::get_openai_api_key_for_codex_default(app_working_dir)
+                .is_none()
+            {
+                crate::api::ai_providers::get_all_openai_oauth_accounts(app_working_dir)
+                    .into_iter()
+                    .next()
+            } else {
+                None
+            }
+        }
+    };
+    let prepared_oauth_account = match oauth_account_to_prepare.as_ref() {
+        Some(account) => {
             match crate::api::ai_providers::prepare_codex_oauth_account_for_launch(
                 app_working_dir,
                 account,
@@ -14238,7 +14255,7 @@ pub async fn run_codex_turn(
                 }
             }
         }
-        _ => None,
+        None => None,
     };
     let prepared_override = prepared_oauth_account
         .as_ref()
