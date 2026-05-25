@@ -14299,6 +14299,13 @@ pub async fn run_codex_turn(
     let mut thinking_emitted = false;
     let mut thinking_done_emitted = false;
     let mut thinking_accumulated = String::new();
+    // Tracks which codex reasoning item `thinking_accumulated` currently
+    // belongs to. When a Thinking event arrives with a different `item_id`,
+    // we finalize the existing buffer and start a fresh one — codex emits
+    // multiple reasoning items per turn (each with its own cumulative
+    // snapshots), and merging them into one buffer produced concatenated
+    // thoughts in stored history (see mission dbc8a7e9 seq 6651).
+    let mut thinking_item: Option<String> = None;
     let mut last_summary: Option<String> = None;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
@@ -14338,9 +14345,44 @@ pub async fn run_codex_turn(
                             text_delta_pending = true;
                         }
                     }
-                    ExecutionEvent::Thinking { content } => {
-                        merge_stream_fragment(&mut thinking_accumulated, &content);
-                        // Stream the canonical cumulative buffer for real-time UI.
+                    ExecutionEvent::Thinking { content, item_id } => {
+                        // Codex emits per-item cumulative snapshots: every
+                        // emit with the same `item_id` contains the previous
+                        // emit as a prefix. When `item_id` changes we're on a
+                        // new reasoning item — finalize the existing buffer
+                        // as `done: true` so it persists as its own thought,
+                        // and start fresh. Falling back to `merge_stream_fragment`
+                        // (the pre-fix behaviour) concatenated unrelated items
+                        // into one buffer because it only knows about byte
+                        // overlap, not item identity.
+                        let item_changed = match (&thinking_item, &item_id) {
+                            (Some(prev), Some(cur)) => prev != cur,
+                            // First event of the turn, or backend doesn't
+                            // expose item IDs: treat as continuation.
+                            _ => false,
+                        };
+                        if item_changed && !thinking_accumulated.is_empty() {
+                            let _ = events_tx.send(AgentEvent::Thinking {
+                                content: std::mem::take(&mut thinking_accumulated),
+                                done: true,
+                                mission_id: Some(mission_id),
+                            });
+                            thinking_done_emitted = true;
+                        }
+                        if item_id.is_some() {
+                            thinking_item = item_id;
+                            // Per-item cumulative: each new snapshot replaces
+                            // the buffer (longest wins; shorter echoes are
+                            // dropped to keep the buffer monotone).
+                            if content.len() >= thinking_accumulated.len() {
+                                thinking_accumulated = content;
+                            }
+                        } else {
+                            // Unknown-item backends still use overlap-based
+                            // merging so a CLI that resends a partial
+                            // snapshot doesn't double words.
+                            merge_stream_fragment(&mut thinking_accumulated, &content);
+                        }
                         let _ = events_tx.send(AgentEvent::Thinking {
                             content: thinking_accumulated.clone(),
                             done: false,
@@ -14360,6 +14402,7 @@ pub async fn run_codex_turn(
                             });
                             thinking_done_emitted = true;
                         }
+                        thinking_item = None;
                         pending_tools.insert(id.clone(), name.clone());
                         let _ = events_tx.send(AgentEvent::ToolCall {
                             tool_call_id: id,
@@ -14907,7 +14950,7 @@ pub async fn run_gemini_turn(
                             mission_id: Some(mission_id),
                         });
                     }
-                    ExecutionEvent::Thinking { content } => {
+                    ExecutionEvent::Thinking { content, item_id: _ } => {
                         merge_stream_fragment(&mut thinking_accumulated, &content);
                         // Stream the canonical cumulative buffer for real-time UI.
                         let _ = events_tx.send(AgentEvent::Thinking {

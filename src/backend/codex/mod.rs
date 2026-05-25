@@ -602,10 +602,11 @@ impl AppServerEventTranslator {
                         ("reasoning", DeltaSemantics::Incremental)
                     };
                     let key = format!("{}:{}", kind, item_id);
-                    let entry = self.delta_buffers.entry(key).or_default();
+                    let entry = self.delta_buffers.entry(key.clone()).or_default();
                     fold_delta_into(entry, delta, semantics);
                     events.push(ExecutionEvent::Thinking {
                         content: entry.clone(),
+                        item_id: Some(key),
                     });
                 }
             }
@@ -836,6 +837,8 @@ pub fn registry_entry() -> Arc<dyn Backend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn parse_goal_prefix_detects_simple_goal() {
@@ -949,6 +952,93 @@ mod tests {
         fold_delta_into(&mut buf, "stable", DeltaSemantics::CumulativeSnapshot);
         fold_delta_into(&mut buf, "stable", DeltaSemantics::CumulativeSnapshot);
         assert_eq!(buf, "stable");
+    }
+
+    #[test]
+    fn reasoning_thinking_events_carry_distinct_item_ids() {
+        // Regression for mission dbc8a7e9 seq 6651: the translator must
+        // tag each Thinking event with the per-item buffer key so the
+        // mission_runner can detect when codex moves to a new reasoning
+        // item and finalize the previous thought instead of concatenating
+        // unrelated cumulative snapshots into one buffer.
+        let mut translator = AppServerEventTranslator {
+            delta_buffers: HashMap::new(),
+            emitted_usage_for_turn: HashSet::new(),
+            counted_turn_ids: HashSet::new(),
+            goal_iteration: 0,
+            goal_objective: String::new(),
+        };
+
+        let notify = |item_id: &str, delta: &str| {
+            json!({
+                "itemId": item_id,
+                "delta": delta,
+            })
+        };
+
+        let collect = |events: Vec<ExecutionEvent>| -> Vec<(Option<String>, String)> {
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    ExecutionEvent::Thinking { content, item_id } => Some((item_id, content)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Item A: cumulative summary snapshots.
+        let mut events = Vec::new();
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("A", "The recovery log."),
+                    false,
+                )
+                .events,
+        );
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("A", "The recovery log. Do not duplicate."),
+                    false,
+                )
+                .events,
+        );
+        // Item B: brand new reasoning, starts at "Work".
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("B", "Work"),
+                    false,
+                )
+                .events,
+        );
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("B", "Worktrees are ready"),
+                    false,
+                )
+                .events,
+        );
+
+        let thinkings = collect(events);
+        assert_eq!(thinkings.len(), 4);
+        // Item A's snapshots share an item_id.
+        assert_eq!(thinkings[0].0, Some("summary:A".to_string()));
+        assert_eq!(thinkings[1].0, Some("summary:A".to_string()));
+        // Item B's snapshots share a *different* item_id.
+        assert_eq!(thinkings[2].0, Some("summary:B".to_string()));
+        assert_eq!(thinkings[3].0, Some("summary:B".to_string()));
+        assert_ne!(thinkings[1].0, thinkings[2].0);
+        // Per-item contents are clean cumulative snapshots (the runner is
+        // free to REPLACE per item, no overlap merging required).
+        assert_eq!(thinkings[1].1, "The recovery log. Do not duplicate.");
+        assert_eq!(thinkings[3].1, "Worktrees are ready");
     }
 
     #[tokio::test]
