@@ -2567,18 +2567,15 @@ pub(crate) fn write_codex_auth_json_chatgpt_with_tokens(
     access_token: &str,
     refresh_token: &str,
 ) -> Result<(), String> {
-    // Rotation workers deliberately receive an access-token-only auth file.
-    // OpenAI ChatGPT refresh tokens rotate on every use, so allowing multiple
-    // Codex child processes to refresh the same account independently makes
-    // one process consume the token and the others fail with
-    // `refresh_token_reused`. The backend refreshes under a per-account lock
-    // before launch; workers should not perform their own refresh.
+    // The current Codex app-server requires the ChatGPT refresh_token to be
+    // present in auth.json. Access-token-only auth can leave the responses
+    // client with no bearer header, producing 401s from the OpenAI API.
     write_codex_chatgpt_auth_file(
         config_dir,
         access_token,
         refresh_token,
         "rotation_override",
-        false,
+        true,
     )
 }
 

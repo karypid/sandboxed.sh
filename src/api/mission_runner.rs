@@ -714,7 +714,7 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 }
 
 const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
-const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
+const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 1;
 const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
