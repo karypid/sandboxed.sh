@@ -143,6 +143,15 @@ fn resolve_cwd(base: &Path, raw: Option<&str>) -> Result<PathBuf, String> {
 
 fn merge_job_for_write(current: Option<DurableJob>, mut next: DurableJob) -> DurableJob {
     if let Some(current) = current {
+        if matches!(
+            current.status,
+            DurableJobStatus::Completed | DurableJobStatus::Failed | DurableJobStatus::Cancelled
+        ) && !matches!(
+            next.status,
+            DurableJobStatus::Completed | DurableJobStatus::Failed | DurableJobStatus::Cancelled
+        ) {
+            return current;
+        }
         if current.status == DurableJobStatus::Cancelled
             && next.status != DurableJobStatus::Cancelled
         {
@@ -571,6 +580,17 @@ mod tests {
         let merged = merge_job_for_write(Some(current), next);
 
         assert_eq!(merged.status, DurableJobStatus::Cancelled);
+    }
+
+    #[test]
+    fn merge_job_for_write_preserves_terminal_status_over_unknown_refresh() {
+        let current = test_job(DurableJobStatus::Completed);
+        let mut next = current.clone();
+        next.status = DurableJobStatus::Unknown;
+
+        let merged = merge_job_for_write(Some(current), next);
+
+        assert_eq!(merged.status, DurableJobStatus::Completed);
     }
 
     #[tokio::test]
