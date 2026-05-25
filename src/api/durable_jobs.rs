@@ -156,6 +156,29 @@ async fn read_job(state: &AppState, id: Uuid) -> Result<DurableJob, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid durable job entry: {}", e))
 }
 
+async fn write_terminal_job_state(
+    state: &AppState,
+    mut job: DurableJob,
+    status: DurableJobStatus,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    updated_at: DateTime<Utc>,
+) -> DurableJob {
+    if let Ok(latest) = read_job(state, job.id).await {
+        if latest.status == DurableJobStatus::Cancelled {
+            return latest;
+        }
+        job = latest;
+    }
+
+    job.status = status;
+    job.exit_code = exit_code;
+    job.signal = signal;
+    job.updated_at = updated_at;
+    let _ = write_job(state, &job).await;
+    job
+}
+
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
@@ -188,16 +211,20 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
     ) {
         if let Ok(bytes) = tokio::fs::read(&job.status_file).await {
             if let Ok(exit) = serde_json::from_slice::<ExitRecord>(&bytes) {
-                job.status = if exit.exit_code == Some(0) {
+                let status = if exit.exit_code == Some(0) {
                     DurableJobStatus::Completed
                 } else {
                     DurableJobStatus::Failed
                 };
-                job.exit_code = exit.exit_code;
-                job.signal = exit.signal;
-                job.updated_at = exit.finished_at;
-                let _ = write_job(state, &job).await;
-                return job;
+                return write_terminal_job_state(
+                    state,
+                    job,
+                    status,
+                    exit.exit_code,
+                    exit.signal,
+                    exit.finished_at,
+                )
+                .await;
             }
         }
 
@@ -291,23 +318,28 @@ pub async fn start_job(
     tokio::spawn(async move {
         let mut child = child;
         if let Ok(status) = child.wait().await {
-            if let Ok(mut job) = read_job(&watcher_state, id).await {
-                let was_cancelled = job.status == DurableJobStatus::Cancelled;
-                if !was_cancelled {
-                    job.status = if status.success() {
-                        DurableJobStatus::Completed
-                    } else {
-                        DurableJobStatus::Failed
-                    };
-                }
-                job.exit_code = status.code();
+            if let Ok(job) = read_job(&watcher_state, id).await {
+                let job_status = if status.success() {
+                    DurableJobStatus::Completed
+                } else {
+                    DurableJobStatus::Failed
+                };
                 #[cfg(unix)]
-                {
+                let signal = {
                     use std::os::unix::process::ExitStatusExt;
-                    job.signal = status.signal();
-                }
-                job.updated_at = Utc::now();
-                let _ = write_job(&watcher_state, &job).await;
+                    status.signal()
+                };
+                #[cfg(not(unix))]
+                let signal = None;
+                let _ = write_terminal_job_state(
+                    &watcher_state,
+                    job,
+                    job_status,
+                    status.code(),
+                    signal,
+                    Utc::now(),
+                )
+                .await;
             }
         }
     });
