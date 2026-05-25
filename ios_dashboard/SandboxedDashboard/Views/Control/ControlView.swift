@@ -5595,10 +5595,12 @@ private struct MissionSwitcherSheet: View {
 
     private var missionListSignature: String {
         let runningPart = runningMissions
-            .map { "\($0.missionId):\($0.state):\($0.title ?? "")" }
+            .map { "\($0.missionId):\($0.state):\($0.title ?? ""):\($0.currentActivity ?? "")" }
             .joined(separator: "|")
         let recentPart = recentMissions
-            .map { "\($0.id):\($0.status.displayLabel):\($0.updatedDate?.timeIntervalSince1970 ?? 0):\($0.parentMissionId ?? ""):\($0.title ?? "")" }
+            .map {
+                "\($0.id):\($0.status.displayLabel):\($0.updatedDate?.timeIntervalSince1970 ?? 0):\($0.parentMissionId ?? ""):\($0.title ?? ""):\($0.shortDescription ?? ""):\($0.backend ?? "")"
+            }
             .joined(separator: "|")
         let backendPart = backendSearchResults
             .map { "\($0.mission.id):\($0.relevanceScore)" }
