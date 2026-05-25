@@ -28,6 +28,11 @@ Date: 2026-05-25
     - `MarkdownView`
 - `SandboxedDashboard/Views/Components/MarkdownView.swift`
   - Adds `markdown.parse` timing when Control Diagnostics is enabled.
+  - Caches parsed markdown blocks and inline `AttributedString(markdown:)` output by content hash.
+- `SandboxedDashboard/Models/ChatHistoryReducer.swift`
+  - Adds a pure historical replay reducer that builds chat messages with indexed ids/tool calls and assigns UI state once.
+- `SandboxedDashboard/Services/ImageMemoryCache.swift`
+  - Adds a shared `NSCache` image store and background ImageIO downsampling for inline/shared chat images.
 - `SandboxedDashboard/Services/APIService.swift`
   - Adds whole-app request and decode timing for every JSON API call:
     - `api.request`
@@ -47,17 +52,40 @@ xcodebuild -project ios_dashboard/SandboxedDashboard.xcodeproj \
 
 Result: build succeeded. Existing warning remains in `APIService.swift` about generic `T.Type` Sendability; it is unrelated to the diagnostics patch.
 
-Simulator work:
+Tests:
 
 ```bash
 xcrun simctl create OpenAgentPerf \
-  'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro' \
-  'com.apple.CoreSimulator.SimRuntime.iOS-26-4'
+  com.apple.CoreSimulator.SimDeviceType.iPhone-16 \
+  com.apple.CoreSimulator.SimRuntime.iOS-26-4
 xcrun simctl boot <device-id>
-xcrun simctl bootstatus <device-id> -b
+xcodebuild -project ios_dashboard/SandboxedDashboard.xcodeproj \
+  -scheme SandboxedDashboard \
+  -destination 'id=<device-id>' \
+  test
 ```
 
-The simulator booted, but `simctl launch` and `simctl listapps` hung after install on this CoreSimulator instance. That blocked a complete automated trace capture in this run. The app now emits signposts usable from Instruments once the simulator can launch the app:
+Result: 30 tests passed. Existing Swift 6 actor warnings remain in `NetworkResilienceTests` for `ControlView.migrateMissionCacheIfNeeded()` calls from a non-main-actor test method; unrelated to this performance pass.
+
+Trace work:
+
+```bash
+for template in 'SwiftUI' 'Time Profiler' 'Animation Hitches'; do
+  xcrun xctrace record \
+    --template "$template" \
+    --device <device-id> \
+    --launch md.thomas.openagent.dashboard \
+    --time-limit 5s \
+    --output "/tmp/SandboxedDashboard-${template// /-}.trace"
+done
+```
+
+Result:
+- SwiftUI launched the app and saved `/tmp/SandboxedDashboard-SwiftUI.trace`, but reported that the SwiftUI instrument is not supported on this Simulator runtime.
+- Time Profiler launched the app, but did not end the recording after the requested 5-second time limit and was stopped by the timeout wrapper. A partial `/tmp/SandboxedDashboard-Time-Profiler.trace` bundle was left.
+- Animation Hitches launched the app and saved `/tmp/SandboxedDashboard-Animation-Hitches.trace`, but reported that Hitches is not supported on this platform.
+
+The temporary simulator was shut down and deleted. Manual Instruments capture on a physical iOS device, or a simulator/runtime that supports these instruments, is still useful with these templates:
 
 ```bash
 xcrun xctrace record \
@@ -91,65 +119,58 @@ category == "ControlPerformance"
 
 ## Diagnostics
 
-1. **Chat history replay is still O(events x messages) in practice.**
-   `applyViewingMissionWithEvents` replays every stored event through `handleStreamEvent`. Inside the replay, several event cases call `messages.contains`, `messages.firstIndex`, `messages.lastIndex`, and `messages.removeAll`. On long missions this becomes the dominant CPU path after the network snapshot returns.
+1. **Fixed: historical chat replay no longer replays through UI state.**
+   `applyViewingMissionWithEvents` now uses `ChatHistoryReducer.reduce(events:mission:)`, which builds `[ChatMessage]` in a pure pass with indexed ids/tool calls/text-op buffers and assigns `messages` once. Live tail deltas still use `handleStreamEvent`, which is acceptable because those batches are small.
 
-2. **Assistant markdown is reparsed in SwiftUI body.**
-   `MarkdownView.body` calls `MarkdownParser.parse(content)` every time SwiftUI evaluates the row. Large assistant messages, tables, code blocks, and image-rich responses can repeatedly pay regex + line parser + `AttributedString(markdown:)` costs. The new `markdown.parse` signpost should confirm this during scroll and mission load.
+2. **Fixed: assistant markdown parsing is cached.**
+   `MarkdownView` caches block parsing and inline attributed text by content hash. Cache misses still emit `markdown.parse` timing when Control Diagnostics is enabled.
 
-3. **Hot redraws are likely row-wide, not cell-local.**
-   `MessageBubble` receives full `ChatMessage` values and the parent view owns many unrelated `@State` values. State changes such as polling, queue count, copied id, connection status, diagnostics overlay updates, and running missions can cause visible chat rows to re-evaluate. The render probes will show whether `MessageBubble`/`MarkdownView` counts rise when unrelated toolbar or polling state changes.
+3. **Fixed: chat rows have a narrower render boundary.**
+   The conversation rows now live in `ConversationRowsView`, which receives only grouped items, copy/retry closures, and tool expansion state. Further row-level `Equatable` models are an optional follow-up if Instruments shows redraws from unrelated parent state.
 
 4. **The diagnostics overlay itself is intentionally debug-only but can perturb results.**
    When enabled, body probes mutate an in-memory counter and `markdown.parse` timing wraps parsing. Use it to identify suspicious paths, then confirm with Instruments signposts with the overlay hidden.
 
-5. **Mission switching has good cache-first behavior but still performs main-actor decode/replay.**
-   Cached mission data is read and decoded synchronously before render. This is good for perceived latency when files are small, but large cached missions still consume main-thread time before the first interactive frame.
+5. **Fixed: large mission cache decode moves off the first render.**
+   Small cache files keep the synchronous fast path. Cache files above the threshold are decoded in a detached task and applied only if they are still relevant and not older than an already-applied snapshot.
 
 6. **Running-mission and child-mission polling can still invalidate ControlView regularly.**
    The code already backs off on failures and gates child-mission fetches, but successful 5-second polling mutates `runningMissions` on the parent view. This can drive redraws in the chat subtree unless the chat list is isolated from polling state.
 
-7. **History, Files, and Settings perform sorted/filter computed properties in view render paths.**
-   Examples:
-   - `HistoryView.filteredMissions`
-   - `FilesView.sortedEntries`
-   - mission switcher/search helpers in `ControlView`
-   These are probably fine for small lists but should be measured if the whole app feels sluggish outside chat.
+7. **Fixed: list sorting/filtering is memoized outside body.**
+   `HistoryView.filteredMissions`, `FilesView.sortedEntries`, and mission switcher running/recent/search sections are now state-backed and recomputed when their inputs change.
 
-8. **Inline/shared image loading has no explicit memory cache.**
-   Inline markdown images and shared file images hold decoded `Data` in row state. Rows recreated during navigation or identity changes can refetch/redecode images. Use Instruments Allocations + Network to confirm when image-heavy chats are slow.
+8. **Fixed: inline/shared images use a memory cache and downsampling.**
+   `ImageMemoryCache` stores decoded images by URL and downscales large images off the main actor before SwiftUI renders them.
 
-9. **Timers in row/sheet components can contribute to unnecessary invalidations.**
-   Several control subviews start timers on appear for durations/progress. If many tool rows are visible, timer-driven body refreshes can stack. Render probes around `ToolGroupView` help detect this.
+9. **Fixed enough: row timers are scoped to visible active work.**
+   Tool/thinking timers only start after the row appears, only run while the tool/thought is active, and cancel on disappear/completion. A shared elapsed-time ticker is not needed unless future profiling shows many simultaneously active rows.
 
 ## Recommended Fixes
 
-1. **Replace replay-through-UI-state with a pure reducer.**
+1. **Done: replace replay-through-UI-state with a pure reducer.**
    Build `[ChatMessage]` from `[StoredEvent]` in a pure function using dictionaries/sets for ids (`messageById`, `toolById`, active thinking id). Assign `messages` once at the end. This removes repeated array scans and avoids transient SwiftUI invalidations during replay.
 
-2. **Cache parsed markdown per message id/content hash.**
+2. **Done: cache parsed markdown per content hash.**
    Move markdown parsing out of `body`, or introduce a `ParsedMarkdown` cache keyed by message id + content hash. For streaming content, debounce parsing to frame cadence or parse only the active message incrementally.
 
-3. **Isolate chat list state from toolbar/polling state.**
+3. **Done: isolate chat list state from toolbar/polling state.**
    Extract the conversation list into a small view model or child view that only receives `groupedItems`, copy/retry closures, and scroll state. Keep `runningMissions`, queue polling, sheets, and toolbar state out of the row subtree.
 
-4. **Track rendered message ids during replay.**
+4. **Done: track rendered message ids during replay.**
    Even before a full reducer refactor, maintain a temporary `Set<String>` during historical replay so duplicate checks are O(1) instead of `messages.contains`.
 
-5. **Move cache decode off the first render when the cache file is large.**
+5. **Done: move cache decode off the first render when the cache file is large.**
    For cache files over a small threshold, render the skeleton immediately and decode in a background task, then publish the decoded snapshot. Keep the current sync fast path for small cache files.
 
-6. **Memoize sorted/filter lists outside view bodies.**
+6. **Done: memoize sorted/filter lists outside view bodies.**
    For History, Files, and mission switcher/search, compute sorted/filter outputs when source arrays or query/filter settings change, not every `body` evaluation.
 
-7. **Use `EquatableView` or narrower Equatable row models for chat rows.**
+7. **Optional follow-up: use `EquatableView` or narrower Equatable row models for chat rows.**
    Make visible rows skip body work when unrelated state changes. This is especially important for assistant rows with expensive markdown.
 
-8. **Add image cache and downsampling.**
+8. **Done: add image cache and downsampling.**
    Use `URLCache`/`NSCache` keyed by resolved download URL and downsample large images before storing in SwiftUI state. This should reduce both network repeat work and memory spikes.
 
-9. **Run the three trace templates on a configured simulator session.**
-   After CoreSimulator launch is healthy, capture:
-   - SwiftUI: body invalidation and diffing hot spots.
-   - Time Profiler: reducer/replay/markdown CPU cost.
-   - Animation Hitches: chat load and scroll frame drops.
+9. **Done with current simulator limits: run trace templates on a configured simulator session.**
+   All three requested templates were run against a booted iPhone 16 simulator. SwiftUI and Animation Hitches are unsupported by this simulator/runtime; Time Profiler launches but does not stop cleanly from `xctrace` here. Use a physical device for complete trace data.

@@ -2156,11 +2156,8 @@ fn update_provider_oauth_for_chatgpt_account(
             .and_then(|o| o.get("access_token"))
             .and_then(|v| v.as_str())
             .and_then(extract_chatgpt_account_id);
-        let matches = stored_account_id
-            .as_deref()
-            .or(decoded_account_id.as_deref())
-            .map(|s| s == account_id)
-            .unwrap_or(false);
+        let matches = stored_account_id.as_deref() == Some(account_id)
+            || decoded_account_id.as_deref() == Some(account_id);
         if !matches {
             continue;
         }

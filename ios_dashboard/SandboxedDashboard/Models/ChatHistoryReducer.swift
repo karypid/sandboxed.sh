@@ -8,13 +8,22 @@
 import Foundation
 
 enum ChatHistoryReducer {
+    struct ReplayResult {
+        let messages: [ChatMessage]
+        let textOpBuffers: [String: String]
+    }
+
     static func reduce(events: [StoredEvent], mission: Mission) -> [ChatMessage] {
+        reduceWithState(events: events, mission: mission).messages
+    }
+
+    static func reduceWithState(events: [StoredEvent], mission: Mission) -> ReplayResult {
         var state = State(mission: mission)
         for event in ordered(events) {
             state.apply(event)
         }
         state.finalizeActiveToolCalls(withState: .success)
-        return state.messages
+        return ReplayResult(messages: state.messages, textOpBuffers: state.textOpBuffers)
     }
 
     private static func ordered(_ events: [StoredEvent]) -> [StoredEvent] {
@@ -31,6 +40,7 @@ enum ChatHistoryReducer {
         var messageIds = Set<String>()
         var toolMessageIndexByCallId: [String: Int] = [:]
         var textOpBuffers: [String: String] = [:]
+        private let streamingThoughtPrefix = "stream-thinking-"
 
         mutating func apply(_ event: StoredEvent) {
             var data = event.metadata.mapValues(\.value)
@@ -257,7 +267,14 @@ enum ChatHistoryReducer {
             textOpBuffers[bubbleId] = finalized ? nil : content
             guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
             removePhaseMessages()
-            let id = "stream-thinking-\(bubbleId)"
+
+            if let activeRealThought = messages.last(where: {
+                $0.isThinking && !$0.thinkingDone && !$0.id.hasPrefix(streamingThoughtPrefix)
+            }), !activeRealThought.content.isEmpty {
+                return
+            }
+
+            let id = "\(streamingThoughtPrefix)\(bubbleId)"
             if let index = messages.lastIndex(where: { $0.isThinking && !$0.thinkingDone && $0.id == id }) {
                 messages[index] = ChatMessage(
                     id: id,
