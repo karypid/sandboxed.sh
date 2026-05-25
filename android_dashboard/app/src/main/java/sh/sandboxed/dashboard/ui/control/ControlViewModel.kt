@@ -152,14 +152,14 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
             runCatching { container.api.resumeMission(id) }
                 .onSuccess { if (id == _state.value.mission?.id) _state.update { st -> st.copy(mission = it) } }
             loadRecentMissions()
-            refreshRunning()
+            runCatching { refreshRunning() }
         }
     }
     fun cancelMission(id: String) {
         viewModelScope.launch {
             runCatching { container.api.cancelMission(id) }
             loadRecentMissions()
-            refreshRunning()
+            runCatching { refreshRunning() }
         }
     }
     fun deleteMission(id: String) {
@@ -189,7 +189,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 lastSeq = null
                 _state.update { it.copy(mission = mission, messages = emptyList(), childMissions = emptyList(), goalStatus = null, progress = null) }
                 container.settings.setLastMission(mission.id)
-                refreshRunning()
+                runCatching { refreshRunning() }
             }.onFailure { e ->
                 _state.update { it.copy(error = e.message) }
             }
@@ -227,7 +227,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 }
                 container.settings.setLastMission(mission.id)
                 container.settings.setDraft(prompt)
-                refreshRunning()
+                runCatching { refreshRunning() }
             }.onFailure { e ->
                 _state.update { it.copy(error = e.message) }
             }
@@ -459,7 +459,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                         },
                     )
                 }
-                viewModelScope.launch { refreshRunning() }
+                viewModelScope.launch { runCatching { refreshRunning() } }
             }
             "mission_title_changed" -> {
                 val t = s("title") ?: return
@@ -471,12 +471,12 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                         childMissions = st.childMissions.map { if (it.id == eventMissionId) it.copy(title = t) else it },
                     )
                 }
-                if (live) viewModelScope.launch { refreshRunning() }
+                if (live) viewModelScope.launch { runCatching { refreshRunning() } }
             }
             "mission_metadata_updated" -> {
                 val id = s("mission_id") ?: return
                 applyMissionMetadataUpdate(id, obj)
-                if (live) viewModelScope.launch { refreshRunning() }
+                if (live) viewModelScope.launch { runCatching { refreshRunning() } }
             }
             "status" -> {
                 if (eventMissionId != null && eventMissionId != _state.value.mission?.id) return
@@ -490,7 +490,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                         progress = if (runState == ControlRunState.IDLE) null else st.progress,
                     )
                 }
-                if (shouldRefreshQueue) viewModelScope.launch { refreshQueue() }
+                if (shouldRefreshQueue) viewModelScope.launch { runCatching { refreshQueue() } }
             }
             "error" -> _state.update { it.copy(error = s("message")) }
         }

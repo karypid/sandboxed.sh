@@ -42,6 +42,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -60,6 +61,8 @@ import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.Workspace
 import sh.sandboxed.dashboard.data.api.TerminalEvent
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.theme.Palette
 import sh.sandboxed.dashboard.util.Ansi
 
@@ -231,7 +234,7 @@ fun TerminalScreen(container: AppContainer) {
             Text("Terminal", style = MaterialTheme.typography.titleMedium, color = Palette.TextPrimary)
             Spacer(Modifier.width(8.dp))
             Box {
-                TextButton(onClick = { menu = true }) {
+                TextButton(onClick = { menu = true }, modifier = Modifier.tag(TestTags.TERMINAL_WORKSPACE)) {
                     Text(activeWorkspace?.name ?: "default", color = Palette.AccentLight, style = MaterialTheme.typography.labelMedium)
                 }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
@@ -246,6 +249,7 @@ fun TerminalScreen(container: AppContainer) {
                 if (state.connected) "● connected" else "○ offline",
                 color = if (state.connected) Palette.Success else Palette.Warning,
                 style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.tag(TestTags.TERMINAL_STATUS),
             )
         }
         LazyColumn(
@@ -280,7 +284,7 @@ fun TerminalScreen(container: AppContainer) {
                     onValueChange = vm::setDraft,
                     cursorBrush = SolidColor(Palette.Accent),
                     textStyle = TextStyle(fontFamily = FontFamily.Monospace, color = Palette.TextPrimary, fontSize = 13.sp),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().tag(TestTags.TERMINAL_INPUT),
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                     keyboardActions = KeyboardActions(onSend = { if (canSend) vm.submit() }),
@@ -292,7 +296,7 @@ fun TerminalScreen(container: AppContainer) {
             IconButton(
                 onClick = vm::submit,
                 enabled = canSend,
-                modifier = Modifier.size(48.dp),
+                modifier = Modifier.size(48.dp).tag(TestTags.TERMINAL_SEND),
             ) {
                 Icon(
                     Icons.AutoMirrored.Filled.KeyboardReturn,

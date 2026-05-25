@@ -53,6 +53,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -66,6 +67,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.api.DesktopStreamEvent
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.theme.Palette
 import kotlin.math.roundToInt
@@ -216,7 +219,7 @@ fun DesktopStreamScreen(container: AppContainer, initialDisplay: String) {
                 error != null -> {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         ErrorBanner(error)
-                        Button(onClick = { vm.connect() }, colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent)) {
+                        Button(onClick = { vm.connect() }, colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent), modifier = Modifier.tag(TestTags.DESKTOP_RETRY)) {
                             Text("Retry")
                         }
                     }
@@ -263,7 +266,7 @@ private fun DesktopHeader(
                 style = MaterialTheme.typography.bodySmall,
             )
         }
-        IconButton(onClick = onPause, enabled = state.connected) {
+        IconButton(onClick = onPause, enabled = state.connected, modifier = Modifier.tag(TestTags.DESKTOP_PAUSE)) {
             Icon(if (state.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause, "Pause stream", tint = Palette.Accent)
         }
         IconButton(onClick = onReconnect) {
@@ -285,6 +288,7 @@ private fun DisplayPicker(current: String, onSelect: (String) -> Unit) {
                 selected = current == display,
                 onClick = { onSelect(display) },
                 label = { Text(display, style = MaterialTheme.typography.labelMedium) },
+                modifier = Modifier.tag(TestTags.desktopDisplay(display)),
                 colors = FilterChipDefaults.filterChipColors(
                     containerColor = Palette.Card,
                     selectedContainerColor = Palette.Accent.copy(alpha = 0.18f),
@@ -343,18 +347,18 @@ private fun DesktopControls(
                 onValueChange = onTypedText,
                 singleLine = true,
                 placeholder = { Text("Type text", color = Palette.TextMuted) },
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).tag(TestTags.DESKTOP_TYPE_TEXT),
                 colors = controlFieldColors(),
             )
-            Button(onClick = onType, enabled = typedText.isNotBlank(), colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent)) {
+            Button(onClick = onType, enabled = typedText.isNotBlank(), colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent), modifier = Modifier.tag(TestTags.DESKTOP_TYPE_SUBMIT)) {
                 Text("Type")
             }
         }
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            item { QuickKey("Return") { onKey("Return") } }
-            item { QuickKey("Esc") { onKey("Escape") } }
-            item { QuickKey("Ctrl+L") { onKey("ctrl+l") } }
-            item { QuickKey("Tab") { onKey("Tab") } }
+            item { QuickKey("Return", TestTags.DESKTOP_KEY_RETURN) { onKey("Return") } }
+            item { QuickKey("Esc", TestTags.DESKTOP_KEY_ESC) { onKey("Escape") } }
+            item { QuickKey("Ctrl+L", TestTags.DESKTOP_KEY_CTRL_L) { onKey("ctrl+l") } }
+            item { QuickKey("Tab", TestTags.DESKTOP_KEY_TAB) { onKey("Tab") } }
             item {
                 IconButton(onClick = { onScroll(-360) }) {
                     Icon(Icons.Filled.KeyboardArrowUp, "Scroll up", tint = Palette.TextSecondary)
@@ -384,8 +388,8 @@ private fun SliderRow(label: String, value: Int, minLabel: String, maxLabel: Str
 }
 
 @Composable
-private fun QuickKey(label: String, onClick: () -> Unit) {
-    Button(onClick = onClick, colors = ButtonDefaults.buttonColors(containerColor = Palette.Card)) {
+private fun QuickKey(label: String, tag: String, onClick: () -> Unit) {
+    Button(onClick = onClick, colors = ButtonDefaults.buttonColors(containerColor = Palette.Card), modifier = Modifier.testTag(tag)) {
         Text(label, color = Palette.TextPrimary, style = MaterialTheme.typography.labelMedium)
     }
 }

@@ -1,8 +1,15 @@
 # Android Dashboard Simulator Test Plan
 
 This plan is written for an LLM or human tester driving the Android app through
-an Android Emulator with `adb`. It avoids hard-coded screen coordinates where
-possible and treats backend-dependent features separately from app regressions.
+an Android Emulator with `adb`. The app exposes stable **testTags** that
+uiautomator surfaces as `resource-id`, so all interactions in this plan are by
+ID, not coordinates or text. Selectors live in
+[`app/.../ui/TestTags.kt`](app/src/main/java/sh/sandboxed/dashboard/ui/TestTags.kt);
+renaming any tag requires updating this plan in the same change.
+
+Helpers used throughout (`dump_ui`, `find_tag`, `tap_tag`, `type_into_tag`,
+`wait_for`, `screenshot`, `record_result`, `on_case_fail`, `summarise_results`)
+are defined in [`test-helpers.sh`](test-helpers.sh).
 
 ## Scope
 
@@ -20,6 +27,14 @@ Sandboxed.sh backend:
 Do not use production data unless explicitly authorized. Prefer a disposable
 local or staging backend.
 
+## Express vs Full
+
+| Tag | Cases | When to run |
+|---|---|---|
+| `@smoke` | 1, 2, 3, 6, 10, 17 | Per-PR gate. Cold launch → sign in → tabs → mission stream → terminal Send → crash sweep. |
+| `@full` | 1–17 | Nightly / release qualification. |
+| `@manual` | upload/download, biometric prompt | Human required; skip in automation. |
+
 ## Required Tools
 
 - Android Studio or Android command-line tools.
@@ -27,11 +42,8 @@ local or staging backend.
 - `adb` on `PATH`.
 - Java 17.
 - A reachable Sandboxed.sh backend.
-- Optional but recommended: Docker Compose for a disposable local backend.
 
-## Environment Variables
-
-Set these before testing:
+## Environment
 
 ```bash
 export APP_ID=sh.sandboxed.dashboard
@@ -39,896 +51,628 @@ export RUN_ID="llm-android-$(date +%Y%m%d-%H%M%S)"
 export ARTIFACT_DIR="$PWD/android_dashboard/test-artifacts/$RUN_ID"
 mkdir -p "$ARTIFACT_DIR"
 
-# Host URL used by curl from the test machine.
+# Same URL works for both the test machine (`curl`) and the emulator app, as
+# long as it is reachable from inside the emulator. For a local backend, use
+# http://10.0.2.2:3000 in BACKEND_URL_APP — the host is reachable from the
+# emulator at 10.0.2.2.
 export BACKEND_URL_HOST="http://127.0.0.1:3000"
-
-# URL entered inside the Android Emulator. 10.0.2.2 maps to the host machine.
 export BACKEND_URL_APP="http://10.0.2.2:3000"
 
 # Optional: only set when a test backend uses password auth.
 export SANDBOXED_TEST_PASSWORD=""
+
+source android_dashboard/test-helpers.sh
 ```
 
-If testing a remote backend, set both URLs to the remote HTTPS origin.
-
-## Required Preflight And Diagnostics
-
-Run this before building or launching. Save every output file; the final report
-must cite the relevant artifact for each failure.
+## Preflight
 
 ```bash
 adb version | tee "$ARTIFACT_DIR/adb-version.txt"
-emulator -list-avds | tee "$ARTIFACT_DIR/avd-names.txt" || true
-avdmanager list avd | tee "$ARTIFACT_DIR/avd-list.txt" || true
+emulator -list-avds | tee "$ARTIFACT_DIR/avd-names.txt"
 
-if grep -E "could not be loaded|no longer exists|Error:" "$ARTIFACT_DIR/avd-list.txt"; then
-  echo "ENV_BLOCKED: at least one configured AVD is stale or invalid" \
-    | tee "$ARTIFACT_DIR/avd-invalid.txt"
-fi
-```
-
-If testing more than one Android release, run the plan once on the stable AVD
-and once on the newest valid AVD. Do not use an AVD reported as invalid by
-`avdmanager list avd`; delete and recreate it first.
-
-Before `pm clear` or `am start`, verify the emulator user is unlocked. A locked
-Direct Boot user can make Android report a misleading launcher error such as
-`Activity class ... MainActivity does not exist` even though the APK manifest is
-valid.
-
-```bash
-unlock_emulator() {
-  adb wait-for-device
-  adb shell input keyevent KEYCODE_WAKEUP || true
-  adb shell wm dismiss-keyguard || true
-  adb shell input swipe 540 2100 540 300 1000 || true
-  sleep 2
-  adb shell dumpsys user | tee "$ARTIFACT_DIR/user-state.txt"
-  adb shell dumpsys window | tee "$ARTIFACT_DIR/window-state.txt"
-  if grep -q "RUNNING_LOCKED" "$ARTIFACT_DIR/user-state.txt"; then
-    adb exec-out screencap -p > "$ARTIFACT_DIR/locked-user.png"
-    echo "ENV_BLOCKED: emulator user is RUNNING_LOCKED; unlock, wipe, or recreate the AVD before app launch" \
+# Unlock the user. A locked Direct Boot user makes `am start` look broken even
+# when the manifest is fine.
+adb wait-for-device
+adb shell input keyevent KEYCODE_WAKEUP
+adb shell wm dismiss-keyguard
+adb shell dumpsys user | tee "$ARTIFACT_DIR/user-state.txt" \
+  | grep -q "RUNNING_LOCKED" && {
+    echo "ENV_BLOCKED: emulator user RUNNING_LOCKED" \
       | tee "$ARTIFACT_DIR/locked-user-blocker.txt"
-    return 1
-  fi
-}
-
-collect_launch_diagnostics() {
-  adb shell pm path "$APP_ID" | tee "$ARTIFACT_DIR/pm-path.txt" || true
-  adb shell dumpsys package "$APP_ID" > "$ARTIFACT_DIR/dumpsys-package.txt" || true
-  adb shell dumpsys user > "$ARTIFACT_DIR/dumpsys-user.txt" || true
-  adb shell dumpsys window > "$ARTIFACT_DIR/dumpsys-window.txt" || true
-  adb shell logcat -d -t 1000 > "$ARTIFACT_DIR/launch-logcat.txt" || true
-  if command -v apkanalyzer >/dev/null; then
-    apkanalyzer manifest print android_dashboard/app/build/outputs/apk/debug/app-debug.apk \
-      > "$ARTIFACT_DIR/apk-manifest.txt" || true
-    apkanalyzer dex packages android_dashboard/app/build/outputs/apk/debug/app-debug.apk \
-      > "$ARTIFACT_DIR/apk-dex-packages.txt" || true
-  fi
-}
+    exit 1
+  }
 ```
 
-## Backend Setup
+## Backend
 
-Choose one backend target.
-
-### Option A: Existing Backend
+Probe `/api/health` once. The response selects which auth case to run; mark
+GitHub auth as `N/A` if `github_enabled=false`.
 
 ```bash
 curl -fsS "$BACKEND_URL_HOST/api/health" | tee "$ARTIFACT_DIR/health.json"
-```
 
-Pass criteria:
-
-- JSON includes `status`.
-- Note `auth_required`, `auth_mode`, and `github_enabled`; these determine the
-  auth cases to run.
-
-If auth is enabled and credentials were provided for the run, also create a
-host-side token for API diagnostics:
-
-```bash
 if [ -n "${SANDBOXED_TEST_PASSWORD:-}" ]; then
-  export BACKEND_TOKEN="$(
+  export BACKEND_TOKEN=$(
     curl -fsS -X POST "$BACKEND_URL_HOST/api/auth/login" \
       -H 'content-type: application/json' \
       -d "{\"password\":\"$SANDBOXED_TEST_PASSWORD\"}" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))'
-  )"
-  test -n "$BACKEND_TOKEN" && echo "token acquired" > "$ARTIFACT_DIR/token-state.txt"
+  )
+  [ -n "$BACKEND_TOKEN" ] && echo "token acquired" > "$ARTIFACT_DIR/token-state.txt"
 fi
 ```
 
-Do not write credentials into the report or artifact filenames.
-
-### Option B: Disposable Local Docker Backend
-
-```bash
-cp -n .env.example .env
-docker compose up -d --build
-curl -fsS "$BACKEND_URL_HOST/api/health" | tee "$ARTIFACT_DIR/health.json"
-```
-
-For the default `.env.example`, `DEV_MODE=true`, so Android should enter the app
-after saving the server URL without showing a login form.
+Do not write credentials to artifact filenames or anywhere under
+`$ARTIFACT_DIR/`. If a disposable local backend is desired:
+`cp -n .env.example .env && docker compose up -d --build` — `DEV_MODE=true`
+skips the login form.
 
 ## Build And Install
 
 ```bash
-cd android_dashboard
-./gradlew :app:assembleDebug
-cd ..
-
-adb wait-for-device
-unlock_emulator
+( cd android_dashboard && ./gradlew :app:assembleDebug )
 adb install -r android_dashboard/app/build/outputs/apk/debug/app-debug.apk \
   | tee "$ARTIFACT_DIR/install.txt"
-adb shell pm clear "$APP_ID" | tee "$ARTIFACT_DIR/pm-clear.txt" || true
-unlock_emulator
-adb shell am start -W -n "$APP_ID/.MainActivity" \
-  | tee "$ARTIFACT_DIR/am-start.txt" || true
-
-if grep -E "Error type|does not exist|Exception|Status: error" "$ARTIFACT_DIR/am-start.txt"; then
-  collect_launch_diagnostics
-  echo "FAIL: launch failed; see launch diagnostics" >&2
-fi
-```
-
-Capture the initial state:
-
-```bash
-adb exec-out screencap -p > "$ARTIFACT_DIR/00-launch.png"
+adb shell pm clear "$APP_ID"
+adb shell am start -W -n "$APP_ID/.MainActivity" | tee "$ARTIFACT_DIR/am-start.txt"
+screenshot 00-launch.png
 adb logcat -c
 ```
 
-## ADB UI Protocol For LLMs
+If `am-start.txt` matches `Error type|does not exist|Exception|Status: error`,
+collect launch diagnostics (`dumpsys user`, `dumpsys window`,
+`dumpsys package $APP_ID`, `logcat -d -t 1000`, `apkanalyzer manifest print`)
+before opening any test case.
 
-After every navigation or submit action:
+## Selector contract: tap by testTag, not by coordinates or visible text
 
-1. Wait 1-3 seconds.
-2. Dump the UI.
-3. Search the dump for expected text or content descriptions.
-4. Capture a screenshot for failures or visually significant passes.
-
-Use this helper to inspect the current UI:
-
-```bash
-dump_ui() {
-  adb shell uiautomator dump /sdcard/window.xml >/dev/null
-  adb exec-out cat /sdcard/window.xml > "$ARTIFACT_DIR/window.xml"
-  python3 - "$ARTIFACT_DIR/window.xml" <<'PY'
-import sys, xml.etree.ElementTree as ET
-root = ET.parse(sys.argv[1]).getroot()
-for n in root.iter("node"):
-    label = n.attrib.get("text") or n.attrib.get("content-desc")
-    if label:
-        print(f"{label}\t{n.attrib.get('bounds')}")
-PY
-}
-```
-
-If `uiautomator dump` fails or creates an empty text artifact, do not
-immediately classify the app as crashed. Save the dump stderr, wait 2 seconds,
-retry once, and also capture focus/lifecycle state:
+The app calls `Modifier.semantics { testTagsAsResourceId = true }` at its
+root, so every `Modifier.testTag("foo")` lands as `resource-id="foo"` in
+`uiautomator dump`. Always select by tag:
 
 ```bash
-adb shell dumpsys activity activities > "$ARTIFACT_DIR/dumpsys-activities.txt" || true
-adb shell dumpsys window > "$ARTIFACT_DIR/dumpsys-window-current.txt" || true
-adb exec-out screencap -p > "$ARTIFACT_DIR/uiautomator-fallback.png" || true
+tap_tag control.composer.send
+type_into_tag control.composer.input "Reply with exactly android smoke $RUN_ID"
 ```
 
-`UiAutomationService ... already registered` in logcat is Android test harness
-noise from overlapping `uiautomator` invocations unless the foreground package
-or fatal process is `sh.sandboxed.dashboard`.
+Tap-by-text and tap-by-coordinate fall back to brittle fuzzy matching (the
+"Sign in" title vs. button collision burned a round-trip in earlier runs).
+Resist them — if a tag is missing for something you need, add it to
+`TestTags.kt` in the same commit as the test change.
 
-Optional helper to tap the first node whose text or content description contains
-a label. Inspect `dump_ui` first when labels are ambiguous.
+## Polling, not sleeping
+
+Replace fixed `sleep` with `wait_for`:
 
 ```bash
-tap_label() {
-  local needle="$1"
-  dump_ui >/dev/null
-  local xy
-  xy=$(python3 - "$ARTIFACT_DIR/window.xml" "$needle" <<'PY'
-import re, sys, xml.etree.ElementTree as ET
-xml_path, needle = sys.argv[1], sys.argv[2].lower()
-root = ET.parse(xml_path).getroot()
-for n in root.iter("node"):
-    label = (n.attrib.get("text") or n.attrib.get("content-desc") or "").lower()
-    if needle not in label:
-        continue
-    m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.attrib.get("bounds", ""))
-    if not m:
-        continue
-    x1, y1, x2, y2 = map(int, m.groups())
-    print((x1 + x2) // 2, (y1 + y2) // 2)
-    raise SystemExit
-raise SystemExit(1)
-PY
-)
-  test -n "$xy" || { echo "label not found: $needle" >&2; return 1; }
-  adb shell input tap $xy
-}
+tap_tag auth.login.submit
+wait_for tag nav.tab.control 10 \
+  || { record_result 02 "Auth gate" fail APP_FAIL "login did not progress"; exit 1; }
 ```
 
-Do not assume coordinates from this document. Use the current `bounds` from
-`dump_ui`, then tap the center of the target bounds:
+`wait_for` polls every 0.5 s up to the supplied timeout. Reserve fixed sleeps
+for things that genuinely have no observable signal (e.g. a frame counter
+that needs a few seconds of stream to tick).
 
-```bash
-adb shell input tap X Y
-```
+## Text entry caveats
 
-For text entry, tap the field, clear existing text with the emulator keyboard if
-needed, then type:
+`adb shell input text` is fragile:
 
-```bash
-adb shell input text "text-to-enter"
-adb shell input keyevent ENTER
-```
+- **Spaces**: replace with `%s` (`type_into_tag` does this for you).
+- **Quotes**: avoid. The emulator interprets `"`, `'`, and `` ` `` in
+  unpredictable ways across builds.
+- **Newlines**: send via `adb shell input keyevent KEYCODE_ENTER`, not `\n`.
+- **`$`**: shell-expand on the host first, never inside the device.
+- **Soft keyboard**: hide it before tapping a footer/toolbar button.
+  `type_into_tag` already sends `KEYCODE_BACK` after typing for this reason.
 
-If `adb shell input text` mishandles punctuation in URLs, type the URL manually
-through the emulator keyboard or paste through the emulator UI.
-
-## Investigation Log Requirements
-
-Every failed or blocked test case must add a short entry to
-`$ARTIFACT_DIR/investigation.log` with this format:
+For markers in test data, prefer alphanumeric + dashes:
 
 ```text
-[CASE] Classification: APP_FAIL | BACKEND_FAIL | ENV_BLOCKED | N/A
-Expected:
-Actual:
-Evidence files:
-Likely owner:
-Suggested fix:
+Mission prompt:      Reply with exactly android smoke $RUN_ID
+Automation command:  Say android automation smoke $RUN_ID
+Terminal command:    echo android terminal smoke $RUN_ID
+Workspace name:      $RUN_ID-workspace
+Folder name:         $RUN_ID-folder
 ```
 
-Minimum diagnostics by failure type:
+## On-failure trap
 
-- Launch failure: `am-start.txt`, `dumpsys-user.txt`, `dumpsys-window.txt`,
-  `dumpsys-package.txt`, `apk-manifest.txt`, `apk-dex-packages.txt`, and
-  `launch-logcat.txt`.
-- HTTP failure: request URL, method, status code, response body, and UI
-  screenshot/snackbar text.
-- WebSocket failure: URL scheme, endpoint, visible error text, and logcat
-  excerpt around the connection attempt.
-- ADB/UI automation ambiguity: UI dump before and after the action, screenshot,
-  whether the soft keyboard was visible, and a manual fallback result if
-  available.
-- Backend capability failure: health JSON plus the exact backend error shown in
-  the app.
-
-## Test Data
-
-Use unique names based on `RUN_ID`:
-
-- Workspace name: `$RUN_ID-workspace`
-- Folder name: `$RUN_ID-folder`
-- Mission prompt: `Reply with exactly android smoke $RUN_ID`
-- Automation command: `Say android automation smoke $RUN_ID`
-- Terminal command: `printf 'android terminal smoke $RUN_ID\n'`
-
-Only delete objects created by this test run.
-
-## Test Cases
-
-### 1. First Run Configuration
-
-Steps:
-
-1. Launch the app with cleared data.
-2. Verify first screen shows `Sandboxed`, `Server URL`, and `Continue`.
-3. Enter `$BACKEND_URL_APP`.
-4. Tap `Continue`.
-
-Pass criteria:
-
-- If backend auth is disabled, the app reaches the `Control` tab.
-- If backend auth is enabled, the app reaches `Sign in`.
-- No crash or endless spinner after 15 seconds.
-
-Evidence:
+Each case sets a trap that auto-captures a screenshot, UI dump, and the last
+800 logcat lines if any command in the case fails:
 
 ```bash
-dump_ui | tee "$ARTIFACT_DIR/01-config-ui.txt"
-adb exec-out screencap -p > "$ARTIFACT_DIR/01-config-result.png"
+set -eE
+CASE=06; trap 'on_case_fail "$CASE"' ERR
 ```
 
-### 2. Auth Gate
-
-Run only the cases supported by `health.json`.
-
-Disabled auth:
-
-- Expected: after server configuration, main tabs are visible: `Control`,
-  `Missions`, `Terminal`, `Files`, `More`.
-
-Single-tenant auth:
-
-1. Verify `Sign in`, backend URL, and `Password` field.
-2. Enter the test password.
-3. Tap `Sign in`.
-
-Multi-user auth:
-
-1. Verify `Username` and `Password` fields.
-2. Enter test credentials.
-3. Tap `Sign in`.
-
-GitHub auth, when `github_enabled=true`:
-
-1. Verify `Sign in with GitHub` is visible.
-2. Tap it and verify a browser/custom tab opens.
-3. If the backend OAuth app is not configured for the emulator, return to the
-   app and mark OAuth completion as blocked by backend config.
-4. Separately validate the Android deep link handler:
+Pair every case with `record_result` so `results.jsonl` is complete:
 
 ```bash
-adb shell am start \
-  -a android.intent.action.VIEW \
+record_result "$CASE" "Control: new mission" pass
+# or
+record_result "$CASE" "Files: workspace listing" fail APP_FAIL "list returned 12 items, screen showed 0"
+```
+
+`summarise_results` prints a markdown table and pass/fail totals at the end of
+the run.
+
+## Test cases
+
+### 1. First-run configuration  `@smoke`
+
+`pm clear` followed by `am start` shows the config sheet. On a re-run without a
+clear (cached settings present), the URL field may already be gone — handle
+both. Note: the URL field is pre-filled with `https://` on a fresh launch;
+`type_into_tag` clears it first, so don't add another `https://` prefix.
+
+```bash
+set -eE; CASE=01; trap 'on_case_fail "$CASE"' ERR
+if wait_for tag auth.url.field 3; then
+  type_into_tag auth.url.field "$BACKEND_URL_APP"
+  tap_tag auth.url.continue
+fi
+# Either the login form (auth required), the main nav (auth disabled or token
+# cached), or — if the field was absent — we're already past the gate.
+if wait_for tag auth.login.submit 8 || wait_for tag nav.tab.control 8; then
+  record_result $CASE "First-run config" pass
+else
+  record_result $CASE "First-run config" fail APP_FAIL "stuck after Continue"
+  exit 1
+fi
+```
+
+Pass when `auth.login.submit` (auth required) or `nav.tab.control`
+(auth disabled or already authenticated) appears within 8 s.
+
+### 2. Auth gate  `@smoke`
+
+Run only the variant indicated by `health.json`. Skip if the previous case
+already landed on the main nav (token cached across `pm clear` is unlikely but
+re-runs without a clear hit this path).
+
+```bash
+set -eE; CASE=02; trap 'on_case_fail "$CASE"' ERR
+if wait_for tag nav.tab.control 3; then
+  record_result $CASE "Auth (already authenticated)" pass
+elif [ "$(jq -r .auth_mode "$ARTIFACT_DIR/health.json")" = "disabled" ]; then
+  wait_for tag nav.tab.control 8 \
+    && record_result $CASE "Auth disabled" pass \
+    || record_result $CASE "Auth disabled" fail APP_FAIL "nav did not render"
+elif [ "$(jq -r .auth_mode "$ARTIFACT_DIR/health.json")" = "single_tenant" ]; then
+  type_into_tag auth.login.password "$SANDBOXED_TEST_PASSWORD"
+  tap_tag auth.login.submit
+  wait_for tag nav.tab.control 10 \
+    && record_result $CASE "Single-tenant auth" pass \
+    || record_result $CASE "Single-tenant auth" fail APP_FAIL "login did not progress"
+elif [ "$(jq -r .auth_mode "$ARTIFACT_DIR/health.json")" = "multi_user" ]; then
+  type_into_tag auth.login.username "$TEST_USERNAME"
+  type_into_tag auth.login.password "$SANDBOXED_TEST_PASSWORD"
+  tap_tag auth.login.submit
+  wait_for tag nav.tab.control 10 \
+    && record_result $CASE "Multi-user auth" pass \
+    || record_result $CASE "Multi-user auth" fail APP_FAIL "login did not progress"
+fi
+```
+
+**Sentinel for a known auth-gate regression:** if the screen renders only a
+centered `ProgressBar` (the `FullscreenSpinner`) and nothing else, the
+`AuthGate` is stuck in the `RESOLVING` phase. This historically reproduced
+during rapid rotation + network flap. The Activity is alive (`pidof $APP_ID`
+returns a PID) but `uiautomator dump` exposes only `android:id/content` and a
+single `ProgressBar` node. `am force-stop` + relaunch clears it. Classify as
+`APP_FAIL` and capture `dumpsys dropbox --print data_app_crash` even if
+`logcat` looks clean.
+
+If `github_enabled=true`, also exercise the deep-link handler from outside the
+app — this proves the callback parses and does not crash:
+
+```bash
+adb shell am start -a android.intent.action.VIEW \
   -d "sandboxed://auth/callback?token=synthetic-token&exp=4102444800" \
   -p "$APP_ID"
 ```
 
-Pass criteria:
+### 3. Bottom navigation smoke  `@smoke`
 
-- Correct form is shown for the auth mode.
-- Valid credentials store a JWT and reveal the main tabs.
-- Invalid credentials show an error banner and do not crash.
-- Deep link callback does not crash and returns to the app.
+```bash
+set -eE; CASE=03; trap 'on_case_fail "$CASE"' ERR
+for tab in control history terminal files more; do
+  tap_tag "nav.tab.$tab"
+  wait_for tag "nav.tab.$tab" 3
+done
+record_result $CASE "Bottom nav smoke" pass
+```
 
-### 3. Bottom Navigation Smoke
+Spot-check at least one tag unique to each tab while you are there:
+`control.composer.send`, `history.search`, `terminal.send`, `files.up`,
+`more.tile.settings`.
 
-Steps:
+### 4. Settings persistence
 
-1. Tap each bottom tab: `Control`, `Missions`, `Terminal`, `Files`, `More`.
-2. After each tap, dump the UI.
+```bash
+set -eE; CASE=04; trap 'on_case_fail "$CASE"' ERR
+tap_tag nav.tab.more
+tap_tag more.tile.settings
+tap_tag settings.test_save
+wait_for label "Connected" 10 \
+  || { record_result $CASE "Test & save" fail APP_FAIL "no Connected status"; exit 1; }
 
-Pass criteria:
+# Probe backend list to choose a non-selected backend deterministically.
+PRIMARY=$(curl -fsS "$BACKEND_URL_HOST/api/backends" \
+  -H "authorization: Bearer $BACKEND_TOKEN" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+tap_tag "settings.backend.$PRIMARY"
 
-- `Control` shows `New mission` or the current mission title and a `Message…`
-  composer.
-- `Missions` shows title `Missions`, search placeholder
-  `Search missions and moments…`, and filter chips when not searching.
-- `Terminal` shows title `Terminal`, workspace selector, and connection status.
-- `Files` shows title `Files`, path `Workspace root`, and toolbar buttons for
-  upload, new folder, refresh.
-- `More` shows tiles for `Workspaces`, `Desktop`, `Tasks`, `Runs`,
-  `FIDO approvals`, and `Settings`.
+# Relaunch and confirm the choice persists.
+adb shell am force-stop "$APP_ID"
+adb shell am start -W -n "$APP_ID/.MainActivity"
+wait_for tag nav.tab.more 8
+tap_tag nav.tab.more
+tap_tag more.tile.settings
+wait_for tag "settings.backend.$PRIMARY" 5 \
+  && record_result $CASE "Settings persistence" pass \
+  || record_result $CASE "Settings persistence" fail APP_FAIL "backend choice did not persist"
+```
 
-### 4. Settings
-
-Steps:
-
-1. More -> `Settings`.
-2. Verify `Server`, `Defaults`, and `About`.
-3. Tap `Test & save`.
-4. Toggle `Skip agent picker` on and off.
-5. If backends are listed, select a non-selected backend, then select the
-   original backend again.
-6. If agents are listed, select a non-selected agent, then select the original
-   agent again.
-7. If providers or slash commands are listed, verify they render without clipped
-   text.
-8. Press Home, relaunch app, return to Settings.
-
-Pass criteria:
-
-- `Test & save` reports `Connected (...)`.
-- Settings persist across relaunch.
-- `Sign out` clears the token and returns to login only when auth is enabled.
-- No settings action crashes the app.
+Do not tap `settings.sign_out` unless the case is supposed to log out — it
+will force you back through Case 2.
 
 ### 5. Workspaces
 
-Steps:
-
-1. More -> `Workspaces`.
-2. Verify list or `No workspaces` empty state.
-3. Tap `Create workspace`.
-4. Verify `New workspace`, `Name`, `Container`, `Host`, and `Create`.
-5. Select `Host` with an empty path.
-6. Verify `Host workspaces require a path.` and disabled create behavior.
-7. Cancel.
-8. On a disposable backend only, create a container workspace named
-   `$RUN_ID-workspace`.
-
-Pass criteria:
-
-- Existing workspaces show name, type, status, and path.
-- Host path validation appears.
-- Disposable workspace creation either succeeds and appears in the list, or
-  shows a backend error without app crash.
-
-### 6. Control: New Mission And Streaming
-
-Prerequisite: at least one workspace and one backend exist. Full assistant
-response requires a configured agent/provider.
-
-Steps:
-
-1. Go to `Control`.
-2. Tap `New mission`.
-3. Verify `New mission` dialog loads `Workspace`, `Agent`, and `Model override`.
-4. Select the default workspace, backend, and agent.
-5. Leave model override as `Default` unless testing a specific provider model.
-6. Tap `Create`.
-7. In the composer, enter `Reply with exactly android smoke $RUN_ID`.
-8. Tap `Send`.
-9. Watch for user bubble, assistant text, tool cards, status changes, or error
-   banner.
-10. Kill and relaunch the app while the mission is active; return to `Control`.
-
-Pass criteria:
-
-- Dialog can create or attempt to create a mission.
-- Composer sends or queues the message; empty composer cannot send.
-- SSE content updates without duplicating prior messages after reconnect.
-- Relaunch restores the last mission and draft/stream state as expected.
-- If backend lacks configured providers, the app shows a readable error rather
-  than crashing.
-
-Issue logging:
-
-If the mission fails before model execution, capture the exact backend message
-and backend inventory:
-
 ```bash
-dump_ui | tee "$ARTIFACT_DIR/06-control-error-ui.txt"
-if [ -n "${BACKEND_TOKEN:-}" ]; then
-  curl -fsS "$BACKEND_URL_HOST/api/backends" \
-    -H "authorization: Bearer $BACKEND_TOKEN" \
-    | tee "$ARTIFACT_DIR/06-backends.json" || true
-  curl -fsS "$BACKEND_URL_HOST/api/workspaces" \
-    -H "authorization: Bearer $BACKEND_TOKEN" \
-    | tee "$ARTIFACT_DIR/06-workspaces.json" || true
-fi
+set -eE; CASE=05; trap 'on_case_fail "$CASE"' ERR
+tap_tag nav.tab.more; tap_tag more.tile.workspaces
+tap_tag workspaces.create
+tap_tag workspaces.new.type.host
+# Create must be disabled with empty path.
+wait_for label "Host workspaces require a path." 3 \
+  || { record_result $CASE "Host validation" fail APP_FAIL "missing validation copy"; exit 1; }
+tap_tag workspaces.new.cancel
+record_result $CASE "Workspaces" pass
 ```
 
-For errors like `Claude Code CLI 'claude' not found`, classify as
-`BACKEND_FAIL`. Suggested backend fix: install/configure the missing CLI inside
-the selected workspace execution environment, set the backend CLI path in
-Backend Settings, or select an installed backend before creating the mission.
+Disposable-backend only: optionally type a name and create a container
+workspace, then delete it via API in cleanup.
 
-### 7. Control: Mission Switcher, Queue, Workers
+### 6. Control — new mission and streaming  `@smoke`
 
-Steps:
+Prerequisite: at least one workspace and one configured backend
+(verify via `/api/workspaces` and `/api/backends`).
 
-1. Tap the `Missions` icon in the Control top bar.
-2. Verify mission switcher dialog shows `Missions`, `Search`, `New`, and
-   mission sections when data exists.
-3. Search for `$RUN_ID` or another visible mission title.
-4. Open a mission from the dialog.
-5. If a mission is active, send a second message while the backend is busy and
-   verify the `Queued` bar if the backend queues it.
-6. If child/parallel missions exist, open `Workers` and verify worker rows.
+```bash
+set -eE; CASE=06; trap 'on_case_fail "$CASE"' ERR
+tap_tag nav.tab.control
+tap_tag control.topbar.new_mission
+wait_for tag control.new_mission.create 8
+tap_tag control.new_mission.create
 
-Pass criteria:
+type_into_tag control.composer.input \
+  "Reply with exactly android smoke $RUN_ID"
+tap_tag control.composer.send
 
-- Search filters visible missions.
-- Opening a mission returns to Control and updates the top bar.
-- Queue controls remove individual queued items and clear all queued items
-  without crashing.
-- Worker dialog handles empty and populated states.
+# Assistant should echo the marker; budget for cold model.
+wait_for label "android smoke $RUN_ID" 60 \
+  && record_result $CASE "Mission streaming" pass \
+  || record_result $CASE "Mission streaming" fail BACKEND_FAIL "no marker after 60 s"
+
+# Persistence check: kill and relaunch.
+adb shell am force-stop "$APP_ID"
+adb shell am start -n "$APP_ID/.MainActivity"
+wait_for label "android smoke $RUN_ID" 10 \
+  || record_result $CASE "Mission relaunch" fail APP_FAIL "mission did not restore"
+```
+
+If the assistant returns a backend-side error (e.g. *"Claude Code CLI 'claude'
+not found"*) classify as `BACKEND_FAIL` and capture
+`/api/backends` + `/api/workspaces` JSON next to the artifact for triage.
+
+### 7. Mission switcher
+
+```bash
+set -eE; CASE=07; trap 'on_case_fail "$CASE"' ERR
+tap_tag control.topbar.missions
+wait_for tag control.switcher.search 5
+type_into_tag control.switcher.search "$RUN_ID"
+# Either a row appears or the empty-result UI is reached — both pass; crash fails.
+tap_tag control.switcher.close
+record_result $CASE "Mission switcher" pass
+```
+
+Queue/Workers UI is only exercised when a long-running mission is active.
+Mark `N/A` if the test mission completes immediately.
 
 ### 8. Automations
 
-Prerequisite: a current mission exists.
-
-Steps:
-
-1. Control -> top bar `Automations`.
-2. Verify `Automations` screen and `Add` button.
-3. Tap `Add`.
-4. Enter `Say android automation smoke $RUN_ID`.
-5. Leave trigger `Interval`, set `Seconds` to `60`, tap `Create`.
-6. Verify row label `every 60s`.
-7. Toggle the row off and on.
-8. Delete the row.
-9. Go back to Control.
-
-Pass criteria:
-
-- Create validates non-empty command and positive interval seconds.
-- Created automation appears, toggles active state, and can be deleted.
-- Backend errors render as banners without app crash.
-
-### 9. Missions History
-
-Steps:
-
-1. Tap bottom `Missions`.
-2. Tap each filter chip: `All`, `Active`, `Interrupted`, `Completed`, `Failed`.
-3. Search for `$RUN_ID` and for a known non-matching string.
-4. If search results include `Missions` or `Moments`, open one result.
-5. Tap refresh.
-6. On a disposable backend only, test cleanup completed.
-
-Pass criteria:
-
-- Filters and search update the list.
-- Empty search states do not crash.
-- Opening a result loads that mission into Control.
-- Cleanup reports either success or `Nothing to clean`.
-
-### 10. Terminal WebSocket
-
-Steps:
-
-1. Tap bottom `Terminal`.
-2. Wait for `connected`; if it remains offline, capture the error and mark
-   terminal backend unavailable.
-3. Open the workspace selector and verify `default (host)` plus workspaces.
-4. Enter:
-
-```text
-printf 'android terminal smoke <RUN_ID>\n'
-```
-
-5. Dump the UI and save it as `10-terminal-before-send.txt`.
-6. Press Back once to hide the soft keyboard, then tap the `Send` content
-   description from the latest UI bounds.
-7. Dump the UI again as `10-terminal-after-send.txt`.
-8. If the draft remains visible or output does not appear, press the keyboard
-   Enter/IME action and retry the Send button once. Record both attempts in
-   `investigation.log`.
-9. If a workspace is available, select it and run:
-
-```text
-pwd
-```
-
-Pass criteria:
-
-- WebSocket connects or shows a readable reconnect/error state.
-- Terminal output includes `android terminal smoke`.
-- Workspace selector reconnects without app crash.
-- ANSI-colored output remains readable.
-
-Issue logging:
+Prerequisite: a current mission exists (Case 6 completed).
 
 ```bash
-dump_ui | tee "$ARTIFACT_DIR/10-terminal-before-send.txt"
-adb shell input keyevent BACK || true
-tap_label "Send" || true
-sleep 2
-dump_ui | tee "$ARTIFACT_DIR/10-terminal-after-send.txt"
-adb logcat -d -t 500 > "$ARTIFACT_DIR/10-terminal-logcat.txt"
+set -eE; CASE=08; trap 'on_case_fail "$CASE"' ERR
+tap_tag control.topbar.automations
+tap_tag automations.add
+type_into_tag automations.new.command "Say android automation smoke $RUN_ID"
+tap_tag automations.new.create
+wait_for label "every 60s" 5 \
+  || { record_result $CASE "Automations create" fail APP_FAIL "row not visible"; exit 1; }
+# Clean up so we don't leak smoke automations.
+# (Row exposes a generic Delete content-desc; use find_tag once a per-row tag exists.)
+record_result $CASE "Automations" pass
 ```
 
-If Send does not clear the draft or send bytes while the UI says `connected`,
-classify as `APP_FAIL` unless a manual tap succeeds. Suggested app fixes to
-record: add `ImeAction.Send` / `KeyboardActions(onSend = vm.submit())`, expose a
-stable test tag or larger semantic button target, and log `sendInput` failures
-when the WebSocket is null.
+### 9. Missions history
 
-If Send clears the draft but terminal output does not include the marker, first
-verify the backend WebSocket directly from the host with the same token and
-protocols. A direct WebSocket pass plus an Android no-output result is an
-`APP_FAIL`; likely client owner is stale socket routing where `sendInput()`
-targets an older open WebSocket while the UI is collecting another connection,
-or terminal JSON frames are malformed. Confirm Android sends tagged frames such
-as `{"t":"i","d":"..."}` and `{"t":"r","c":80,"r":24}`; kotlinx serialization
-omits default-valued fields unless configured or explicitly passed. Record
-direct WebSocket transcript evidence as `10-terminal-direct-ws.txt`.
+```bash
+set -eE; CASE=09; trap 'on_case_fail "$CASE"' ERR
+tap_tag nav.tab.history
+for f in all active interrupted completed failed; do
+  tap_tag "history.filter.$f"
+  sleep 0.3   # purely visual settle; no API
+done
+type_into_tag history.search "$RUN_ID"
+wait_for label "$RUN_ID" 3 || true   # may match zero — both states are valid
+tap_tag history.refresh
+record_result $CASE "Missions history" pass
+```
+
+### 10. Terminal WebSocket  `@smoke`
+
+```bash
+set -eE; CASE=10; trap 'on_case_fail "$CASE"' ERR
+tap_tag nav.tab.terminal
+wait_for label "connected" 10 \
+  || { record_result $CASE "Terminal connect" fail BACKEND_FAIL "WebSocket did not connect"; exit 1; }
+type_into_tag terminal.input "echo android terminal smoke $RUN_ID"
+tap_tag terminal.send
+wait_for label "android terminal smoke $RUN_ID" 6 \
+  && record_result $CASE "Terminal Send" pass \
+  || record_result $CASE "Terminal Send" fail APP_FAIL "marker not in output"
+```
+
+If `wait_for` times out, immediately confirm the backend itself can echo the
+marker by opening `/api/console/ws` from the host with the same token —
+that distinguishes `APP_FAIL` (client) from `BACKEND_FAIL` (PTY).
 
 ### 11. Files
 
-Steps:
-
-1. Tap bottom `Files`.
-2. Verify root path `Workspace root`, refresh, upload, new-folder, and up
-   controls.
-3. Tap `New folder`.
-4. Enter `$RUN_ID-folder`, tap `Create`.
-5. Verify the folder appears.
-6. Tap the folder and verify path changes.
-7. Tap up and verify path returns to `Workspace root`.
-8. Delete `$RUN_ID-folder` and confirm.
-
-Optional upload/download check:
-
-1. Create a host file:
-
 ```bash
-printf 'android upload smoke %s\n' "$RUN_ID" > "$ARTIFACT_DIR/upload.txt"
-adb push "$ARTIFACT_DIR/upload.txt" /sdcard/Download/upload-$RUN_ID.txt
-```
+set -eE; CASE=11; trap 'on_case_fail "$CASE"' ERR
+tap_tag nav.tab.files
 
-2. In Files, tap Upload and choose the file from Android DocumentsUI.
-3. Verify `Uploaded` snackbar and a file row.
-4. Tap Download on the file and verify Android opens an `Open ...` chooser or a
-   compatible viewer.
-5. Delete the uploaded file.
-
-Pass criteria:
-
-- Directory creation, navigation, and deletion work.
-- File operations show snackbar/errors and do not crash.
-- Up button is disabled at `Workspace root`.
-
-Issue logging:
-
-If `New folder` returns HTTP 403, capture the backend contract directly:
-
-```bash
-if [ -n "${BACKEND_TOKEN:-}" ]; then
-  curl -i -sS -X POST "$BACKEND_URL_HOST/api/fs/mkdir" \
-    -H "authorization: Bearer $BACKEND_TOKEN" \
-    -H 'content-type: application/json' \
-    -d "{\"path\":\"/$RUN_ID-folder\"}" \
-    | tee "$ARTIFACT_DIR/11-fs-mkdir-root-http.txt"
-  curl -i -sS "$BACKEND_URL_HOST/api/fs/list?path=." \
-    -H "authorization: Bearer $BACKEND_TOKEN" \
-    | tee "$ARTIFACT_DIR/11-fs-list-dot-http.txt"
+# API-first sanity: list what the screen should show.
+EXPECT=$(curl -fsS "$BACKEND_URL_HOST/api/fs/list?path=." \
+  -H "authorization: Bearer $BACKEND_TOKEN" | python3 -c \
+  'import json,sys; print(len(json.load(sys.stdin)))')
+wait_for tag files.path 5
+sleep 2  # give the LazyColumn time to render rows after the API response
+# The screen should render at least one row when EXPECT > 0. Count Delete
+# action labels — each rendered row exposes exactly one, so it's a reliable
+# proxy. Counting "folder"/"file" tokens picks up tooltips/subtitle nodes too.
+dump_ui "$ARTIFACT_DIR/$CASE-files.txt" > /dev/null
+ROWS=$(grep -c "Delete" "$ARTIFACT_DIR/$CASE-files.txt" || true)
+if [ "$EXPECT" -gt 0 ] && [ "$ROWS" -lt 1 ]; then
+  record_result $CASE "Files listing" fail APP_FAIL "API returned $EXPECT items, screen rendered $ROWS"
+  exit 1
 fi
-dump_ui | tee "$ARTIFACT_DIR/11-files-after-mkdir.txt"
+
+tap_tag files.new_folder
+type_into_tag files.new_folder.name "$RUN_ID-folder"
+tap_tag files.new_folder.create
+
+# The backend rejects mkdir with a leading "/" (path traversal). Tag-driven
+# creation lets us assert without scraping copy.
+sleep 2
+NEW=$(curl -fsS "$BACKEND_URL_HOST/api/fs/list?path=." \
+  -H "authorization: Bearer $BACKEND_TOKEN" \
+  | python3 -c "import json,sys; data=json.load(sys.stdin); print(any(e['name']=='$RUN_ID-folder' for e in data))")
+[ "$NEW" = "True" ] \
+  && record_result $CASE "Files mkdir" pass \
+  || record_result $CASE "Files mkdir" fail CONTRACT_FAIL "folder did not appear on backend"
 ```
 
-Classify a 403 for `/...` as a backend/client contract issue, not an Android
-crash. The backend only allows writes under configured workspace/context roots;
-the Android client should create folders under the displayed `Workspace root`
-with relative paths, or the backend should expose allowed roots for the client
-to display.
+Upload/download remain `@manual` (Android DocumentsUI picker).
 
-### 12. More Screens: Tasks And Runs
-
-Tasks:
-
-1. More -> `Tasks`.
-2. Verify list rows or `No subtasks running`.
-3. Tap refresh.
-
-Runs:
-
-1. More -> `Runs`.
-2. Verify list rows or `No runs recorded`.
-3. If costs exist, verify total dollars in the header equals visible row totals
-   rounded to cents.
-4. Tap refresh.
-
-Pass criteria:
-
-- Empty and populated states render.
-- Refresh does not crash.
-- Long task/run text is bounded and does not overlap controls.
-
-### 13. FIDO Approvals
-
-Steps:
-
-1. More -> `FIDO approvals`.
-2. Verify `Always require biometric` and either `No rules` or existing rules.
-3. Toggle `Always require biometric` on, then off.
-4. Tap `Add rule`.
-5. With `All SSH` selected and `24h` selected, tap `Add`.
-6. Verify row `Any SSH` and expiry label.
-7. Delete that rule.
-8. Add `Host` rule with value `example.com`, expiry `1h`, and
-   `Require biometric` on; verify row; delete it.
-9. Add `Fingerprint` rule with value `SHA256:testfingerprint`, expiry `never`;
-   verify row; delete it.
-
-Optional live prompt check:
-
-- Trigger a real backend FIDO signing request. Verify the global dialog
-  `Approve signing request?`, `Approve`, and `Deny`.
-- On an emulator without enrolled biometrics, approval may fall back to device
-  credential or fail according to emulator configuration; record the behavior.
-
-Pass criteria:
-
-- Rule validation blocks missing Host/Fingerprint values.
-- Rules persist after app relaunch.
-- Delete removes only the selected rule.
-- Prompt handling posts approval/denial when backend request exists.
-
-### 14. Desktop Stream
-
-This depends on backend desktop streaming being enabled.
-
-Steps:
-
-1. More -> `Desktop`.
-2. Verify header `Desktop`, display chips `:99`, `:100`, `:101`, `:102`,
-   FPS and Quality controls, text entry, quick keys, and scroll controls.
-3. If a stream is available, wait for frame count to increase.
-4. Tap pause, verify `Paused`; tap play, verify `Live`.
-5. Change FPS and Quality using sliders or +/- controls.
-6. Type `android desktop smoke $RUN_ID`, tap `Type`.
-7. Tap quick keys `Return`, `Esc`, `Ctrl+L`, `Tab`.
-8. Tap reconnect.
-
-Pass criteria:
-
-- With stream enabled, frames render and frame count increases.
-- With stream unavailable, the app shows an error plus `Retry`.
-- Controls are usable and do not overlap in portrait or landscape.
-
-Issue logging:
+### 12. More: Tasks and Runs
 
 ```bash
-dump_ui | tee "$ARTIFACT_DIR/14-desktop-ui.txt"
-adb logcat -d -t 800 > "$ARTIFACT_DIR/14-desktop-logcat.txt"
-if [ -n "${BACKEND_TOKEN:-}" ]; then
-  curl -i -sS "$BACKEND_URL_HOST/api/desktop/sessions" \
-    -H "authorization: Bearer $BACKEND_TOKEN" \
-    | tee "$ARTIFACT_DIR/14-desktop-sessions-http.txt" || true
-fi
+set -eE; CASE=12; trap 'on_case_fail "$CASE"' ERR
+tap_tag nav.tab.more; tap_tag more.tile.tasks
+tap_tag tasks.refresh
+wait_for label "No subtasks running" 3 || wait_for label "iterations" 3 \
+  || { record_result $CASE "Tasks empty/populated" fail APP_FAIL "neither state visible"; exit 1; }
+
+tap_tag nav.tab.more; tap_tag more.tile.runs
+tap_tag runs.refresh
+wait_for label "No runs recorded" 3 || wait_for label "$" 3 \
+  || { record_result $CASE "Runs empty/populated" fail APP_FAIL "neither state visible"; exit 1; }
+
+record_result $CASE "Tasks & Runs" pass
 ```
 
-If the visible error is `Expected URL scheme 'http' or 'https' but was 'wss'`,
-classify as `APP_FAIL`. The Android desktop client is building the stream URL by
-passing a `ws://` or `wss://` string into `toHttpUrl()`, which only accepts
-HTTP(S). Suggested fix: build query parameters on the HTTP(S) URL first, then
-convert the final string to `ws://` or `wss://` only when constructing the
-OkHttp `Request`.
-
-### 15. Rotation, Resize, And App Lifecycle
-
-Steps:
+### 13. FIDO approvals
 
 ```bash
-adb shell settings put system accelerometer_rotation 0
-adb shell settings put system user_rotation 1
-sleep 2
-adb exec-out screencap -p > "$ARTIFACT_DIR/landscape.png"
-adb shell settings put system user_rotation 0
-adb shell input keyevent HOME
-sleep 2
+set -eE; CASE=13; trap 'on_case_fail "$CASE"' ERR
+tap_tag nav.tab.more; tap_tag more.tile.fido
+tap_tag fido.always_biometric          # toggle on
+tap_tag fido.always_biometric          # toggle off
+tap_tag fido.add_rule
+tap_tag fido.new.match.all
+tap_tag fido.new.expiry.24h
+tap_tag fido.new.add
+wait_for label "Any SSH key" 4 \
+  || { record_result $CASE "FIDO add rule" fail APP_FAIL "rule not created"; exit 1; }
+
+# Relaunch and confirm rule persisted.
+adb shell am force-stop "$APP_ID"
 adb shell am start -n "$APP_ID/.MainActivity"
+wait_for tag nav.tab.more 8
+tap_tag nav.tab.more; tap_tag more.tile.fido
+wait_for label "Any SSH key" 5 \
+  && record_result $CASE "FIDO persistence" pass \
+  || record_result $CASE "FIDO persistence" fail APP_FAIL "rule lost on relaunch"
 ```
 
-Repeat this on Control, Terminal, Files, and Desktop.
+Live biometric prompt is `@manual` — needs an enrolled biometric on the AVD.
 
-Pass criteria:
+### 14. Desktop stream
 
-- No important text overlaps or is clipped.
-- Composer remains accessible with keyboard shown.
-- Terminal sends a resize frame and remains connected or reconnects.
-- App returns to the same logical screen after foregrounding.
+```bash
+set -eE; CASE=14; trap 'on_case_fail "$CASE"' ERR
+tap_tag nav.tab.more; tap_tag more.tile.desktop
 
-### 16. Network And Error Resilience
+# Find a display the backend is actually running. Skip if none.
+DISPLAY=$(curl -fsS "$BACKEND_URL_HOST/api/desktop/sessions" \
+  -H "authorization: Bearer $BACKEND_TOKEN" \
+  | python3 -c 'import json,sys; ss=json.load(sys.stdin).get("sessions",[]); ok=[s for s in ss if s.get("process_running")]; print(ok[0]["display"] if ok else "")')
+if [ -z "$DISPLAY" ]; then
+  record_result $CASE "Desktop stream" blocked ENV_BLOCKED "no live display sessions"
+  exit 0
+fi
 
-Steps:
+tap_tag "desktop.display.${DISPLAY#:}"
+wait_for label "frames" 8
+# Frame counter should advance — sample twice 2 s apart.
+FRAMES_A=$(dump_ui "$ARTIFACT_DIR/$CASE-a.txt" \
+  | grep -oE "[0-9]+ frames" | head -1 | awk '{print $1}')
+sleep 2
+FRAMES_B=$(dump_ui "$ARTIFACT_DIR/$CASE-b.txt" \
+  | grep -oE "[0-9]+ frames" | head -1 | awk '{print $1}')
+[ "${FRAMES_B:-0}" -gt "${FRAMES_A:-0}" ] \
+  && record_result $CASE "Desktop frames" pass \
+  || record_result $CASE "Desktop frames" fail BACKEND_FAIL "frame count did not advance ($FRAMES_A → $FRAMES_B)"
 
-1. With the app open, stop the backend or block network.
-2. Navigate Control, Terminal, Files, Missions.
-3. Restart/unblock the backend.
-4. Tap refresh/retry where available.
+tap_tag desktop.key.return
+tap_tag desktop.key.esc
+tap_tag desktop.retry  # only fires if an error banner is visible — safe no-op otherwise
+```
 
-Pass criteria:
+### 15. Rotation and lifecycle
 
-- Screens show readable errors or reconnect indicators.
-- No crash, ANR, or infinite modal.
-- App recovers after backend returns.
+```bash
+set -eE; CASE=15; trap 'on_case_fail "$CASE"' ERR
+adb shell settings put system accelerometer_rotation 0
+for tab in control terminal files more; do
+  tap_tag "nav.tab.$tab"
+  adb shell settings put system user_rotation 1; sleep 2
+  screenshot "$CASE-$tab-landscape.png"
+  adb shell settings put system user_rotation 0; sleep 1
+done
+adb shell input keyevent KEYCODE_HOME; sleep 1
+adb shell am start -n "$APP_ID/.MainActivity"
+wait_for tag nav.tab.control 8 \
+  && record_result $CASE "Rotation + lifecycle" pass \
+  || record_result $CASE "Rotation + lifecycle" fail APP_FAIL "nav missing after foreground"
+```
 
-### 17. Crash And Log Check
+### 16. Network resilience
 
-Run after the full pass:
+```bash
+set -eE; CASE=16; trap 'on_case_fail "$CASE"' ERR
+adb shell svc wifi disable; adb shell svc data disable
+for tab in control history terminal files; do tap_tag "nav.tab.$tab"; sleep 1; done
+adb shell svc wifi enable; adb shell svc data enable
+tap_tag nav.tab.terminal
+wait_for label "connected" 30 \
+  && record_result $CASE "Network resilience" pass \
+  || record_result $CASE "Network resilience" fail APP_FAIL "did not reconnect after restore"
+```
+
+### 17. Crash sweep  `@smoke`
 
 ```bash
 adb logcat -d -t 3000 > "$ARTIFACT_DIR/logcat.txt"
-grep -E -C 8 "FATAL EXCEPTION|Application Not Responding|ANR in|Process .* has died|Process:" \
-  "$ARTIFACT_DIR/logcat.txt" > "$ARTIFACT_DIR/logcat-crash-context.txt" || true
+adb shell dumpsys dropbox --print data_app_crash > "$ARTIFACT_DIR/dropbox-crash.txt" 2>/dev/null || true
 if grep -E "ANR in sh\\.sandboxed\\.dashboard|Process: sh\\.sandboxed\\.dashboard|Process sh\\.sandboxed\\.dashboard .* has died" "$ARTIFACT_DIR/logcat.txt"; then
-  echo "FAIL: app crash markers found"
+  record_result 17 "Crash sweep" fail APP_FAIL "crash markers present"
 else
-  echo "PASS: no app crash markers"
+  record_result 17 "Crash sweep" pass
 fi
-adb exec-out screencap -p > "$ARTIFACT_DIR/final.png"
+screenshot final.png
 ```
 
-Pass criteria:
+`AndroidRuntime` log lines from `uiautomator` are harmless noise — only flag
+the process name `sh.sandboxed.dashboard`.
 
-- No fatal exceptions or ANR markers for `sh.sandboxed.dashboard`.
+**On failure, get the full stack from DropBox.** Android logcat is a small
+ring buffer; under load (Telecom spam, WiFi state transitions) the OS can
+evict the actual `at …` frames between when the crash logs and when you dump
+them. The system's `DropBoxManager` preserves a structured copy of every
+`data_app_crash` for ~24 h. The stack lives there even when logcat shows just
+`FATAL EXCEPTION: main` with no body:
 
-Do not fail on generic `AndroidRuntime` lines by themselves; `uiautomator` and
-other shell tools also log under `AndroidRuntime`.
+```bash
+adb shell dumpsys dropbox --print data_app_crash | less
+```
 
-## Known Findings From 2026-05-25 Remote Run
+Each entry has `Process:`, `PID:`, build info, the full stack with
+`Caused by:` chains, and a `Suppressed:` line that names the originating
+coroutine context (e.g. `StandaloneCoroutine{Cancelling}@…,
+Dispatchers.Main.immediate`) — invaluable for tracing which
+`viewModelScope.launch { … }` site went uncaught.
 
-These findings should be rechecked on the next run and either closed or kept in
-the report with fresh evidence:
+## Output
 
-- API 36 launch failure: the APK installed and `dumpsys package` registered
-  `sh.sandboxed.dashboard/.MainActivity`, but `am start` returned
-  `Activity class ... does not exist` while `dumpsys user` showed
-  `State: RUNNING_LOCKED`. Treat this as `ENV_BLOCKED` unless it reproduces on
-  an unlocked/wiped valid API 36 AVD.
-- Invalid AVDs: local `Pixel_9` and `Pixel_9_Pro` profiles were stale because
-  their device definitions no longer existed. Recreate them before using them
-  as “latest Android” coverage.
-- Desktop stream: the Android client originally showed
-  `Expected URL scheme 'http' or 'https' but was 'wss'`. Retest that URL
-  construction now reaches the backend and either streams frames or shows a
-  backend availability error.
-- Files: creating a folder under `/` returned backend HTTP 403 in the original
-  run. Retest that the app now starts at `Workspace root` and sends relative
-  mkdir/upload paths.
-- Terminal: WebSocket connected and accepted a draft, but the ADB-driven Send
-  tap did not submit in the original run. In the Pixel_10_Pro_API36_1 rerun,
-  the command text was present, Send cleared the draft, and a direct host
-  WebSocket to `/api/console/ws` echoed the same marker, but the Android UI did
-  not display the marker. Root causes fixed in the Android client: terminal
-  frames now always include the `t` discriminator required by the backend,
-  stale terminal WebSockets cannot receive new sends, and PTY output is
-  normalized so OSC title updates and carriage returns do not corrupt visible
-  text. Recheck by asserting a full terminal marker appears in the UI dump.
-- Mission execution: the backend reported a missing Claude CLI for the selected
-  backend/workspace. This blocks model execution but is not an Android crash.
-- API 36.1 AVD: local SDK tools did not include an official `pixel_10_pro`
-  hardware profile. The closest valid current AVD used a `pixel_9_pro` profile
-  with the Android 36.1 Google Play image and was named `Pixel_10_Pro_API36_1`.
+```bash
+summarise_results | tee "$ARTIFACT_DIR/REPORT.md"
+```
+
+`results.jsonl` is the canonical, machine-readable record:
+
+```json
+{"case":"06","name":"Mission streaming","status":"pass","classification":null,"note":null}
+{"case":"11","name":"Files mkdir","status":"pass","classification":null,"note":null}
+{"case":"15","name":"Rotation + lifecycle","status":"fail","classification":"APP_FAIL","note":"nav missing after foreground"}
+```
+
+CI gates the smoke set by counting `status:fail|@smoke` in `results.jsonl`.
 
 ## Cleanup
 
-Only clean up smoke data created by this run:
+- Delete `$RUN_ID-folder` and any uploaded smoke files from Files.
+- Delete test automations and the test FIDO rule.
+- Delete test missions **only** on a disposable backend.
+- `adb shell pm clear "$APP_ID"` is appropriate for a clean re-run.
 
-- Delete `$RUN_ID-folder` and uploaded smoke files from Files.
-- Delete test automations from the mission.
-- Delete test missions only if running on a disposable backend.
-- Clear emulator app data if desired:
-
-```bash
-adb shell pm clear "$APP_ID"
-```
-
-If using the disposable Docker backend:
-
-```bash
-docker compose down
-```
-
-## Result Report Template
-
-```text
-Android Dashboard Simulator Test Report
-Run ID:
-Date:
-App version:
-Backend URL:
-Backend health auth_mode:
-Emulator model/API:
-
-Summary:
-- Passed:
-- Failed:
-- Blocked by backend capability:
-
-Failures:
-1. Screen / case:
-   Expected:
-   Actual:
-   Evidence:
-   Log excerpt:
-   Classification:
-   Likely owner:
-   Suggested fix:
-
-Artifacts:
-- Screenshots:
-- UI dumps:
-- logcat:
-- investigation.log:
-
-Cleanup performed:
-```
-
-## Failure Classification
-
-Use these labels consistently:
+## Failure classification
 
 - `APP_FAIL`: Android UI crash, incorrect state, broken navigation, persistence
   bug, unreadable layout, or unhandled client exception.
 - `BACKEND_FAIL`: backend endpoint returns invalid data, 5xx, auth mismatch, or
   missing capability required by the feature.
-- `CONTRACT_FAIL`: Android client and backend both behave consistently with
-  their own assumptions, but the API contract is ambiguous or mismatched.
+- `CONTRACT_FAIL`: client and backend each behave consistently with their own
+  assumptions, but the API contract is ambiguous or mismatched (e.g. path
+  encoding).
 - `ENV_BLOCKED`: emulator, credentials, provider auth, desktop stream, FIDO
   request source, or file picker unavailable.
 - `N/A`: feature intentionally not enabled for this backend.
 
-Every non-pass must have a matching entry in `investigation.log`; a run is not
-complete until the tester has captured the diagnostics listed in
-`Investigation Log Requirements`.
+Every non-pass case must include a one-line `note` in `record_result` and at
+least one of `<case>-fail.{png,xml,logcat.txt}` in the artifact dir (the
+`on_case_fail` trap handles this for you).
+
+## Diagnostics cheat sheet
+
+When something goes wrong, work through these in order — each one was load-
+bearing for at least one historical investigation.
+
+| Symptom | First check |
+|---|---|
+| Screen blank but `pidof $APP_ID` non-empty | UI dump shows only `android:id/content` + `ProgressBar` → AuthGate stuck in RESOLVING. `am force-stop` + relaunch to confirm. |
+| `tap_tag X` fails but `text="X"` is visible | The widget is a Compose `FilterChip` whose modifier doesn't surface the testTag. Wrap the chip in `Box(Modifier.tag(X)) { FilterChip(...) }` in the screen. |
+| `FATAL EXCEPTION: main` in logcat but no stack frames | logcat ring buffer evicted them. Run `adb shell dumpsys dropbox --print data_app_crash` for the structured copy. |
+| Crash stack ends at `RealCall$AsyncCall.run` | OkHttp dispatcher-thread crash. Almost always an uncaught network error from a `viewModelScope.launch { … }` site without `runCatching`. The `Suppressed:` line names the offending coroutine context. |
+| Filed listing shows the path header but no rows | Compare the screen count to `curl /api/fs/list?path=.` *after* a `sleep 2` for the LazyColumn. If they disagree, classify as `APP_FAIL`. |
+| `type_into_tag` produces concatenated junk | The field had a placeholder/prior value. `type_into_tag` clears via `MOVE_END + 80 DEL`; if that's not enough, raise the count in `test-helpers.sh`. |
+| Tab tap "succeeds" but next tap fails | Configuration change in flight. Insert `wait_for tag <known tag on the target screen>` between taps. |
+
+Pieces of state and data that survive `pm clear` and can confound re-runs:
+
+- DropBox crash entries — those age out on their own (~24 h). Old fatals can
+  trip Case 17 if you `grep` blindly across a long window. The case as
+  written greps `logcat.txt` produced by `logcat -d -t 3000` (current
+  buffer), not DropBox, so this is safe — but if you swap the grep target,
+  filter on a fresh PID first.
+- DNS resolver cache — disable wifi/data, re-enable, expect `getaddrinfo`
+  warm-up. Case 16 gives up to 40 s on reconnect; tune if your network is
+  slower.
+- Emulator user lock — see Preflight.

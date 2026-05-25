@@ -41,6 +41,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -55,6 +56,8 @@ import sh.sandboxed.dashboard.data.AutomationCommandSource
 import sh.sandboxed.dashboard.data.AutomationTrigger
 import sh.sandboxed.dashboard.data.CreateAutomationRequest
 import sh.sandboxed.dashboard.data.UpdateAutomationRequest
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.theme.Palette
@@ -119,7 +122,7 @@ fun AutomationsScreen(container: AppContainer, missionId: String, onBack: () -> 
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Palette.TextPrimary) }
             Text("Automations", style = MaterialTheme.typography.titleLarge, color = Palette.TextPrimary, modifier = Modifier.weight(1f))
-            IconButton(onClick = { showCreate = true }) { Icon(Icons.Filled.Add, "Add", tint = Palette.Accent) }
+            IconButton(onClick = { showCreate = true }, modifier = Modifier.tag(TestTags.AUTOMATIONS_ADD)) { Icon(Icons.Filled.Add, "Add", tint = Palette.Accent) }
         }
         state.error?.let { Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { ErrorBanner(it) } }
         if (state.loading && state.items.isEmpty()) {
@@ -187,7 +190,7 @@ private fun CreateAutomationDialog(onCancel: () -> Unit, onCreate: (String, Int?
                 OutlinedTextField(
                     value = content, onValueChange = { content = it },
                     label = { Text("Command (sent to agent)") },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().tag(TestTags.AUTOMATIONS_NEW_COMMAND),
                     colors = autoFieldColors(), maxLines = 4,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -208,6 +211,7 @@ private fun CreateAutomationDialog(onCancel: () -> Unit, onCreate: (String, Int?
                     OutlinedTextField(
                         value = seconds, onValueChange = { seconds = it.filter { c -> c.isDigit() } },
                         label = { Text("Seconds") }, singleLine = true,
+                        modifier = Modifier.tag(TestTags.AUTOMATIONS_NEW_INTERVAL_SECS),
                         colors = autoFieldColors(),
                     )
                 }
@@ -218,9 +222,10 @@ private fun CreateAutomationDialog(onCancel: () -> Unit, onCreate: (String, Int?
                 onClick = { onCreate(content, seconds.toIntOrNull(), triggerKind) },
                 enabled = content.isNotBlank() && (triggerKind != "interval" || (seconds.toIntOrNull() ?: 0) > 0),
                 colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
+                modifier = Modifier.tag(TestTags.AUTOMATIONS_NEW_CREATE),
             ) { Text("Create") }
         },
-        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = onCancel, modifier = Modifier.tag(TestTags.AUTOMATIONS_NEW_CANCEL)) { Text("Cancel") } },
         containerColor = Palette.Card,
     )
 }

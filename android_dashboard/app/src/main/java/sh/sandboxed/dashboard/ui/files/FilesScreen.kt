@@ -50,6 +50,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
@@ -61,6 +62,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.FileEntry
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.theme.Palette
@@ -211,15 +214,15 @@ fun FilesScreen(container: AppContainer) {
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Files", style = MaterialTheme.typography.titleMedium, color = Palette.TextPrimary, modifier = Modifier.weight(1f))
-            IconButton(onClick = { pickFile.launch("*/*") }) { Icon(Icons.Filled.Upload, "Upload", tint = Palette.Accent) }
-            IconButton(onClick = { showMkdir = true }) { Icon(Icons.Filled.CreateNewFolder, "New folder", tint = Palette.Accent) }
-            IconButton(onClick = vm::refresh) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
+            IconButton(onClick = { pickFile.launch("*/*") }, modifier = Modifier.tag(TestTags.FILES_UPLOAD)) { Icon(Icons.Filled.Upload, "Upload", tint = Palette.Accent) }
+            IconButton(onClick = { showMkdir = true }, modifier = Modifier.tag(TestTags.FILES_NEW_FOLDER)) { Icon(Icons.Filled.CreateNewFolder, "New folder", tint = Palette.Accent) }
+            IconButton(onClick = vm::refresh, modifier = Modifier.tag(TestTags.FILES_REFRESH)) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
         }
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = vm::up, enabled = state.backStack.isNotEmpty()) {
+            IconButton(onClick = vm::up, enabled = state.backStack.isNotEmpty(), modifier = Modifier.tag(TestTags.FILES_UP)) {
                 Icon(Icons.Filled.ArrowUpward, "Up", tint = Palette.TextSecondary)
             }
-            Text(if (state.path == ".") "Workspace root" else state.path, color = Palette.TextSecondary, style = MaterialTheme.typography.bodyMedium)
+            Text(if (state.path == ".") "Workspace root" else state.path, color = Palette.TextSecondary, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.tag(TestTags.FILES_PATH))
         }
         state.error?.let { Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { ErrorBanner(it) } }
         if (state.loading && state.entries.isEmpty()) {
@@ -270,6 +273,7 @@ fun FilesScreen(container: AppContainer) {
                     label = { Text("Folder name") },
                     isError = nameError != null,
                     supportingText = nameError?.let { { Text(it) } },
+                    modifier = Modifier.tag(TestTags.FILES_NEW_FOLDER_NAME),
                     colors = TextFieldDefaults.colors(
                         focusedContainerColor = Palette.Card,
                         unfocusedContainerColor = Palette.Card,
@@ -284,10 +288,11 @@ fun FilesScreen(container: AppContainer) {
                     onClick = { vm.mkdir(name); showMkdir = false },
                     enabled = folderNameValidationError(name) == null,
                     colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
+                    modifier = Modifier.tag(TestTags.FILES_NEW_FOLDER_CREATE),
                 ) { Text("Create") }
             },
             dismissButton = {
-                TextButton(onClick = { showMkdir = false }) { Text("Cancel") }
+                TextButton(onClick = { showMkdir = false }, modifier = Modifier.tag(TestTags.FILES_NEW_FOLDER_CANCEL)) { Text("Cancel") }
             },
             containerColor = Palette.Card,
         )

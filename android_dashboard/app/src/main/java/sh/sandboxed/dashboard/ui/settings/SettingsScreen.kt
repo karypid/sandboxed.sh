@@ -30,6 +30,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
@@ -38,6 +39,8 @@ import sh.sandboxed.dashboard.data.BackendAgent
 import sh.sandboxed.dashboard.data.BuiltinCommandsResponse
 import sh.sandboxed.dashboard.data.Provider
 import sh.sandboxed.dashboard.data.SlashCommand
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.theme.Palette
 
@@ -83,7 +86,7 @@ fun SettingsScreen(container: AppContainer) {
                     OutlinedTextField(
                         value = url, onValueChange = { url = it },
                         label = { Text("Base URL") }, singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().tag(TestTags.SETTINGS_URL),
                         colors = fieldColors(),
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -97,10 +100,11 @@ fun SettingsScreen(container: AppContainer) {
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
+                            modifier = Modifier.tag(TestTags.SETTINGS_TEST_SAVE),
                         ) { Text("Test & save") }
                         OutlinedButton(onClick = {
                             scope.launch { container.settings.setToken(null) }
-                        }) { Text("Sign out") }
+                        }, modifier = Modifier.tag(TestTags.SETTINGS_SIGN_OUT)) { Text("Sign out") }
                     }
                     status?.let { Text(it, color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall) }
                 }
@@ -120,12 +124,13 @@ fun SettingsScreen(container: AppContainer) {
                                 scope.launch { container.settings.setSkipAgentSelection(it) }
                             },
                             colors = SwitchDefaults.colors(checkedThumbColor = Palette.Accent),
+                            modifier = Modifier.tag(TestTags.SETTINGS_SKIP_AGENT_PICKER),
                         )
                     }
                     HorizontalDivider(color = Palette.Border)
                     Text("Backend", color = Palette.TextSecondary, style = MaterialTheme.typography.labelMedium)
                     backends.forEach { b ->
-                        BackendRow(b.name, selectedBackend == b.id) {
+                        BackendRow(b.name, selectedBackend == b.id, tag = TestTags.backendSelect(b.id)) {
                             selectedBackend = b.id
                             scope.launch { container.settings.setDefaultBackend(b.id) }
                         }
@@ -134,7 +139,7 @@ fun SettingsScreen(container: AppContainer) {
                         HorizontalDivider(color = Palette.Border)
                         Text("Agent", color = Palette.TextSecondary, style = MaterialTheme.typography.labelMedium)
                         agents.forEach { a ->
-                            BackendRow(a.name, selectedAgent == a.id) {
+                            BackendRow(a.name, selectedAgent == a.id, tag = TestTags.agentSelect(a.id)) {
                                 selectedAgent = a.id
                                 scope.launch { container.settings.setDefaultAgent(a.id) }
                             }
@@ -207,13 +212,13 @@ private fun SlashCommandRow(sc: SlashCommand) {
 }
 
 @Composable
-private fun BackendRow(name: String, selected: Boolean, onClick: () -> Unit) {
+private fun BackendRow(name: String, selected: Boolean, tag: String, onClick: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(name, color = if (selected) Palette.Accent else Palette.TextPrimary, modifier = Modifier.weight(1f))
-        OutlinedButton(onClick = onClick) {
+        OutlinedButton(onClick = onClick, modifier = Modifier.testTag(tag)) {
             Text(if (selected) "Selected" else "Select")
         }
     }

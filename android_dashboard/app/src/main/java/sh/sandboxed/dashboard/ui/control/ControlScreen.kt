@@ -65,6 +65,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.core.net.toUri
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -84,6 +85,8 @@ import sh.sandboxed.dashboard.data.RunningMissionInfo
 import sh.sandboxed.dashboard.data.SharedFile
 import sh.sandboxed.dashboard.data.SlashCommand
 import sh.sandboxed.dashboard.data.Workspace
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.components.StatusBadge
@@ -273,18 +276,18 @@ private fun TopBar(
             mission?.status?.let { StatusBadge(it) }
             if (canResume) {
                 Spacer(Modifier.width(8.dp))
-                IconButton(onClick = onResume) { Icon(Icons.Filled.PlayArrow, "Resume", tint = Palette.Accent) }
+                IconButton(onClick = onResume, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_RESUME)) { Icon(Icons.Filled.PlayArrow, "Resume", tint = Palette.Accent) }
             }
             if (mission != null) {
-                IconButton(onClick = onAutomations) { Icon(Icons.Filled.Settings, "Automations", tint = Palette.TextSecondary) }
+                IconButton(onClick = onAutomations, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_AUTOMATIONS)) { Icon(Icons.Filled.Settings, "Automations", tint = Palette.TextSecondary) }
             }
-            IconButton(onClick = onDesktop) { Icon(Icons.Filled.Computer, "Desktop", tint = Palette.TextSecondary) }
+            IconButton(onClick = onDesktop, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_DESKTOP)) { Icon(Icons.Filled.Computer, "Desktop", tint = Palette.TextSecondary) }
             if (workerCount > 0) {
                 IconButton(onClick = onWorkers) {
                     Text("W$workerCount", color = Palette.AccentLight, style = MaterialTheme.typography.labelMedium)
                 }
             }
-            IconButton(onClick = onSwitchMissions) {
+            IconButton(onClick = onSwitchMissions, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_MISSIONS)) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(Icons.Filled.History, "Missions", tint = if (runningCount > 0) Palette.Accent else Palette.TextSecondary)
                     if (runningCount > 0) {
@@ -292,7 +295,7 @@ private fun TopBar(
                     }
                 }
             }
-            IconButton(onClick = onNewMission) { Icon(Icons.Filled.Add, "New mission", tint = Palette.Accent) }
+            IconButton(onClick = onNewMission, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_NEW_MISSION)) { Icon(Icons.Filled.Add, "New mission", tint = Palette.Accent) }
         }
         if (mission != null && (mission.metadataModel != null || mission.metadataSource != null || mission.workspaceName != null)) {
             Spacer(Modifier.height(4.dp))
@@ -520,9 +523,10 @@ private fun NewMissionDialog(
                 },
                 enabled = !loading && selectedWorkspaceId != null && selectedBackend.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
+                modifier = Modifier.tag(TestTags.NEW_MISSION_CREATE),
             ) { Text("Create") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = onDismiss, modifier = Modifier.tag(TestTags.NEW_MISSION_CANCEL)) { Text("Cancel") } },
         containerColor = Palette.Card,
     )
 }
@@ -567,7 +571,7 @@ private fun MissionSwitcherDialog(
                         onValueChange = { query = it },
                         singleLine = true,
                         label = { Text("Search") },
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().tag(TestTags.SWITCHER_SEARCH),
                         colors = dialogFieldColors(),
                     )
                 }
@@ -614,11 +618,11 @@ private fun MissionSwitcherDialog(
             }
         },
         confirmButton = {
-            Button(onClick = onNewMission, colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent)) {
+            Button(onClick = onNewMission, colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent), modifier = Modifier.tag(TestTags.SWITCHER_NEW)) {
                 Text("New")
             }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        dismissButton = { TextButton(onClick = onDismiss, modifier = Modifier.tag(TestTags.SWITCHER_CLOSE)) { Text("Close") } },
         containerColor = Palette.Card,
     )
 }
@@ -1015,14 +1019,14 @@ private fun Composer(value: String, onChange: (String) -> Unit, onSend: () -> Un
                 onValueChange = onChange,
                 cursorBrush = SolidColor(Palette.Accent),
                 textStyle = MaterialTheme.typography.bodyMedium.copy(color = Palette.TextPrimary),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().tag(TestTags.CONTROL_COMPOSER_INPUT),
             )
             if (value.isEmpty()) {
                 Text("Message…", color = Palette.TextMuted, style = MaterialTheme.typography.bodyMedium)
             }
         }
         Spacer(Modifier.width(8.dp))
-        IconButton(onClick = if (isSending) onCancel else onSend, enabled = isSending || value.isNotBlank()) {
+        IconButton(onClick = if (isSending) onCancel else onSend, enabled = isSending || value.isNotBlank(), modifier = Modifier.tag(TestTags.CONTROL_COMPOSER_SEND)) {
             Icon(
                 if (isSending) Icons.Filled.Cancel else Icons.AutoMirrored.Filled.Send,
                 contentDescription = if (isSending) "Cancel" else "Send",

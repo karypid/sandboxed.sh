@@ -20,8 +20,12 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -45,28 +49,36 @@ import sh.sandboxed.dashboard.ui.files.FilesScreen
 import sh.sandboxed.dashboard.ui.history.HistoryScreen
 import sh.sandboxed.dashboard.ui.more.MoreScreen
 import sh.sandboxed.dashboard.ui.runs.RunsScreen
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.settings.SettingsScreen
 import sh.sandboxed.dashboard.ui.tasks.TasksScreen
 import sh.sandboxed.dashboard.ui.terminal.TerminalScreen
 import sh.sandboxed.dashboard.ui.theme.Palette
 import sh.sandboxed.dashboard.ui.workspaces.WorkspacesScreen
 
-private data class TabItem(val route: String, val label: String, val icon: ImageVector)
+private data class TabItem(val route: String, val label: String, val icon: ImageVector, val tag: String)
 
 private val Tabs = listOf(
-    TabItem("control", "Control", Icons.AutoMirrored.Filled.Chat),
-    TabItem("history", "Missions", Icons.Filled.History),
-    TabItem("terminal", "Terminal", Icons.Filled.Terminal),
-    TabItem("files", "Files", Icons.Filled.Folder),
-    TabItem("more", "More", Icons.Filled.MoreHoriz),
+    TabItem("control", "Control", Icons.AutoMirrored.Filled.Chat, TestTags.NAV_TAB_CONTROL),
+    TabItem("history", "Missions", Icons.Filled.History, TestTags.NAV_TAB_HISTORY),
+    TabItem("terminal", "Terminal", Icons.Filled.Terminal, TestTags.NAV_TAB_TERMINAL),
+    TabItem("files", "Files", Icons.Filled.Folder, TestTags.NAV_TAB_FILES),
+    TabItem("more", "More", Icons.Filled.MoreHoriz, TestTags.NAV_TAB_MORE),
 )
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun AppRoot(container: AppContainer, settings: AppSettings, host: FragmentActivity?) {
-    AuthGate(container = container, settings = settings) {
-        Box(Modifier.fillMaxSize()) {
-            MainScaffold(container, host)
-            FidoOverlay(container, host)
+    // Wrap the whole tree (auth gate + main scaffold) so testTags surface as
+    // `resource-id` in uiautomator dumps on every screen, including the
+    // first-run config and login screens.
+    Box(Modifier.fillMaxSize().semantics { testTagsAsResourceId = true }) {
+        AuthGate(container = container, settings = settings) {
+            Box(Modifier.fillMaxSize()) {
+                MainScaffold(container, host)
+                FidoOverlay(container, host)
+            }
         }
     }
 }
@@ -83,6 +95,7 @@ private fun MainScaffold(container: AppContainer, host: FragmentActivity?) {
                 Tabs.forEach { tab ->
                     val selected = currentRoute?.let { it == tab.route || it.startsWith(tab.route + "/") } ?: false
                     NavigationBarItem(
+                        modifier = Modifier.testTag(tab.tag),
                         selected = selected,
                         onClick = {
                             navController.navigate(tab.route) {

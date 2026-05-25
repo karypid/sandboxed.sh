@@ -75,8 +75,16 @@ class ApiService(
         val call = client.newCall(req)
         cont.invokeOnCancellation { call.cancel() }
         call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = cont.resumeWithException(e)
-            override fun onResponse(call: Call, response: Response) = cont.resume(response)
+            // Guard against resuming a continuation that has already been
+            // cancelled (e.g. ViewModel cleared while the request was in
+            // flight). Without the check, an uncaught IllegalStateException
+            // on the OkHttp dispatcher thread crashes the process.
+            override fun onFailure(call: Call, e: IOException) {
+                if (cont.isActive) cont.resumeWithException(e)
+            }
+            override fun onResponse(call: Call, response: Response) {
+                if (cont.isActive) cont.resume(response) else response.close()
+            }
         })
     }
 

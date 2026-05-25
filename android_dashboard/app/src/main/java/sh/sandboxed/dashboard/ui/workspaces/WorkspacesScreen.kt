@@ -36,6 +36,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -48,6 +49,8 @@ import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.CreateWorkspaceRequest
 import sh.sandboxed.dashboard.data.Workspace
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.theme.Palette
@@ -103,8 +106,8 @@ fun WorkspacesScreen(container: AppContainer) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("Workspaces", style = MaterialTheme.typography.headlineSmall, color = Palette.TextPrimary, modifier = Modifier.weight(1f))
-            IconButton(onClick = { showCreate = true }) { Icon(Icons.Filled.Add, "Create workspace", tint = Palette.Accent) }
-            IconButton(onClick = vm::refresh) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
+            IconButton(onClick = { showCreate = true }, modifier = Modifier.tag(TestTags.WORKSPACES_CREATE)) { Icon(Icons.Filled.Add, "Create workspace", tint = Palette.Accent) }
+            IconButton(onClick = vm::refresh, modifier = Modifier.tag(TestTags.WORKSPACES_REFRESH)) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
         }
         state.error?.let { Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { ErrorBanner(it) } }
         if (state.loading && state.items.isEmpty()) {
@@ -172,22 +175,27 @@ private fun CreateWorkspaceDialog(onCancel: () -> Unit, onCreate: (String, Strin
                     onValueChange = { name = it },
                     label = { Text("Name") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().tag(TestTags.WORKSPACES_NEW_NAME),
                     colors = fieldColors(),
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("container" to "Container", "host" to "Host").forEach { (value, label) ->
-                        FilterChip(
-                            selected = type == value,
-                            onClick = { type = value },
-                            label = { Text(label, style = MaterialTheme.typography.labelSmall) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                containerColor = Palette.Card,
-                                selectedContainerColor = Palette.Accent.copy(alpha = 0.18f),
-                                labelColor = Palette.TextSecondary,
-                                selectedLabelColor = Palette.Accent,
-                            ),
-                        )
+                    listOf(
+                        Triple("container", "Container", TestTags.WORKSPACES_NEW_TYPE_CONTAINER),
+                        Triple("host", "Host", TestTags.WORKSPACES_NEW_TYPE_HOST),
+                    ).forEach { (value, label, chipTag) ->
+                        Box(Modifier.tag(chipTag)) {
+                            FilterChip(
+                                selected = type == value,
+                                onClick = { type = value },
+                                label = { Text(label, style = MaterialTheme.typography.labelSmall) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    containerColor = Palette.Card,
+                                    selectedContainerColor = Palette.Accent.copy(alpha = 0.18f),
+                                    labelColor = Palette.TextSecondary,
+                                    selectedLabelColor = Palette.Accent,
+                                ),
+                            )
+                        }
                     }
                 }
                 if (type == "host") {
@@ -196,7 +204,7 @@ private fun CreateWorkspaceDialog(onCancel: () -> Unit, onCreate: (String, Strin
                         onValueChange = { path = it },
                         label = { Text("Host path") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().tag(TestTags.WORKSPACES_NEW_PATH),
                         colors = fieldColors(),
                     )
                 }
@@ -210,9 +218,10 @@ private fun CreateWorkspaceDialog(onCancel: () -> Unit, onCreate: (String, Strin
                 onClick = { onCreate(name, type, path) },
                 enabled = name.isNotBlank() && !hostNeedsPath,
                 colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
+                modifier = Modifier.tag(TestTags.WORKSPACES_NEW_CREATE),
             ) { Text("Create") }
         },
-        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = onCancel, modifier = Modifier.tag(TestTags.WORKSPACES_NEW_CANCEL)) { Text("Cancel") } },
         containerColor = Palette.Card,
     )
 }
