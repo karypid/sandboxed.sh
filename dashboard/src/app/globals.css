@@ -259,9 +259,23 @@ select:focus-visible {
   }
 
   [class~="bg-[#1a1a1c]"],
+  [class~="bg-[#1a1a1a]"],
+  [class~="bg-[#1c1c1e]/95"],
+  [class~="bg-[#121214]"],
   [class~="bg-[#111113]"],
   [class~="bg-[#0f0f11]"] {
     background-color: rgb(255 255 255);
+  }
+
+  [class~="bg-slate-800"],
+  [class~="[&>option]:bg-slate-800"] > option,
+  [class~="[&>optgroup]:bg-slate-900"] > optgroup {
+    background-color: rgb(255 255 255);
+  }
+
+  [class~="[&>option]:text-white"] > option,
+  [class~="[&>optgroup]:text-white/70"] > optgroup {
+    color: rgb(var(--foreground));
   }
 
   [class*="bg-indigo-"][class*="text-white"],
@@ -274,6 +288,61 @@ select:focus-visible {
   [class*="bg-amber-"][class*="text-white"],
   [class*="bg-orange-"][class*="text-white"] {
     color: #ffffff;
+  }
+
+  [class~="bg-indigo-500/10"][class*="text-white"],
+  [class~="bg-indigo-500/15"][class*="text-white"],
+  [class~="bg-indigo-500/20"][class*="text-white"],
+  [class~="bg-indigo-500/30"][class*="text-white"] {
+    color: rgb(var(--foreground) / 0.88);
+  }
+}
+
+.mission-selector-trigger {
+  background-color: rgb(var(--accent) / 0.2);
+}
+
+.mission-selector-trigger:hover {
+  background-color: rgb(var(--accent) / 0.3);
+}
+
+@media (prefers-color-scheme: light) {
+  .mission-selector-trigger {
+    background-color: rgb(224 231 255);
+    border: 1px solid rgb(165 180 252 / 0.55);
+  }
+
+  .mission-selector-trigger:hover {
+    background-color: rgb(199 210 254);
+  }
+}
+
+.user-message-bubble {
+  color: #ffffff;
+}
+
+.user-message-bubble-solid {
+  background-color: rgb(var(--accent));
+}
+
+.user-message-bubble-queued {
+  background-color: rgb(var(--accent) / 0.2);
+  border-color: rgb(var(--accent) / 0.6);
+}
+
+@media (prefers-color-scheme: light) {
+  .user-message-bubble {
+    color: rgb(30 41 59);
+  }
+
+  .user-message-bubble-solid {
+    background-color: rgb(224 231 255);
+    border: 1px solid rgb(165 180 252 / 0.55);
+  }
+
+  .user-message-bubble-queued {
+    background-color: rgb(238 242 255);
+    border-color: rgb(129 140 248 / 0.7);
   }
 }
 
@@ -454,6 +523,13 @@ select:focus-visible {
 .card:hover {
   background: rgba(255, 255, 255, 0.04);
   border-color: rgba(255, 255, 255, 0.08);
+}
+
+@media (prefers-color-scheme: light) {
+  .card:hover {
+    background: rgba(255, 255, 255, 0.95);
+    border-color: rgba(17, 24, 39, 0.14);
+  }
 }
 
 .card-interactive {
