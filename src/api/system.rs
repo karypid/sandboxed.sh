@@ -2614,7 +2614,8 @@ mod tests {
         // Sanity: a value below 60s would render the safety useless given
         // typical agent retry behavior. If you genuinely need to lower
         // this, change the test deliberately.
-        assert!(DEPLOY_DEBOUNCE_SECS >= 60);
+        let debounce_secs = DEPLOY_DEBOUNCE_SECS;
+        assert!(debounce_secs >= 60);
     }
 
     // ─── Pre-existing helpers ───────────────────────────────────────────────
