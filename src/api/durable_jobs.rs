@@ -301,9 +301,8 @@ pub async fn start_job(
         command
     );
 
-    let mut child = Command::new("setsid");
+    let mut child = Command::new("/bin/sh");
     child
-        .arg("/bin/sh")
         .arg("-lc")
         .arg(wrapper)
         .current_dir(&cwd)
@@ -313,6 +312,15 @@ pub async fn start_job(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    #[cfg(unix)]
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     let child = child
         .spawn()
