@@ -15,6 +15,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -111,6 +112,10 @@ fn job_file(state: &AppState, id: Uuid) -> PathBuf {
     job_dir(state, id).join("job.json")
 }
 
+fn job_lock_file(state: &AppState, id: Uuid) -> PathBuf {
+    job_dir(state, id).join("job.lock")
+}
+
 fn resolve_cwd(base: &Path, raw: Option<&str>) -> Result<PathBuf, String> {
     let cwd = match raw {
         Some(value) if !value.trim().is_empty() => {
@@ -134,19 +139,43 @@ fn resolve_cwd(base: &Path, raw: Option<&str>) -> Result<PathBuf, String> {
     Ok(cwd)
 }
 
-async fn write_job(state: &AppState, job: &DurableJob) -> Result<(), String> {
+fn merge_job_for_write(current: Option<DurableJob>, mut next: DurableJob) -> DurableJob {
+    if let Some(current) = current {
+        if current.status == DurableJobStatus::Cancelled
+            && next.status != DurableJobStatus::Cancelled
+        {
+            next.status = DurableJobStatus::Cancelled;
+        }
+    }
+    next
+}
+
+async fn write_job(state: &AppState, job: &DurableJob) -> Result<DurableJob, String> {
     let path = job_file(state, job.id);
     let parent = path
         .parent()
         .ok_or_else(|| "invalid durable job path".to_string())?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(|e| format!("failed to create job dir: {}", e))?;
-    let bytes = serde_json::to_vec_pretty(job)
+    let lock_path = job_lock_file(state, job.id);
+    std::fs::create_dir_all(parent).map_err(|e| format!("failed to create job dir: {}", e))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("failed to open job lock: {}", e))?;
+    lock.lock_exclusive()
+        .map_err(|e| format!("failed to lock job registry entry: {}", e))?;
+
+    let current = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<DurableJob>(&bytes).ok(),
+        Err(_) => None,
+    };
+    let job = merge_job_for_write(current, job.clone());
+    let bytes = serde_json::to_vec_pretty(&job)
         .map_err(|e| format!("failed to serialize job registry entry: {}", e))?;
-    tokio::fs::write(path, bytes)
-        .await
-        .map_err(|e| format!("failed to write job registry entry: {}", e))
+    std::fs::write(path, bytes)
+        .map_err(|e| format!("failed to write job registry entry: {}", e))?;
+    Ok(job)
 }
 
 async fn read_job(state: &AppState, id: Uuid) -> Result<DurableJob, String> {
@@ -165,9 +194,6 @@ async fn write_terminal_job_state(
     updated_at: DateTime<Utc>,
 ) -> DurableJob {
     if let Ok(latest) = read_job(state, job.id).await {
-        if latest.status == DurableJobStatus::Cancelled {
-            return latest;
-        }
         job = latest;
     }
 
@@ -175,8 +201,7 @@ async fn write_terminal_job_state(
     job.exit_code = exit_code;
     job.signal = signal;
     job.updated_at = updated_at;
-    let _ = write_job(state, &job).await;
-    job
+    write_job(state, &job).await.unwrap_or(job)
 }
 
 #[cfg(unix)]
@@ -232,7 +257,7 @@ async fn refresh_job(state: &AppState, mut job: DurableJob) -> DurableJob {
             if !process_alive(pid) {
                 job.status = DurableJobStatus::Unknown;
                 job.updated_at = Utc::now();
-                let _ = write_job(state, &job).await;
+                job = write_job(state, &job).await.unwrap_or(job);
             }
         }
     }
@@ -424,7 +449,7 @@ pub async fn cancel_job(
         }
         job.status = DurableJobStatus::Cancelled;
         job.updated_at = Utc::now();
-        write_job(&state, &job)
+        job = write_job(&state, &job)
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
@@ -443,6 +468,25 @@ pub fn routes() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
 
+    fn test_job(status: DurableJobStatus) -> DurableJob {
+        let now = Utc::now();
+        DurableJob {
+            id: Uuid::new_v4(),
+            command: "true".to_string(),
+            cwd: "/tmp".to_string(),
+            status,
+            pid: Some(123),
+            exit_code: None,
+            signal: None,
+            created_at: now,
+            updated_at: now,
+            started_by_mission_id: None,
+            stdout_log: "/tmp/stdout.log".to_string(),
+            stderr_log: "/tmp/stderr.log".to_string(),
+            status_file: "/tmp/exit.json".to_string(),
+        }
+    }
+
     #[test]
     fn resolve_cwd_defaults_to_base() {
         let base = std::env::current_dir().unwrap();
@@ -454,5 +498,29 @@ mod tests {
         let base = std::env::current_dir().unwrap();
         let result = resolve_cwd(&base, Some("__definitely_missing_durable_job_cwd__"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn merge_job_for_write_preserves_cancelled_status() {
+        let current = test_job(DurableJobStatus::Cancelled);
+        let mut next = current.clone();
+        next.status = DurableJobStatus::Completed;
+        next.exit_code = Some(0);
+
+        let merged = merge_job_for_write(Some(current), next);
+
+        assert_eq!(merged.status, DurableJobStatus::Cancelled);
+        assert_eq!(merged.exit_code, Some(0));
+    }
+
+    #[test]
+    fn merge_job_for_write_allows_explicit_cancelled_update() {
+        let current = test_job(DurableJobStatus::Running);
+        let mut next = current.clone();
+        next.status = DurableJobStatus::Cancelled;
+
+        let merged = merge_job_for_write(Some(current), next);
+
+        assert_eq!(merged.status, DurableJobStatus::Cancelled);
     }
 }
