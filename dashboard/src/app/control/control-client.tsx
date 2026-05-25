@@ -9891,7 +9891,7 @@ export default function ControlClient() {
                                     ].includes(w.status) && "bg-white/30",
                                   )}
                                 />
-                                <span className="font-mono text-[11px] text-white/70 truncate">
+                                <span className="font-mono text-[11px] text-foreground/80 truncate">
                                   {w.title || w.id.slice(0, 8)}
                                 </span>
                               </a>

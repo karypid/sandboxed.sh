@@ -217,7 +217,7 @@ export const WorkersStrip = memo(function WorkersStrip({
             title={status.activity ? `${title}: ${status.activity}` : title}
           >
             <span className={cn('shrink-0', status.color)}>{status.icon}</span>
-            <span className="truncate text-white/85">{title}</span>
+            <span className="truncate text-foreground/85">{title}</span>
             {status.activity && (
               <span className="hidden md:inline truncate text-white/40 max-w-[120px]">
                 · {status.activity}

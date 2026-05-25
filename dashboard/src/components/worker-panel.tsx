@@ -188,7 +188,7 @@ const WorkerCard = memo(function WorkerCard({
       {/* Header row */}
       <div className="flex items-center gap-2 mb-1">
         <span className={status.color}>{status.icon}</span>
-        <span className="text-sm font-medium text-white/90 truncate flex-1">
+        <span className="text-sm font-medium text-foreground/90 truncate flex-1">
           {title}
         </span>
         <ExternalLink className="h-3 w-3 text-white/20 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
