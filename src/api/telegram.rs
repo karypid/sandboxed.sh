@@ -1246,7 +1246,7 @@ async fn paloma_pending_alert_still_eligible(
     }
     let events = ctx
         .mission_store
-        .get_events(mission.id, None, Some(40), None)
+        .get_latest_events(mission.id, 40)
         .await
         .unwrap_or_default();
     paloma_should_alert_mission_at(&mission, &events, interest, now)
@@ -1290,7 +1290,7 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, _http: &Client) {
         let title = mission_label(&mission);
         let events = ctx
             .mission_store
-            .get_events(mission.id, None, Some(40), None)
+            .get_latest_events(mission.id, 40)
             .await
             .unwrap_or_default();
         let alert_now = Utc::now();
@@ -1643,7 +1643,13 @@ async fn flush_pending_paloma_digest(
             // Doing it at queue time would advance the backoff ladder even
             // for alerts the user never saw (quiet-hours-suppressed,
             // rate-limited, etc.).
+            //
+            // Within one digest, dedupe by `(mission_id, alert_class)` so a
+            // bundle that contains two alerts of the same class for the
+            // same mission counts as a single user-facing interrupt and
+            // walks the ladder one step, not N.
             let cooldown_now = digest_checked_at;
+            let mut bumped: HashSet<(Uuid, String)> = HashSet::new();
             for alert in pending {
                 let _ = ctx
                     .mission_store
@@ -1651,6 +1657,10 @@ async fn flush_pending_paloma_digest(
                     .await;
                 if let Some(mission_id) = alert.mission_id {
                     let base_class = paloma_alert_class_from_event_kind(&alert.event_kind);
+                    let key = (mission_id, base_class.to_string());
+                    if !bumped.insert(key) {
+                        continue;
+                    }
                     let prev = ctx
                         .mission_store
                         .get_paloma_cooldown_state(owner_id, mission_id, base_class)
@@ -1703,7 +1713,7 @@ async fn refresh_mission_cards(ctx: &ChannelContext, http: &Client) {
         return;
     };
 
-    let missions = match ctx
+    let mut missions = match ctx
         .mission_store
         .list_missions(PALOMA_MISSION_CARD_SCAN_LIMIT, 0)
         .await
@@ -1714,6 +1724,31 @@ async fn refresh_mission_cards(ctx: &ChannelContext, http: &Client) {
             return;
         }
     };
+
+    // Long-running quiet missions drift out of the most-recently-updated
+    // window once newer missions tick. Their cards would then freeze on
+    // whatever state was last rendered. Pull in the mission row for every
+    // non-archived persisted card so we always refresh active anchors.
+    let active_card_missions = ctx
+        .mission_store
+        .list_active_paloma_mission_cards(owner_id)
+        .await
+        .unwrap_or_default();
+    let in_window: HashSet<Uuid> = missions.iter().map(|m| m.id).collect();
+    for card in active_card_missions {
+        if in_window.contains(&card.mission_id) {
+            continue;
+        }
+        match ctx.mission_store.get_mission(card.mission_id).await {
+            Ok(Some(mission)) => missions.push(mission),
+            Ok(None) => {} // mission deleted; the orphaned card will linger but cause no spam
+            Err(err) => tracing::debug!(
+                mission_id = %card.mission_id,
+                "Failed to load mission for active card refresh: {}",
+                err
+            ),
+        }
+    }
 
     let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
     let now = Utc::now();
@@ -1763,11 +1798,11 @@ async fn refresh_mission_cards(ctx: &ChannelContext, http: &Client) {
 
         let events = ctx
             .mission_store
-            .get_events(mission.id, None, Some(40), None)
+            .get_latest_events(mission.id, 40)
             .await
             .unwrap_or_default();
         let title = mission_label(&mission);
-        let started_at = mission_card::mission_started_at(&mission, &events);
+        let started_at = mission_card::mission_started_at(&mission);
         let latest_line = paloma_latest_attention_line(&mission, &events);
         let content =
             mission_card::render_card(&mission, &title, started_at, now, latest_line.as_deref());
@@ -1912,7 +1947,18 @@ fn mission_card_should_reanchor(anchor_ts: &str, now: chrono::DateTime<Utc>) -> 
             let age = now - parsed.with_timezone(&Utc);
             age >= ChronoDuration::hours(PALOMA_MISSION_CARD_REANCHOR_AFTER_HOURS)
         }
-        Err(_) => true,
+        Err(_) => {
+            // A corrupted anchor_ts should not trigger a re-anchor every
+            // 2-second tick — that would spam the chat with fresh card
+            // messages forever. Prefer to keep editing the existing card
+            // (it might be salvageable) and surface the malformed anchor
+            // in the logs so we can repair it manually.
+            tracing::warn!(
+                "Paloma mission card anchor_ts is not RFC3339; skipping re-anchor: {:?}",
+                anchor_ts
+            );
+            false
+        }
     }
 }
 
@@ -6469,8 +6515,9 @@ mod tests {
         extract_telegram_actions, feedback_mutes_alerts, feedback_only_failures,
         feedback_raises_interest, format_structured_memory_context, is_paloma_command,
         is_paloma_shared_summary_allowed, markdown_to_telegram_html, merge_telegram_chat_metadata,
-        mission_label, normalize_paloma_natural_command, paloma_alert_body,
-        paloma_alert_digest_text, paloma_alert_event_kind_at, paloma_alert_importance_for_mission,
+        mission_card_should_reanchor, mission_label, normalize_paloma_natural_command,
+        paloma_alert_body, paloma_alert_class_from_event_kind, paloma_alert_digest_text,
+        paloma_alert_event_kind_at, paloma_alert_importance_for_mission,
         paloma_alert_kind_for_status, paloma_channel_job_name, paloma_chat_is_allowed,
         paloma_command_error_response, paloma_mission_has_failure_only_preference,
         paloma_role_for_user, paloma_shared_summary_body,
@@ -7748,5 +7795,42 @@ mod tests {
         ));
 
         std::env::remove_var("SANDBOXED_INTERNAL_ACTION_SECRET");
+    }
+
+    #[test]
+    fn mission_card_reanchor_skipped_for_unparseable_anchor() {
+        // Regression: returning true on parse failure would post a fresh
+        // card every ~2-second tick, spamming the chat with duplicate
+        // anchors. Prefer to keep the (possibly recoverable) existing
+        // anchor and let the user/operator notice via logs.
+        let now = Utc::now();
+        assert!(!mission_card_should_reanchor("", now));
+        assert!(!mission_card_should_reanchor("not-a-date", now));
+        assert!(!mission_card_should_reanchor("2026-99-99T99:99:99Z", now));
+    }
+
+    #[test]
+    fn mission_card_reanchor_fires_after_47_hours() {
+        let now = Utc::now();
+        let fresh = (now - chrono::Duration::hours(2)).to_rfc3339();
+        let stale = (now - chrono::Duration::hours(50)).to_rfc3339();
+        assert!(!mission_card_should_reanchor(&fresh, now));
+        assert!(mission_card_should_reanchor(&stale, now));
+    }
+
+    #[test]
+    fn alert_class_from_event_kind_strips_timestamp_suffix() {
+        assert_eq!(
+            paloma_alert_class_from_event_kind("mission_failed:2026-05-24T07-09-00Z"),
+            "mission_failed"
+        );
+        assert_eq!(
+            paloma_alert_class_from_event_kind("mission_long_running"),
+            "mission_long_running"
+        );
+        assert_eq!(
+            paloma_alert_class_from_event_kind("mission_awaiting_user:t1"),
+            "mission_awaiting_user"
+        );
     }
 }

@@ -7,7 +7,7 @@
 //! anchor) lives in the Telegram bridge.
 
 use crate::api::control::MissionStatus;
-use crate::api::mission_store::{Mission, StoredEvent};
+use crate::api::mission_store::Mission;
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 
@@ -229,19 +229,15 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     out
 }
 
-/// Helper for callers that need to pull the latest meaningful event timestamp
-/// for elapsed-time computation. The "started_at" used by the card is the
-/// earliest event timestamp; falls back to mission.created_at.
-pub fn mission_started_at(mission: &Mission, events: &[StoredEvent]) -> Option<DateTime<Utc>> {
-    events
-        .iter()
-        .find_map(|event| DateTime::parse_from_rfc3339(&event.timestamp).ok())
+/// Helper for callers that need to pull the mission's start timestamp for
+/// elapsed-time computation. Uses `mission.created_at` directly — earlier
+/// versions sniffed the first event, but the card now loads only the
+/// *latest* N events, so the first one in the window is not the mission
+/// start. The mission row's `created_at` is always present and stable.
+pub fn mission_started_at(mission: &Mission) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&mission.created_at)
+        .ok()
         .map(|dt| dt.with_timezone(&Utc))
-        .or_else(|| {
-            DateTime::parse_from_rfc3339(&mission.created_at)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        })
 }
 
 #[cfg(test)]

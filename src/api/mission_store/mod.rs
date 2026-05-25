@@ -1282,6 +1282,21 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Get the last `limit` events for a mission, returned in chronological
+    /// order (sequence ASC). Equivalent to `ORDER BY sequence DESC LIMIT N`
+    /// then re-sorted. Use this for "show me what just happened" surfaces
+    /// like the Paloma mission card: `get_events` paginates from the
+    /// *oldest* event and silently drops anything past the limit, which
+    /// makes the card's "Latest" line stale for long-running missions.
+    async fn get_latest_events(
+        &self,
+        mission_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let _ = (mission_id, limit);
+        Ok(vec![])
+    }
+
     /// Get events with `sequence > since_seq`, ordered by sequence ASC.
     /// Used by the client for delta reconnect — pass the highest
     /// sequence the client has seen and get only events that arrived

@@ -3765,6 +3765,66 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_latest_events(
+        &self,
+        mission_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let limit = limit.clamp(1, 50_000) as i64;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mission_id, sequence, event_type, timestamp, event_id,
+                            tool_call_id, tool_name, content, content_file, metadata
+                     FROM mission_events
+                     WHERE mission_id = ?1
+                     ORDER BY sequence DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![mid, limit], |row| {
+                    let content: Option<String> = row.get(8)?;
+                    let content_file: Option<String> = row.get(9)?;
+                    let full_content = SqliteMissionStore::load_content(
+                        content.as_deref(),
+                        content_file.as_deref(),
+                    );
+                    let metadata_str: String = row
+                        .get::<_, Option<String>>(10)?
+                        .unwrap_or_else(|| "{}".to_string());
+                    let mid_str: String = row.get(1)?;
+                    Ok(StoredEvent {
+                        id: row.get(0)?,
+                        mission_id: parse_uuid_or_nil(&mid_str),
+                        sequence: row.get(2)?,
+                        event_type: row.get(3)?,
+                        timestamp: row.get(4)?,
+                        event_id: row.get(5)?,
+                        tool_call_id: row.get(6)?,
+                        tool_name: row.get(7)?,
+                        content: full_content,
+                        metadata: serde_json::from_str(&metadata_str)
+                            .unwrap_or(serde_json::json!({})),
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(row.map_err(|e| e.to_string())?);
+            }
+            // SQL returned DESC; flip to ASC so callers can keep their
+            // existing `iter().rev()` semantics for "walk newest first".
+            events.reverse();
+            Ok(events)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn get_events(
         &self,
         mission_id: Uuid,
@@ -11346,6 +11406,58 @@ mod tests {
             .await
             .expect("refresh after sent");
         assert!(!refreshed2, "sent rows must not be refreshed");
+    }
+
+    #[tokio::test]
+    async fn get_latest_events_returns_newest_n_in_chronological_order() {
+        use crate::api::control::AgentEvent;
+        // Regression: callers want "what just happened", not the first
+        // events of a long-running mission. `get_events(..., limit, 0)`
+        // returns oldest-first; `get_latest_events` must return the tail.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Long stream"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        for n in 0..50 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::AssistantMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("msg-{n}"),
+                        success: true,
+                        cost_cents: 0,
+                        cost_source: CostSource::Unknown,
+                        usage: None,
+                        model: None,
+                        model_normalized: None,
+                        mission_id: Some(mission.id),
+                        shared_files: None,
+                        resumable: false,
+                        completion_evidence: None,
+                    },
+                )
+                .await
+                .expect("log");
+        }
+
+        let latest = store
+            .get_latest_events(mission.id, 5)
+            .await
+            .expect("get_latest_events");
+        assert_eq!(latest.len(), 5);
+        // Returned ASC, so the *first* element of latest 5 corresponds to
+        // event #45 and the last to event #49.
+        let contents: Vec<&str> = latest.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["msg-45", "msg-46", "msg-47", "msg-48", "msg-49"]
+        );
     }
 
     #[tokio::test]
