@@ -1978,7 +1978,13 @@ struct ControlView: View {
             case "goal_iteration":
                 let metadata = event.metadata.mapValues(\.value)
                 let iteration = intValue(metadata["iteration"]) ?? replayed?.iteration ?? 0
-                let objective = metadata["objective"] as? String ?? replayed?.objective ?? mission.goalObjective ?? ""
+                let eventObjective = event.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                let objective =
+                    metadata["objective"] as? String ??
+                    (!eventObjective.isEmpty ? eventObjective : nil) ??
+                    replayed?.objective ??
+                    mission.goalObjective ??
+                    ""
                 replayed = GoalPillInfo(
                     iteration: iteration,
                     status: replayed?.status ?? "active",
@@ -1988,7 +1994,11 @@ struct ControlView: View {
             case "goal_status":
                 let metadata = event.metadata.mapValues(\.value)
                 let status = metadata["status"] as? String ?? event.content
-                let objective = metadata["objective"] as? String ?? replayed?.objective ?? mission.goalObjective ?? ""
+                let objective =
+                    metadata["objective"] as? String ??
+                    replayed?.objective ??
+                    mission.goalObjective ??
+                    ""
                 switch status {
                 case "complete", "cleared", "budgetLimited":
                     replayed = nil
