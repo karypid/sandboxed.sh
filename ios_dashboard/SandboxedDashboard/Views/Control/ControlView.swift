@@ -1964,6 +1964,58 @@ struct ControlView: View {
         clearLoadingHistoryAfterRender()
     }
 
+    private func replayedGoalInfo(for mission: Mission, events: [StoredEvent]) -> GoalPillInfo? {
+        guard mission.goalMode else { return nil }
+
+        var replayed: GoalPillInfo? = GoalPillInfo(
+            iteration: 0,
+            status: "active",
+            objective: mission.goalObjective ?? ""
+        )
+
+        for event in events {
+            switch event.eventType {
+            case "goal_iteration":
+                let metadata = event.metadata.mapValues(\.value)
+                let iteration = intValue(metadata["iteration"]) ?? replayed?.iteration ?? 0
+                let objective = metadata["objective"] as? String ?? replayed?.objective ?? mission.goalObjective ?? ""
+                replayed = GoalPillInfo(
+                    iteration: iteration,
+                    status: replayed?.status ?? "active",
+                    objective: objective
+                )
+
+            case "goal_status":
+                let metadata = event.metadata.mapValues(\.value)
+                let status = metadata["status"] as? String ?? event.content
+                let objective = metadata["objective"] as? String ?? replayed?.objective ?? mission.goalObjective ?? ""
+                switch status {
+                case "complete", "cleared", "budgetLimited":
+                    replayed = nil
+                default:
+                    replayed = GoalPillInfo(
+                        iteration: replayed?.iteration ?? 0,
+                        status: status,
+                        objective: objective
+                    )
+                }
+
+            default:
+                continue
+            }
+        }
+
+        return replayed
+    }
+
+    private func intValue(_ value: Any?) -> Int? {
+        if let int = value as? Int { return int }
+        if let int64 = value as? Int64 { return Int(int64) }
+        if let double = value as? Double { return Int(double) }
+        if let string = value as? String { return Int(string) }
+        return nil
+    }
+
     private func rememberMissionEvents(_ events: [StoredEvent], for missionId: String) -> [StoredEvent] {
         let orderedEvents = events.sorted { lhs, rhs in
             if lhs.sequence != rhs.sequence {
@@ -2008,9 +2060,6 @@ struct ControlView: View {
 
             viewingMission = mission
             viewingMissionId = mission.id
-            goalInfo = mission.goalMode
-                ? GoalPillInfo(iteration: goalInfo?.iteration ?? 0, status: "active", objective: mission.goalObjective ?? "")
-                : nil
 
             // Ensure deterministic replay order in case the backend returns unsorted results
             let orderedEvents = diagnostics.measure(
@@ -2024,6 +2073,7 @@ struct ControlView: View {
             // Track total event count for pagination
             loadedEventCount = orderedEvents.count
             controlMergeCount = orderedEvents.count
+            goalInfo = replayedGoalInfo(for: mission, events: orderedEvents)
 
             // Clear and replay all events to rebuild message history
             messages.removeAll(keepingCapacity: true)
