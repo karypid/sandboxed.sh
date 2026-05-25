@@ -159,6 +159,7 @@ async fn write_job(state: &AppState, job: &DurableJob) -> Result<DurableJob, Str
     std::fs::create_dir_all(parent).map_err(|e| format!("failed to create job dir: {}", e))?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
