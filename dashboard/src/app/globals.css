@@ -49,6 +49,13 @@
   /* Borders - subtle */
   --border: 255 255 255; /* Used with /0.06 */
   --border-elevated: 255 255 255; /* Used with /0.08 */
+
+  /* Code surfaces */
+  --code-background: 30 32 38;
+  --code-border: 255 255 255;
+  --code-foreground: 220 224 232;
+  --code-inline-background: 255 255 255;
+  --code-inline-foreground: 165 180 252;
 }
 
 @media (prefers-color-scheme: light) {
@@ -69,6 +76,13 @@
     /* Borders */
     --border: 17 24 39;
     --border-elevated: 17 24 39;
+
+    /* Code surfaces */
+    --code-background: 244 246 250;
+    --code-border: 17 24 39;
+    --code-foreground: 31 41 55;
+    --code-inline-background: 224 231 255;
+    --code-inline-foreground: 49 46 129;
   }
 }
 
@@ -369,11 +383,32 @@ select:focus-visible {
     color: rgb(49 46 129);
   }
 
+  .mission-switcher-description {
+    color: rgb(var(--foreground-secondary) / 0.92) !important;
+  }
+
+  .mission-switcher-description-muted {
+    color: rgb(var(--foreground-tertiary) / 0.96) !important;
+  }
+
   .mission-switcher-row-selected [class*="text-white"],
   .mission-switcher-row-selected [class*="text-indigo"],
   .mission-switcher-row-selected [class*="text-violet"],
   .mission-switcher-row-selected [class*="text-cyan"] {
     color: inherit !important;
+  }
+
+  .mission-switcher-row-selected .mission-switcher-description,
+  .mission-switcher-row-selected .mission-switcher-description-muted {
+    color: rgb(49 46 129 / 0.82) !important;
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  .workbench-mission-description {
+    background-color: rgb(255 255 255 / 0.76) !important;
+    border-color: rgb(17 24 39 / 0.1) !important;
+    color: rgb(var(--foreground-secondary) / 0.95) !important;
   }
 }
 
@@ -726,14 +761,17 @@ select:focus-visible {
 }
 
 .prose-glass code {
-  background: rgb(var(--background-tertiary));
+  background: rgb(var(--code-inline-background) / 0.72);
+  color: rgb(var(--code-inline-foreground));
   padding: 0.125rem 0.25rem;
   border-radius: 0.25rem;
   font-size: 0.875em;
 }
 
 .prose-glass pre {
-  background: rgb(var(--background-tertiary));
+  background: rgb(var(--code-background));
+  color: rgb(var(--code-foreground));
+  border: 1px solid rgb(var(--code-border) / 0.08);
   border-radius: 0.5rem;
   padding: 1rem;
   overflow-x: auto;
@@ -741,7 +779,19 @@ select:focus-visible {
 
 .prose-glass pre code {
   background: transparent;
+  color: inherit;
   padding: 0;
+}
+
+@media (prefers-color-scheme: light) {
+  .prose-glass pre {
+    border-color: rgb(var(--code-border) / 0.1);
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.65);
+  }
+
+  .prose-glass [class*="text-indigo-300"] {
+    color: rgb(var(--code-inline-foreground));
+  }
 }
 
 .prose-glass img {

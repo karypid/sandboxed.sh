@@ -1355,12 +1355,12 @@ export function MissionSwitcher({
                         {mission && (
                           <>
                             {cardTitle && (
-                              <p className="text-xs text-white/55 truncate mt-0.5">
+                              <p className="mission-switcher-description text-xs text-white/55 truncate mt-0.5">
                                 {cardTitle}
                               </p>
                             )}
                             {cardDescription && (
-                              <p className="text-[11px] text-white/40 truncate">
+                              <p className="mission-switcher-description mission-switcher-description-muted text-[11px] text-white/40 truncate">
                                 {cardDescription}
                               </p>
                             )}

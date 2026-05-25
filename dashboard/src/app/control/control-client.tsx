@@ -2344,7 +2344,7 @@ function MissionWorkbenchPanel({
                 </div>
               </div>
               {mission.short_description && (
-                <p className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2 text-xs leading-relaxed text-white/50">
+                <p className="workbench-mission-description rounded-md border border-white/[0.05] bg-white/[0.02] p-2 text-xs leading-relaxed text-white/50">
                   {mission.short_description}
                 </p>
               )}
