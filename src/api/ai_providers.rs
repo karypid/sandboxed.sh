@@ -2395,13 +2395,108 @@ fn codex_oauth_refresh_lock(account_id: &str) -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+fn sanitize_codex_oauth_account_id(account_id: &str) -> String {
+    account_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn shared_codex_oauth_home_for_account(account_id: &str) -> PathBuf {
+    let root = std::env::var("SANDBOXED_SH_CODEX_OAUTH_HOME_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(home_dir())
+                .join(".sandboxed-sh")
+                .join("codex-oauth-accounts")
+        });
+    root.join(sanitize_codex_oauth_account_id(account_id))
+}
+
+fn find_openai_oauth_account_by_chatgpt_account_id(
+    working_dir: &Path,
+    chatgpt_account_id: &str,
+) -> Option<CodexOAuthAccount> {
+    let providers = load_ai_providers(working_dir);
+
+    for p in providers {
+        if p.get("provider_type").and_then(|v| v.as_str()) != Some("openai")
+            || !p.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+        {
+            continue;
+        }
+
+        let Some(oauth) = p.get("oauth").and_then(|o| o.as_object()) else {
+            continue;
+        };
+        let refresh = oauth
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let access = oauth
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if refresh.is_empty() || access.is_empty() {
+            continue;
+        }
+
+        let account_id = match extract_chatgpt_account_id(access) {
+            Some(id) => id,
+            None => continue,
+        };
+        if account_id != chatgpt_account_id {
+            continue;
+        }
+
+        let expires_at = extract_jwt_exp_ms(access)
+            .or_else(|| oauth.get("expires_at").and_then(|v| v.as_i64()))
+            .unwrap_or(i64::MAX);
+        return Some(CodexOAuthAccount {
+            provider_id: p
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                .unwrap_or_else(uuid::Uuid::new_v4),
+            chatgpt_account_id: account_id,
+            refresh_token: refresh.to_string(),
+            access_token: access.to_string(),
+            expires_at,
+            account_email: p
+                .get("account_email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            priority: p.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        });
+    }
+
+    None
+}
+
+fn sync_shared_codex_oauth_auth(account: &CodexOAuthAccount) -> Result<PathBuf, String> {
+    let codex_home = shared_codex_oauth_home_for_account(&account.chatgpt_account_id);
+    write_codex_auth_json_chatgpt_with_tokens(
+        &codex_home,
+        &account.access_token,
+        &account.refresh_token,
+    )?;
+    Ok(codex_home)
+}
+
 /// Return a launch-ready ChatGPT OAuth account for Codex.
 ///
-/// Codex workers are launched with access-token-only auth so multiple workers
-/// can use the same ChatGPT account concurrently without racing on a rotating
-/// refresh token. This function is the single refresh point for that account:
-/// it re-reads the latest stored tokens under a per-account lock and refreshes
-/// only when the access token is close to expiry.
+/// The backend re-reads the latest stored tokens under a per-account lock and
+/// refreshes only when the access token is close to expiry. The resulting token
+/// pair is also mirrored into the shared per-account Codex auth home, so any
+/// Codex-managed auth fallback starts from the same current refresh token.
 pub async fn prepare_codex_oauth_account_for_launch(
     working_dir: &Path,
     selected: &CodexOAuthAccount,
@@ -2418,6 +2513,7 @@ pub async fn prepare_codex_oauth_account_for_launch(
 
     let now = chrono::Utc::now().timestamp_millis();
     if current.expires_at > now + MIN_ACCESS_TOKEN_TTL_MS {
+        let _ = sync_shared_codex_oauth_auth(&current);
         return Ok(current);
     }
 
@@ -2449,12 +2545,73 @@ pub async fn prepare_codex_oauth_account_for_launch(
         );
     }
 
-    Ok(CodexOAuthAccount {
+    let refreshed = CodexOAuthAccount {
         access_token: access,
         refresh_token: refresh,
         expires_at,
         ..current
-    })
+    };
+    let _ = sync_shared_codex_oauth_auth(&refreshed);
+    Ok(refreshed)
+}
+
+pub async fn refresh_codex_oauth_account_for_app_server(
+    working_dir: &Path,
+    previous_account_id: Option<&str>,
+    fallback_account_id: Option<&str>,
+) -> Result<CodexOAuthAccount, String> {
+    let account_id = previous_account_id
+        .filter(|id| !id.trim().is_empty())
+        .or(fallback_account_id)
+        .ok_or_else(|| "Codex requested OAuth refresh without an account id".to_string())?;
+
+    let lock = codex_oauth_refresh_lock(account_id);
+    let _guard = lock.lock().await;
+
+    let current = find_openai_oauth_account_by_chatgpt_account_id(working_dir, account_id)
+        .ok_or_else(|| {
+            format!(
+                "No OpenAI OAuth account found for ChatGPT account {}",
+                account_id
+            )
+        })?;
+
+    let client = reqwest::Client::new();
+    let (access, refresh, expires_at, _id_token) =
+        refresh_openai_oauth_tokens(&client, &current.refresh_token).await?;
+    let refreshed_account_id =
+        extract_chatgpt_account_id(&access).unwrap_or_else(|| current.chatgpt_account_id.clone());
+
+    if refreshed_account_id != current.chatgpt_account_id {
+        tracing::warn!(
+            expected_account_id = %current.chatgpt_account_id,
+            refreshed_account_id = %refreshed_account_id,
+            "OpenAI OAuth app-server refresh returned a different ChatGPT account id"
+        );
+    }
+
+    let updated = update_provider_oauth_for_chatgpt_account(
+        working_dir,
+        &current.chatgpt_account_id,
+        &access,
+        &refresh,
+        expires_at,
+    );
+    if !updated {
+        tracing::warn!(
+            account_id = %current.chatgpt_account_id,
+            "Refreshed Codex OAuth account for app-server but could not update ai_providers.json"
+        );
+    }
+
+    let refreshed = CodexOAuthAccount {
+        access_token: access,
+        refresh_token: refresh,
+        expires_at,
+        ..current
+    };
+    let _ = sync_shared_codex_oauth_auth(&refreshed);
+    Ok(refreshed)
 }
 
 /// Per-attempt credential override passed to `write_codex_credentials_for_workspace`.

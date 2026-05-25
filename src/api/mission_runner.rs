@@ -714,7 +714,7 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 }
 
 const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
-const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 1;
+const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
 const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
@@ -14284,6 +14284,14 @@ pub async fn run_codex_turn(
     let codex_config = crate::backend::codex::client::CodexConfig {
         cli_path,
         model_effort: model_effort.map(|s| s.to_string()),
+        external_chatgpt_auth: prepared_oauth_account.as_ref().map(|account| {
+            crate::backend::codex::client::CodexExternalChatgptAuth {
+                access_token: account.access_token.clone(),
+                chatgpt_account_id: account.chatgpt_account_id.clone(),
+                chatgpt_plan_type: None,
+                working_dir: app_working_dir.to_path_buf(),
+            }
+        }),
         ..Default::default()
     };
 

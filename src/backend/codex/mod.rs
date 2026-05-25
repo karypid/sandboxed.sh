@@ -215,11 +215,10 @@ async fn send_message_streaming_app_server(
     };
 
     // Note: codex app-server does NOT honor `OPENAI_API_KEY`/`OPENAI_OAUTH_TOKEN`
-    // env vars (per `app-server/src/lib.rs:646-647`) — it reads `~/.codex/auth.json`
-    // (CODEX_HOME-relative). Auth flows through the per-mission codexhome-XXXX
-    // dir already populated by the workspace bootstrap; the legacy
-    // `oauth_token`-via-env path used by exec mode is dead here, so we don't
-    // forward it.
+    // env vars (per `app-server/src/lib.rs:646-647`). For ChatGPT OAuth
+    // rotation we use app-server's external token mode instead: the backend
+    // supplies an access token at startup and answers refresh requests under
+    // our per-account lock.
     let app_cfg = AppServerConfig {
         cli_path: cfg.cli_path.clone(),
         enabled_features: vec!["goals".to_string()],
@@ -241,6 +240,27 @@ async fn send_message_streaming_app_server(
     if let Err(e) = session_arc.initialize("sandboxed-sh", "1.2.0").await {
         let _ = session_arc.shutdown().await;
         return Err(anyhow::anyhow!("codex app-server initialize failed: {}", e));
+    }
+
+    if let Some(external_auth) = cfg.external_chatgpt_auth.as_ref() {
+        if let Err(e) = session_arc
+            .login_chatgpt_auth_tokens(
+                &external_auth.access_token,
+                &external_auth.chatgpt_account_id,
+                external_auth.chatgpt_plan_type.as_deref(),
+            )
+            .await
+        {
+            let _ = session_arc.shutdown().await;
+            return Err(anyhow::anyhow!(
+                "codex account/login/start chatgptAuthTokens failed: {}",
+                e
+            ));
+        }
+        tracing::info!(
+            chatgpt_account_id = %external_auth.chatgpt_account_id,
+            "Configured Codex app-server external ChatGPT OAuth tokens"
+        );
     }
     // Best-effort `notifications/initialized` — codex tolerates clients that
     // skip this but it matches the LSP-style handshake.
@@ -388,28 +408,57 @@ async fn send_message_streaming_app_server(
                             terminal = true;
                         }
                     }
-                    InboundMessage::ServerRequest {
-                        id,
-                        method,
-                        params: _,
-                    } => {
+                    InboundMessage::ServerRequest { id, method, params } => {
                         // Codex elicits permission for command exec, file change,
                         // and dynamic-tool invocations through server-initiated
                         // requests. Exec mode runs with
                         // `--dangerously-bypass-approvals-and-sandbox`; we mirror
                         // that policy here by auto-approving every elicitation.
-                        // Auth-refresh requests get a typed JSON-RPC error
-                        // because we don't carry refresh credentials in the
-                        // app-server path (codex reads its own auth.json).
                         let send_err = if method == "account/chatgptAuthTokens/refresh" {
-                            session_arc
-                                .respond_to_server_request_error(
-                                    id,
-                                    -32603,
-                                    "sandboxed-sh: auth refresh not supported by client; \
-                                     codex must re-read $CODEX_HOME/auth.json",
-                                )
-                                .await
+                            match cfg.external_chatgpt_auth.as_ref() {
+                                Some(external_auth) => {
+                                    let previous_account_id = params
+                                        .get("previousAccountId")
+                                        .and_then(|value| value.as_str());
+                                    match crate::api::ai_providers::refresh_codex_oauth_account_for_app_server(
+                                        &external_auth.working_dir,
+                                        previous_account_id,
+                                        Some(&external_auth.chatgpt_account_id),
+                                    )
+                                    .await
+                                    {
+                                        Ok(account) => {
+                                            let result = serde_json::json!({
+                                                "accessToken": account.access_token,
+                                                "chatgptAccountId": account.chatgpt_account_id,
+                                                "chatgptPlanType": external_auth.chatgpt_plan_type,
+                                            });
+                                            session_arc.respond_to_server_request(id, result).await
+                                        }
+                                        Err(error) => {
+                                            session_arc
+                                                .respond_to_server_request_error(
+                                                    id,
+                                                    -32603,
+                                                    &format!(
+                                                        "sandboxed-sh: ChatGPT OAuth refresh failed: {}",
+                                                        error
+                                                    ),
+                                                )
+                                                .await
+                                        }
+                                    }
+                                }
+                                None => {
+                                    session_arc
+                                        .respond_to_server_request_error(
+                                            id,
+                                            -32603,
+                                            "sandboxed-sh: auth refresh requested without external ChatGPT OAuth context",
+                                        )
+                                        .await
+                                }
+                            }
                         } else {
                             let result = elicitation_auto_approve(&method);
                             session_arc.respond_to_server_request(id, result).await
