@@ -17,6 +17,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -323,18 +324,13 @@ pub async fn start_job(
         });
     }
 
-    let child = child
-        .spawn()
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let pid = child.id();
-
     let now = Utc::now();
-    let job = DurableJob {
+    let mut job = DurableJob {
         id,
         command: command.to_string(),
         cwd: cwd.to_string_lossy().to_string(),
         status: DurableJobStatus::Running,
-        pid,
+        pid: None,
         exit_code: None,
         signal: None,
         created_at: now,
@@ -344,9 +340,35 @@ pub async fn start_job(
         stderr_log: stderr_log.to_string_lossy().to_string(),
         status_file: status_file.to_string_lossy().to_string(),
     };
-    write_job(&state, &job)
+    job = write_job(&state, &job)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let child = match child.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            job.status = DurableJobStatus::Failed;
+            job.updated_at = Utc::now();
+            let _ = write_job(&state, &job).await;
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+    job.pid = child.id();
+    job.updated_at = Utc::now();
+    job = match write_job(&state, &job).await {
+        Ok(job) => job,
+        Err(e) => {
+            if let Some(pid) = job.pid {
+                terminate_process_group(pid);
+            }
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+    if job.status == DurableJobStatus::Cancelled {
+        if let Some(pid) = job.pid {
+            terminate_process_group(pid);
+        }
+    }
 
     let watcher_state = Arc::clone(&state);
     tokio::spawn(async move {
@@ -409,12 +431,22 @@ pub async fn get_job(
 }
 
 async fn tail_file(path: &str, max_bytes: usize) -> String {
-    let Ok(bytes) = tokio::fs::read(path).await else {
+    let keep = max_bytes.clamp(1, 256 * 1024);
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
         return String::new();
     };
-    let keep = max_bytes.clamp(1, 256 * 1024);
-    let start = bytes.len().saturating_sub(keep);
-    String::from_utf8_lossy(&bytes[start..]).to_string()
+    let Ok(metadata) = file.metadata().await else {
+        return String::new();
+    };
+    let start = metadata.len().saturating_sub(keep as u64);
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).await.is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).to_string()
 }
 
 pub async fn job_logs(
@@ -453,14 +485,14 @@ pub async fn cancel_job(
         .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
     job = refresh_job(&state, job).await;
     if job.status == DurableJobStatus::Running {
-        if let Some(pid) = job.pid {
-            terminate_process_group(pid);
-        }
         job.status = DurableJobStatus::Cancelled;
         job.updated_at = Utc::now();
         job = write_job(&state, &job)
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if let Some(pid) = job.pid {
+            terminate_process_group(pid);
+        }
     }
     Ok(Json(job))
 }
