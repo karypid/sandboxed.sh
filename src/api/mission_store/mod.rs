@@ -1956,6 +1956,32 @@ pub trait MissionStore: Send + Sync {
         Ok(0)
     }
 
+    /// Refresh the body / title / importance of a pending Telegram alert.
+    /// Called after `create_telegram_alert_if_absent` so collapsed alert
+    /// classes (e.g. `mission_long_running`) reflect the latest mission state
+    /// at digest time, instead of being frozen at first insert. No-op when
+    /// the row was just inserted (idempotent over-write) or already
+    /// acknowledged/sent.
+    async fn refresh_pending_telegram_alert_body(
+        &self,
+        telegram_user_id: i64,
+        mission_id: Uuid,
+        event_kind: &str,
+        title: &str,
+        body: &str,
+        importance: &str,
+    ) -> Result<bool, String> {
+        let _ = (
+            telegram_user_id,
+            mission_id,
+            event_kind,
+            title,
+            body,
+            importance,
+        );
+        Ok(false)
+    }
+
     /// Consolidate explicit Telegram memory rows, keeping the latest user-provided rule/fact.
     async fn consolidate_telegram_structured_memory(
         &self,

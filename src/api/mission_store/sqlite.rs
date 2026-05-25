@@ -2633,6 +2633,18 @@ impl MissionStore for SqliteMissionStore {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+            // Read the old status before the UPDATE so we can decide whether
+            // to invalidate the Paloma cooldown. Wiping cooldown on a
+            // no-op status write (e.g. heartbeat that re-sets Active=Active)
+            // would let "still running" alerts skip past the user's
+            // exponential backoff and arrive too soon.
+            let previous_status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM missions WHERE id = ?1",
+                    params![id.to_string()],
+                    |row| row.get(0),
+                )
+                .ok();
             if clear_first_viewed_at {
                 conn.execute(
                     "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5, first_viewed_at = NULL WHERE id = ?6",
@@ -2660,15 +2672,16 @@ impl MissionStore for SqliteMissionStore {
                 )
                 .map_err(|e| e.to_string())?;
             }
-            // A status transition is a genuine signal change for Paloma. Drop
-            // any cooldown rows so the first alert about the new status fires
-            // immediately and the backoff ladder restarts from step 0. Best
-            // effort — if the table is missing or the row is gone, nothing to
-            // do.
-            let _ = conn.execute(
-                "DELETE FROM paloma_cooldown_state WHERE mission_id = ?1",
-                params![id.to_string()],
-            );
+            // Only reset cooldown on a *genuine* status transition. Best
+            // effort — if the table is missing or the row is gone, nothing
+            // to do.
+            let status_changed = previous_status.as_deref() != Some(status_to_string(status));
+            if status_changed {
+                let _ = conn.execute(
+                    "DELETE FROM paloma_cooldown_state WHERE mission_id = ?1",
+                    params![id.to_string()],
+                );
+            }
             Ok(())
         })
         .await
@@ -6488,6 +6501,46 @@ impl MissionStore for SqliteMissionStore {
         Ok(preferences)
     }
 
+    async fn refresh_pending_telegram_alert_body(
+        &self,
+        telegram_user_id: i64,
+        mission_id: Uuid,
+        event_kind: &str,
+        title: &str,
+        body: &str,
+        importance: &str,
+    ) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let event_kind = event_kind.to_string();
+        let title = title.to_string();
+        let body = body.to_string();
+        let importance = importance.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let changed = conn
+                .execute(
+                    "UPDATE telegram_alerts
+                     SET title = ?4, body = ?5, importance = ?6
+                     WHERE telegram_user_id = ?1
+                       AND mission_id = ?2
+                       AND event_kind = ?3
+                       AND status = 'pending'",
+                    params![
+                        telegram_user_id,
+                        mission_id.to_string(),
+                        event_kind,
+                        title,
+                        body,
+                        importance,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(changed > 0)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn count_paloma_sent_alerts_since(
         &self,
         telegram_user_id: i64,
@@ -6497,12 +6550,18 @@ impl MissionStore for SqliteMissionStore {
         let since = since.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+            // Rate-limit budget is "how many Telegram messages did we send
+            // to this user in the window", not "how many alert rows we
+            // marked sent". A digest folds N alerts into one Telegram
+            // message; counting the rows would burn the user's budget N×
+            // faster than reality.
             let count: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM telegram_alerts
+                    "SELECT COUNT(DISTINCT telegram_message_id) FROM telegram_alerts
                      WHERE telegram_user_id = ?1
                        AND status = 'sent'
                        AND sent_at IS NOT NULL
+                       AND telegram_message_id IS NOT NULL
                        AND sent_at >= ?2",
                     params![telegram_user_id, since],
                     |row| row.get(0),
@@ -11134,6 +11193,226 @@ mod tests {
             .await
             .expect("count recent");
         assert_eq!(count_recent, 0);
+    }
+
+    #[tokio::test]
+    async fn paloma_sent_count_treats_digest_bundle_as_one_message() {
+        // Regression: rate limit must count Telegram messages, not the alert
+        // rows they bundled. A digest with N alerts shares one
+        // telegram_message_id; counting rows would burn the user's hourly
+        // budget N× faster than reality.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Bundled"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        // Five distinct pending alerts marked sent under the same digest
+        // message_id — counts as one interrupt.
+        for n in 0..5 {
+            let alert = TelegramAlert {
+                id: Uuid::new_v4(),
+                telegram_user_id: 1_139_694_048,
+                mission_id: Some(mission.id),
+                event_kind: format!("mission_failed:{n}"),
+                importance: "high".to_string(),
+                title: "X".to_string(),
+                body: "X failed.".to_string(),
+                status: "pending".to_string(),
+                telegram_message_id: None,
+                last_error: None,
+                created_at: format!("2026-05-24T01:0{n}:00Z"),
+                sent_at: None,
+                acknowledged_at: None,
+            };
+            let inserted = store
+                .create_telegram_alert_if_absent(alert)
+                .await
+                .expect("insert")
+                .expect("new row");
+            store
+                .mark_telegram_alert_sent(inserted.id, Some(777), "2026-05-24T02:00:00Z")
+                .await
+                .expect("mark sent");
+        }
+        // A second digest a few minutes later — different message_id.
+        let alert = TelegramAlert {
+            id: Uuid::new_v4(),
+            telegram_user_id: 1_139_694_048,
+            mission_id: Some(mission.id),
+            event_kind: "mission_long_running".to_string(),
+            importance: "normal".to_string(),
+            title: "X".to_string(),
+            body: "X still running.".to_string(),
+            status: "pending".to_string(),
+            telegram_message_id: None,
+            last_error: None,
+            created_at: "2026-05-24T02:30:00Z".to_string(),
+            sent_at: None,
+            acknowledged_at: None,
+        };
+        let inserted = store
+            .create_telegram_alert_if_absent(alert)
+            .await
+            .expect("insert second")
+            .expect("new row");
+        store
+            .mark_telegram_alert_sent(inserted.id, Some(778), "2026-05-24T02:30:00Z")
+            .await
+            .expect("mark sent second");
+
+        let count = store
+            .count_paloma_sent_alerts_since(1_139_694_048, "2026-05-24T00:00:00Z")
+            .await
+            .expect("count");
+        // Six alert rows, two distinct Telegram messages → count == 2.
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn paloma_refresh_pending_telegram_alert_body_overwrites_stale_pending_row() {
+        // Regression: long-running alerts collapse to one event_kind per
+        // mission and `INSERT OR IGNORE` keeps the first body. The refresh
+        // helper must update the pending row in place so a 4-hour-stale
+        // "running for 0m" body doesn't show up in the digest.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Long runner"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let alert = TelegramAlert {
+            id: Uuid::new_v4(),
+            telegram_user_id: 1_139_694_048,
+            mission_id: Some(mission.id),
+            event_kind: "mission_long_running".to_string(),
+            importance: "normal".to_string(),
+            title: "Long runner".to_string(),
+            body: "Long runner is still running.".to_string(),
+            status: "pending".to_string(),
+            telegram_message_id: None,
+            last_error: None,
+            created_at: "2026-05-24T01:00:00Z".to_string(),
+            sent_at: None,
+            acknowledged_at: None,
+        };
+        store
+            .create_telegram_alert_if_absent(alert)
+            .await
+            .expect("insert")
+            .expect("new row");
+
+        let refreshed = store
+            .refresh_pending_telegram_alert_body(
+                1_139_694_048,
+                mission.id,
+                "mission_long_running",
+                "Long runner",
+                "Long runner is still running.\n\nLatest: now active for 4h.",
+                "high",
+            )
+            .await
+            .expect("refresh");
+        assert!(refreshed, "should report row updated");
+
+        let pending = store
+            .list_pending_telegram_alerts(1_139_694_048, 10)
+            .await
+            .expect("list");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].body.contains("4h"));
+        assert_eq!(pending[0].importance, "high");
+
+        // Sent alerts are not refreshed — only pending.
+        store
+            .mark_telegram_alert_sent(pending[0].id, Some(99), "2026-05-24T05:00:00Z")
+            .await
+            .expect("mark sent");
+        let refreshed2 = store
+            .refresh_pending_telegram_alert_body(
+                1_139_694_048,
+                mission.id,
+                "mission_long_running",
+                "Long runner",
+                "Long runner is still running.\n\nLatest: now 8h.",
+                "high",
+            )
+            .await
+            .expect("refresh after sent");
+        assert!(!refreshed2, "sent rows must not be refreshed");
+    }
+
+    #[tokio::test]
+    async fn paloma_cooldown_preserved_when_status_update_is_a_noop() {
+        // Regression: heartbeats and internal restarts can re-set the same
+        // status. Wiping cooldown in that case would skip the user's
+        // exponential backoff.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Heartbeat"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        store
+            .upsert_paloma_cooldown_state(PalomaCooldownState {
+                mission_id: mission.id,
+                alert_class: "mission_long_running".to_string(),
+                telegram_user_id: 1_139_694_048,
+                last_sent_at: "2026-05-24T01:00:00Z".to_string(),
+                next_eligible_at: "2026-05-24T09:00:00Z".to_string(),
+                backoff_step: 2,
+            })
+            .await
+            .expect("insert cooldown");
+
+        // Mission starts as Pending. Set it Active for real — should wipe.
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("status change");
+        let after_real_change = store
+            .get_paloma_cooldown_state(1_139_694_048, mission.id, "mission_long_running")
+            .await
+            .expect("get cooldown");
+        assert!(
+            after_real_change.is_none(),
+            "real status change must wipe cooldown"
+        );
+
+        // Re-insert cooldown, then write Active again — must NOT wipe.
+        store
+            .upsert_paloma_cooldown_state(PalomaCooldownState {
+                mission_id: mission.id,
+                alert_class: "mission_long_running".to_string(),
+                telegram_user_id: 1_139_694_048,
+                last_sent_at: "2026-05-24T02:00:00Z".to_string(),
+                next_eligible_at: "2026-05-24T10:00:00Z".to_string(),
+                backoff_step: 2,
+            })
+            .await
+            .expect("reinsert cooldown");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("no-op status write");
+        let after_noop = store
+            .get_paloma_cooldown_state(1_139_694_048, mission.id, "mission_long_running")
+            .await
+            .expect("get cooldown")
+            .expect("cooldown still present");
+        assert_eq!(
+            after_noop.backoff_step, 2,
+            "no-op status writes must leave the backoff ladder intact"
+        );
     }
 
     #[tokio::test]

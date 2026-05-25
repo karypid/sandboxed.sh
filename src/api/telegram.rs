@@ -751,6 +751,14 @@ async fn send_user_message_to_mission(
         })
         .await
         .map_err(|e| e.to_string())?;
+    // A direct user reply is a fresh attention signal. Wipe any Paloma
+    // cooldown for this mission so the next genuine change can alert
+    // immediately instead of waiting out the ladder. Best-effort: cooldown
+    // failures shouldn't block message delivery.
+    let _ = ctx
+        .mission_store
+        .reset_paloma_cooldown_for_mission(mission.id)
+        .await;
     Ok(format!("Sent to {}.", mission_label(mission)))
 }
 
@@ -1375,16 +1383,18 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, _http: &Client) {
         )
         .await;
         let now = now_string();
-        let inserted = ctx
+        let event_kind = paloma_alert_event_kind_at(&mission, base_kind, &events, alert_now);
+        let importance = paloma_alert_importance_for_mission(&mission, interest).to_string();
+        let _ = ctx
             .mission_store
             .create_telegram_alert_if_absent(TelegramAlert {
                 id: Uuid::new_v4(),
                 telegram_user_id: owner_id,
                 mission_id: Some(mission.id),
-                event_kind: paloma_alert_event_kind_at(&mission, base_kind, &events, alert_now),
-                importance: paloma_alert_importance_for_mission(&mission, interest).to_string(),
-                title,
-                body,
+                event_kind: event_kind.clone(),
+                importance: importance.clone(),
+                title: title.clone(),
+                body: body.clone(),
                 status: "pending".to_string(),
                 telegram_message_id: None,
                 last_error: None,
@@ -1393,27 +1403,29 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, _http: &Client) {
                 acknowledged_at: None,
             })
             .await;
-        // Only bump the cooldown ladder when we actually inserted a fresh
-        // alert. INSERT OR IGNORE returning None means a pending alert with
-        // the same event_kind already exists — that's the dedup path, and we
-        // must not advance the backoff for it.
-        if matches!(inserted, Ok(Some(_))) {
-            let next_state = cooldown::record_send(
-                cooldown_state.as_ref(),
+        // Long-running alerts now collide on a single `event_kind` per
+        // mission, so `INSERT OR IGNORE` keeps the *first* body forever
+        // unless we refresh it. Without this, a pending row that was
+        // queued at 01:00 still shows "running for 0m" when finally
+        // flushed at 04:00. Refresh is a no-op when the row was just
+        // inserted (same values written back).
+        let _ = ctx
+            .mission_store
+            .refresh_pending_telegram_alert_body(
                 owner_id,
                 mission.id,
-                base_kind,
-                alert_now,
-            );
-            let _ = ctx
-                .mission_store
-                .upsert_paloma_cooldown_state(next_state)
-                .await;
-        }
+                &event_kind,
+                &title,
+                &body,
+                &importance,
+            )
+            .await;
+        // Cooldown is *not* bumped here. The alert is only queued at this
+        // point — quiet hours, rate ceilings, or other delivery gates
+        // downstream may still suppress it. Bumping the ladder now would
+        // delay future alerts the user never actually saw. Cooldown is
+        // advanced in `flush_pending_paloma_digest` after a successful send.
     }
-
-    // Alert scanning only records pending alerts. Delivery is centralized in
-    // `paloma_digest_flush`, which applies user quiet windows and cooldowns.
 }
 
 async fn flush_pending_paloma_digest(
@@ -1627,11 +1639,33 @@ async fn flush_pending_paloma_digest(
                 let _ = ctx.mission_store.create_paloma_decision(decision).await;
             }
             let sent_count = pending.len();
+            // Bump per-mission cooldown only after a successful delivery.
+            // Doing it at queue time would advance the backoff ladder even
+            // for alerts the user never saw (quiet-hours-suppressed,
+            // rate-limited, etc.).
+            let cooldown_now = digest_checked_at;
             for alert in pending {
                 let _ = ctx
                     .mission_store
                     .mark_telegram_alert_sent(alert.id, Some(message_id), &sent_at)
                     .await;
+                if let Some(mission_id) = alert.mission_id {
+                    let base_class = paloma_alert_class_from_event_kind(&alert.event_kind);
+                    let prev = ctx
+                        .mission_store
+                        .get_paloma_cooldown_state(owner_id, mission_id, base_class)
+                        .await
+                        .ok()
+                        .flatten();
+                    let next = cooldown::record_send(
+                        prev.as_ref(),
+                        owner_id,
+                        mission_id,
+                        base_class,
+                        cooldown_now,
+                    );
+                    let _ = ctx.mission_store.upsert_paloma_cooldown_state(next).await;
+                }
             }
             Ok(sent_count)
         }
@@ -1646,6 +1680,14 @@ async fn flush_pending_paloma_digest(
             Err(err)
         }
     }
+}
+
+/// Strip the timestamp suffix from a persisted `event_kind` to get the base
+/// class used by the cooldown table.  Long-running alerts already collide on
+/// `"mission_long_running"`; everything else looks like
+/// `"<class>:<timestamp>"`.
+fn paloma_alert_class_from_event_kind(event_kind: &str) -> &str {
+    event_kind.split(':').next().unwrap_or(event_kind)
 }
 
 /// Render the per-mission Telegram cards for the configured owner.
@@ -1690,9 +1732,6 @@ async fn refresh_mission_cards(ctx: &ChannelContext, http: &Client) {
             .await
             .ok()
             .flatten();
-        if existing.as_ref().is_some_and(|card| card.archived) {
-            continue;
-        }
 
         let is_terminal_state = matches!(
             mission.status,
@@ -1703,6 +1742,18 @@ async fn refresh_mission_cards(ctx: &ChannelContext, http: &Client) {
                 | MissionStatus::NotFeasible
                 | MissionStatus::Acknowledged
         );
+
+        // An archived card whose mission has come back to life (e.g.
+        // Completed → Active because the user resumed it, or
+        // Acknowledged → AwaitingUser because the agent re-prompted)
+        // needs a fresh card so the user keeps seeing the rolling state.
+        // Drop the existing anchor and treat this like a brand-new card.
+        let existing = match existing {
+            Some(card) if card.archived && !is_terminal_state => None,
+            Some(card) if card.archived => continue,
+            other => other,
+        };
+
         // Don't post a brand-new card for a mission that is already terminal:
         // there's nothing to track and the user doesn't need a tombstone for
         // missions they never knew about.
@@ -1724,16 +1775,11 @@ async fn refresh_mission_cards(ctx: &ChannelContext, http: &Client) {
         let text = redact_for_telegram(&mission_card::card_to_telegram_text(&content));
 
         match existing {
-            Some(existing_card) if existing_card.content_hash == new_hash => {
-                // Same render as last tick; nothing to do.
-                if content.archived {
-                    let _ = ctx
-                        .mission_store
-                        .archive_paloma_mission_card(mission.id)
-                        .await;
-                }
-                continue;
-            }
+            // Re-anchor takes precedence over the hash-skip fast path: a card
+            // whose anchor message is about to age out of Telegram's 48-hour
+            // edit window must be re-posted even if the rendered content
+            // hasn't changed. Otherwise long-quiet missions get stranded on
+            // an uneditable message forever.
             Some(existing_card) if mission_card_should_reanchor(&existing_card.anchor_ts, now) => {
                 // Telegram edit window is about to close. Post a fresh anchor
                 // message and replace the row's message_id.
@@ -1772,6 +1818,18 @@ async fn refresh_mission_cards(ctx: &ChannelContext, http: &Client) {
                         );
                     }
                 }
+            }
+            Some(existing_card) if existing_card.content_hash == new_hash => {
+                // Anchor is still in-window AND the rendered content is
+                // unchanged: nothing to send. The hash-skip is what keeps
+                // the card service quiet under high event volume.
+                if content.archived {
+                    let _ = ctx
+                        .mission_store
+                        .archive_paloma_mission_card(mission.id)
+                        .await;
+                }
+                continue;
             }
             Some(existing_card) => {
                 let markup = mission_card_reply_markup(mission.id);
@@ -4075,6 +4133,12 @@ pub async fn process_webhook_message(
             respond: queued_tx,
         })
         .await;
+    // Direct user input to the mission resets the Paloma backoff so the
+    // next genuine change is allowed to alert immediately.
+    let _ = ctx
+        .mission_store
+        .reset_paloma_cooldown_for_mission(target_mission_id)
+        .await;
 
     // Spawn a task to stream the response back to Telegram
     let http_clone = http.clone();
@@ -5372,6 +5436,11 @@ async fn relay_workflow_reply_to_origin(
             target_mission_id: Some(origin_mission_id),
             respond: queued_tx,
         })
+        .await;
+    // Workflow reply counts as user attention on the origin mission too.
+    let _ = ctx
+        .mission_store
+        .reset_paloma_cooldown_for_mission(origin_mission_id)
         .await;
 
     let http = bridge.http().clone();
