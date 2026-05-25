@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use uuid::Uuid;
 
 use super::routes::AppState;
@@ -207,6 +207,36 @@ async fn write_terminal_job_state(
     write_job(state, &job).await.unwrap_or(job)
 }
 
+fn spawn_job_watcher(state: Arc<AppState>, id: Uuid, mut child: Child) {
+    tokio::spawn(async move {
+        if let Ok(status) = child.wait().await {
+            if let Ok(job) = read_job(&state, id).await {
+                let job_status = if status.success() {
+                    DurableJobStatus::Completed
+                } else {
+                    DurableJobStatus::Failed
+                };
+                #[cfg(unix)]
+                let signal = {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal()
+                };
+                #[cfg(not(unix))]
+                let signal = None;
+                let _ = write_terminal_job_state(
+                    &state,
+                    job,
+                    job_status,
+                    status.code(),
+                    signal,
+                    Utc::now(),
+                )
+                .await;
+            }
+        }
+    });
+}
+
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
@@ -345,7 +375,7 @@ pub async fn start_job(
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let mut child = match child.spawn() {
+    let child = match child.spawn() {
         Ok(child) => child,
         Err(e) => {
             job.status = DurableJobStatus::Failed;
@@ -362,7 +392,10 @@ pub async fn start_job(
             if let Some(pid) = job.pid {
                 terminate_process_group(pid);
             }
-            let _ = child.wait().await;
+            job.status = DurableJobStatus::Failed;
+            job.updated_at = Utc::now();
+            let _ = write_job(&state, &job).await;
+            spawn_job_watcher(Arc::clone(&state), id, child);
             return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
@@ -372,34 +405,7 @@ pub async fn start_job(
         }
     }
 
-    let watcher_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        if let Ok(status) = child.wait().await {
-            if let Ok(job) = read_job(&watcher_state, id).await {
-                let job_status = if status.success() {
-                    DurableJobStatus::Completed
-                } else {
-                    DurableJobStatus::Failed
-                };
-                #[cfg(unix)]
-                let signal = {
-                    use std::os::unix::process::ExitStatusExt;
-                    status.signal()
-                };
-                #[cfg(not(unix))]
-                let signal = None;
-                let _ = write_terminal_job_state(
-                    &watcher_state,
-                    job,
-                    job_status,
-                    status.code(),
-                    signal,
-                    Utc::now(),
-                )
-                .await;
-            }
-        }
-    });
+    spawn_job_watcher(Arc::clone(&state), id, child);
 
     Ok(Json(job))
 }
