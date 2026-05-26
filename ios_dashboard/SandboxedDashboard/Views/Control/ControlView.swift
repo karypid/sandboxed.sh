@@ -3164,6 +3164,7 @@ struct ControlView: View {
         let generation = streamGeneration
         streamTask?.cancel()
         let missionFilter = viewingMissionId
+        let sinceSeq = missionFilter.flatMap { missionMaxSeq[$0] }
         streamTask = Task {
             // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, max 30s.
             let maxBackoff: UInt64 = 30
