@@ -145,3 +145,32 @@ test("semantic components switch to light theme via data-theme", async ({ page }
     expect(color[2]).toBeLessThan(160);
   }
 });
+
+test("semantic components stay dark when data-theme overrides light system preference", async ({
+  page,
+}) => {
+  await forceThemeAgainstSystemPreference(page, "dark");
+
+  const inline = page.getByTestId("inline-code");
+  const inlineBg = parseRgb(await inline.evaluate((el) => getComputedStyle(el).backgroundColor));
+  const inlineText = parseRgb(await inline.evaluate((el) => getComputedStyle(el).color));
+  const userBg = parseRgb(
+    await page.getByTestId("user-message").evaluate((el) => getComputedStyle(el).backgroundColor)
+  );
+  const userText = parseRgb(
+    await page.getByTestId("user-message").evaluate((el) => getComputedStyle(el).color)
+  );
+
+  expect(inlineBg[0]).toBeLessThan(90);
+  expect(inlineBg[1]).toBeLessThan(90);
+  expect(inlineBg[2]).toBeLessThan(110);
+  expect(inlineText[0]).toBeGreaterThan(150);
+  expect(inlineText[1]).toBeGreaterThan(150);
+  expect(inlineText[2]).toBeGreaterThan(180);
+  expect(userBg[2]).toBeGreaterThan(userBg[0]);
+  for (const color of [userText]) {
+    expect(color[0]).toBeGreaterThan(220);
+    expect(color[1]).toBeGreaterThan(220);
+    expect(color[2]).toBeGreaterThan(220);
+  }
+});

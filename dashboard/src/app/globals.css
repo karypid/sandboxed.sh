@@ -178,7 +178,7 @@ body {
   min-height: 100vh;
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   button:focus-visible,
   a:focus-visible {
     background-color: rgba(17, 24, 39, 0.06) !important;
@@ -243,7 +243,7 @@ select:focus-visible {
   background: rgb(var(--foreground-tertiary));
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   /*
    * The dashboard was originally authored with dark-mode utility classes
    * such as text-white/60, bg-white/[0.04], and border-white/[0.06].
@@ -508,7 +508,7 @@ select:focus-visible {
   color: inherit !important;
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .mission-selector-trigger {
     background-color: rgb(var(--accent-soft));
     border-color: rgb(var(--accent) / 0.28);
@@ -538,7 +538,7 @@ select:focus-visible {
   border-color: rgb(var(--accent) / 0.58);
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .user-message-bubble-solid {
     background-color: rgb(var(--message-user-bg));
     border-color: rgb(var(--accent) / 0.34);
@@ -558,7 +558,7 @@ select:focus-visible {
   color: inherit;
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .mission-switcher-description {
     color: rgb(var(--foreground-secondary) / 0.92) !important;
   }
@@ -580,7 +580,7 @@ select:focus-visible {
   }
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .workbench-mission-description {
     background-color: rgb(255 255 255 / 0.76) !important;
     border-color: rgb(17 24 39 / 0.1) !important;
@@ -726,7 +726,7 @@ select:focus-visible {
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .glass-panel {
     background: rgba(255, 255, 255, 0.76);
     border-color: rgba(17, 24, 39, 0.09);
@@ -773,7 +773,7 @@ select:focus-visible {
   transition: background-color 150ms ease-out, border-color 150ms ease-out;
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .card {
     background: rgba(255, 255, 255, 0.78);
     border-color: rgba(17, 24, 39, 0.08);
@@ -790,7 +790,7 @@ select:focus-visible {
   border-color: rgba(255, 255, 255, 0.08);
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .card:hover {
     background: rgba(255, 255, 255, 0.95);
     border-color: rgba(17, 24, 39, 0.14);
@@ -812,7 +812,7 @@ select:focus-visible {
   backdrop-filter: blur(20px);
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .stat-panel {
     background: rgba(255, 255, 255, 0.82);
     border-color: rgba(17, 24, 39, 0.09);
@@ -926,7 +926,7 @@ select:focus-visible {
   font-family: var(--font-mono);
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .tag {
     color: rgb(var(--foreground-tertiary));
     background: rgba(17, 24, 39, 0.05);
@@ -986,7 +986,7 @@ select:focus-visible {
   border: 0;
 }
 
-@media (prefers-color-scheme: light) {
+:root[data-theme="light"] {
   .code-block,
   .prose-glass pre.code-block {
     border-color: rgb(var(--code-border) / 0.1);
