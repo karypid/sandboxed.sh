@@ -227,6 +227,41 @@ function isRetriableSendError(error: unknown): boolean {
   );
 }
 
+function appendUnpersistedLiveTail(
+  historyItems: ChatItem[],
+  liveItems: ChatItem[],
+): ChatItem[] {
+  if (liveItems.length === 0) return historyItems;
+
+  const lastLiveUserIdx = liveItems.findLastIndex(
+    (item) => item.kind === "user",
+  );
+  if (lastLiveUserIdx === -1) return historyItems;
+
+  const existingIds = new Set(historyItems.map((item) => item.id));
+  const existingAssistantContent = new Set(
+    historyItems
+      .filter((item): item is Extract<ChatItem, { kind: "assistant" }> => {
+        return item.kind === "assistant";
+      })
+      .map((item) => item.content.trim())
+      .filter(Boolean),
+  );
+
+  const unpersistedTail = liveItems.slice(lastLiveUserIdx + 1).filter((item) => {
+    if (existingIds.has(item.id)) return false;
+    if (item.kind === "assistant") {
+      const content = item.content.trim();
+      return content.length > 0 && !existingAssistantContent.has(content);
+    }
+    return item.kind === "stream" && !item.done && item.content.trim().length > 0;
+  });
+
+  return unpersistedTail.length > 0
+    ? [...historyItems, ...unpersistedTail]
+    : historyItems;
+}
+
 async function postControlMessageWithRetry(
   content: string,
   options: { agent?: string; mission_id?: string; client_message_id: string },
@@ -8967,7 +9002,9 @@ export default function ControlClient() {
             // safely append.
             const hasLiveStreamingRow = itemsRef.current.some(
               (it) =>
-                (it.kind === "stream" && it.id === "text_delta_latest") ||
+                (it.kind === "stream" &&
+                  it.id === "text_delta_latest" &&
+                  !it.done) ||
                 (it.kind === "thinking" && !it.done),
             );
             const deltaTouchesStreamingTypes = deltaEvents.some(
@@ -9049,6 +9086,10 @@ export default function ControlClient() {
               mission,
             )
           : missionHistoryToItems(mission);
+        historyItems = appendUnpersistedLiveTail(
+          historyItems,
+          itemsRef.current,
+        );
 
         // Pre-queue length: pagination uses this to find the live tail
         // without clipping queued items (see `seedPaginationStateAfterInitialLoad`).
