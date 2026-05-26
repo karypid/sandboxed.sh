@@ -4,7 +4,7 @@ import { memo, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils';
-import { getCurrentMission, streamControl, type Mission, type ControlRunState } from '@/lib/api';
+import { getCurrentMission, type Mission } from '@/lib/api';
 import { BrainLogo } from '@/components/icons';
 import {
   LayoutDashboard,
@@ -84,14 +84,9 @@ const navigation: NavItem[] = [
   },
 ];
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
 export const Sidebar = memo(function Sidebar() {
   const pathname = usePathname();
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
-  const [controlState, setControlState] = useState<ControlRunState>('idle');
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
 
   // Auto-expand sections if we're on their subpages
@@ -110,25 +105,29 @@ export const Sidebar = memo(function Sidebar() {
     return () => window.clearTimeout(timer);
   }, [pathname]);
 
-  // Stream control events for real-time status
+  // Fetch current mission periodically. Activity status (the bottom-left
+  // "Working" / "Ready" pill) is derived from this; previously the Sidebar
+  // also subscribed to the global control SSE stream to flip the pill in
+  // real time, but that subscription was the single biggest source of
+  // re-renders in the app: every status frame from the backend (multiple
+  // times per second on a busy mission) caused the entire nav tree to
+  // re-commit. The 10s poll is good enough for a non-critical indicator
+  // and the cost is paid once per page rather than per-event.
   useEffect(() => {
-    const cleanup = streamControl((event) => {
-      const data: unknown = event.data;
-      if (event.type === 'status' && isRecord(data)) {
-        const st = data['state'];
-        setControlState(typeof st === 'string' ? (st as ControlRunState) : 'idle');
-      }
-    });
-    
-    return () => cleanup();
-  }, []);
-
-  // Fetch current mission periodically
-  useEffect(() => {
+    let cancelled = false;
     const fetchMission = async () => {
       try {
         const mission = await getCurrentMission();
-        setCurrentMission(mission);
+        if (!cancelled) {
+          setCurrentMission((prev) => {
+            // Bail out when nothing changed so the memoized Sidebar doesn't
+            // re-render on every successful poll for no reason.
+            if (prev?.id === mission?.id && prev?.status === mission?.status) {
+              return prev;
+            }
+            return mission;
+          });
+        }
       } catch {
         // ignore errors
       }
@@ -136,10 +135,13 @@ export const Sidebar = memo(function Sidebar() {
 
     fetchMission();
     const interval = setInterval(fetchMission, 10000); // Update every 10s
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, []);
 
-  const isActive = controlState !== 'idle';
+  const isActive = currentMission?.status === 'active';
   const StatusIcon = isActive 
     ? Loader 
     : currentMission?.status === 'completed' 

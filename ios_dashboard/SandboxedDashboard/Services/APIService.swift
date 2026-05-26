@@ -14,7 +14,10 @@ final class APIService {
     static let shared = APIService()
     nonisolated init() {}
 
-    nonisolated static let defaultBaseURL = "https://agent-backend.thomas.md"
+    nonisolated static let defaultBaseURL: String = {
+        let raw = Bundle.main.object(forInfoDictionaryKey: "SandboxedDefaultAPIBaseURL") as? String
+        return raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }()
 
     /// Per-request timeout for ordinary JSON calls. Anything that hasn't started
     /// returning data within this window is treated as failed. Default
@@ -96,7 +99,8 @@ final class APIService {
 
     /// Whether the server URL has been configured
     var isConfigured: Bool {
-        makeURL("/api/health") != nil
+        !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            makeURL("/api/health") != nil
     }
     
     private var jwtToken: String? {
@@ -946,9 +950,13 @@ final class APIService {
         } catch {
             let nsError = error as NSError
             emitDiagnostic(transport: .webSocket, phase: .error, host: url.host, status: nsError.code, bytes: bytesRead, error: error.localizedDescription, eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
-            if opened {
-                onEvent("error", ["message": "WebSocket stream failed: \(error.localizedDescription)"])
-            }
+            onEvent("error", [
+                "message": opened
+                    ? "WebSocket stream failed: \(error.localizedDescription)"
+                    : "WebSocket failed to open: \(error.localizedDescription)",
+                "reason": opened ? "web_socket_failed" : "web_socket_open_failed",
+                "transport": ControlStreamTransport.webSocket.rawValue
+            ])
         }
         task.cancel(with: .normalClosure, reason: nil)
         return opened

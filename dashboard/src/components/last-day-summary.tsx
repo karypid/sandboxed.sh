@@ -5,6 +5,7 @@ import useSWR from 'swr';
 import { CheckCircle, XCircle, Loader, DollarSign, Activity, Hand } from 'lucide-react';
 import { getStats, type Mission, type StatsResponse } from '@/lib/api';
 import { formatCents, cn } from '@/lib/utils';
+import { stableJsonCompare } from '@/lib/swr-config';
 
 interface LastDaySummaryProps {
   missions: Mission[];
@@ -28,6 +29,7 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
     {
       refreshInterval: 30_000,
       revalidateOnFocus: false,
+      compare: stableJsonCompare,
     },
   );
 

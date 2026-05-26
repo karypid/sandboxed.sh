@@ -39,6 +39,7 @@ import {
 } from 'lucide-react';
 import { cn, formatCents } from '@/lib/utils';
 import { NewMissionDialog } from '@/components/new-mission-dialog';
+import { stableJsonCompare } from '@/lib/swr-config';
 import {
   categorizeMissions,
   getMissionTextColor,
@@ -287,13 +288,16 @@ function OverviewPageContent() {
     }
   }, [initialWorkspaceId, router]);
 
-  // SWR: poll stats every 3 seconds
+  // SWR: poll stats every 3 seconds. `compare` keeps the same array/object
+  // reference when a refresh returns identical content; without it every
+  // poll tick re-allocates the data and cascades into `useMemo`s downstream.
   const { data: stats, isLoading: statsLoading } = useSWR(
     'stats',
     getStats,
     {
       refreshInterval: 3000,
       revalidateOnFocus: false,
+      compare: stableJsonCompare,
       onSuccess: () => {
         hasShownErrorRef.current = false;
       },
@@ -309,6 +313,7 @@ function OverviewPageContent() {
   // SWR: fetch workspaces (shared key with workspaces page)
   const { data: workspaces = [] } = useSWR('workspaces', listWorkspaces, {
     revalidateOnFocus: false,
+    compare: stableJsonCompare,
   });
 
   // SWR: fetch missions for kanban
@@ -318,6 +323,7 @@ function OverviewPageContent() {
     {
       refreshInterval: 5000,
       revalidateOnFocus: false,
+      compare: stableJsonCompare,
     }
   );
 
@@ -327,6 +333,7 @@ function OverviewPageContent() {
     {
       refreshInterval: 3000,
       revalidateOnFocus: false,
+      compare: stableJsonCompare,
     }
   );
 
@@ -336,6 +343,7 @@ function OverviewPageContent() {
     {
       refreshInterval: 5000,
       revalidateOnFocus: false,
+      compare: stableJsonCompare,
     }
   );
 

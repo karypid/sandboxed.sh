@@ -44,11 +44,12 @@ final class NetworkResilienceTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(APIService.streamMaxBufferBytes, 64 * 1024)
     }
 
-    /// A missing/blank saved server URL must not let the control view enter an
-    /// unsupported-URL reconnect loop (`/api/control/stream?`). The app's docs
-    /// promise Thomas's backend as the default, so keep that invariant pinned.
+    /// A missing/blank saved server URL must not silently connect to a
+    /// developer-specific backend. Unless a build explicitly supplies
+    /// `SandboxedDefaultAPIBaseURL`, first launch should show setup instead of
+    /// marking the API as configured.
     @MainActor
-    func testBlankBaseURLFallsBackToDefaultBackend() {
+    func testBlankBaseURLRequiresConfigurationWhenNoBundleDefaultExists() {
         let defaults = UserDefaults.standard
         let key = "api_base_url"
         let original = defaults.string(forKey: key)
@@ -63,11 +64,12 @@ final class NetworkResilienceTests: XCTestCase {
 
         defaults.removeObject(forKey: key)
         XCTAssertEqual(APIService.shared.baseURL, APIService.defaultBaseURL)
-        XCTAssertTrue(APIService.shared.isConfigured)
+        XCTAssertEqual(APIService.defaultBaseURL, "")
+        XCTAssertFalse(APIService.shared.isConfigured)
 
         defaults.set("   ", forKey: key)
         XCTAssertEqual(APIService.shared.baseURL, APIService.defaultBaseURL)
-        XCTAssertTrue(APIService.shared.isConfigured)
+        XCTAssertFalse(APIService.shared.isConfigured)
     }
 
     func testConnectionStateLabelsAreSpecific() {
@@ -89,6 +91,10 @@ final class NetworkResilienceTests: XCTestCase {
         XCTAssertTrue(source.contains("sinceSeq: sinceSeq"))
         XCTAssertTrue(source.contains("URLQueryItem(name: \"since_seq\""))
         XCTAssertTrue(source.contains("falling back to SSE"))
+        XCTAssertTrue(source.contains("web_socket_open_failed"))
+        XCTAssertTrue(source.contains("SandboxedDefaultAPIBaseURL"))
+        XCTAssertFalse(source.contains("nonisolated static let defaultBaseURL = \"https://agent-backend.thomas.md\""),
+                       "the iOS app must not hardcode a personal backend as its default")
         XCTAssertFalse(source.contains("components.path = normalizedPath"),
                        "URL construction must preserve any base URL path prefix")
         XCTAssertFalse(source.contains("headers:"),
