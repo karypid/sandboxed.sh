@@ -1086,14 +1086,13 @@ final class APIService {
         let trimmedBase = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
-        guard var components = URLComponents(string: "\(trimmedBase)\(normalizedPath)"),
+        guard let components = URLComponents(string: "\(trimmedBase)\(normalizedPath)"),
               let scheme = components.scheme?.lowercased(),
               (scheme == "http" || scheme == "https"),
               components.host?.isEmpty == false
         else {
             return nil
         }
-        components.path = normalizedPath
         return components
     }
 

@@ -876,10 +876,9 @@ struct ControlView: View {
         }
         Task {
             if !sseIsRecovering, let missionId = viewingMissionId {
-                if shouldSkipForegroundReload(missionId: missionId) {
-                    return
+                if !shouldSkipForegroundReload(missionId: missionId) {
+                    await reloadMissionFromServer(id: missionId)
                 }
-                await reloadMissionFromServer(id: missionId)
             }
             await refreshRunningMissions()
         }
@@ -3165,7 +3164,6 @@ struct ControlView: View {
         let generation = streamGeneration
         streamTask?.cancel()
         let missionFilter = viewingMissionId
-        let sinceSeq = missionFilter.flatMap { missionMaxSeq[$0] }
         streamTask = Task {
             // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, max 30s.
             let maxBackoff: UInt64 = 30
@@ -3254,10 +3252,13 @@ struct ControlView: View {
                     }
                 }
 
+                let currentSinceSeq = await MainActor.run {
+                    missionFilter.flatMap { self.missionMaxSeq[$0] }
+                }
                 _ = await withCheckedContinuation { continuation in
                     let innerTask = api.streamControl(
                         missionId: missionFilter,
-                        sinceSeq: sinceSeq,
+                        sinceSeq: currentSinceSeq,
                         preferWebSocket: true,
                         generation: generation,
                         onDiagnostic: { diagnostic in

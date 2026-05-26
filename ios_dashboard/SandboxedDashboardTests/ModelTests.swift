@@ -171,6 +171,8 @@ final class ModelTests: XCTestCase {
         XCTAssertTrue(source.contains("rememberPendingSend"))
         XCTAssertTrue(source.contains("restorePendingSends"))
         XCTAssertTrue(source.contains("preferWebSocket: true"))
+        XCTAssertTrue(source.contains("let currentSinceSeq = await MainActor.run"))
+        XCTAssertTrue(source.contains("if !shouldSkipForegroundReload(missionId: missionId)"))
         XCTAssertTrue(source.contains("generation == self.streamGeneration"))
     }
 

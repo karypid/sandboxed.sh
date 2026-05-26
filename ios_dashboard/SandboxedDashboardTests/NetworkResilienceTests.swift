@@ -87,6 +87,8 @@ final class NetworkResilienceTests: XCTestCase {
         XCTAssertTrue(source.contains("\"since_seq\""))
         XCTAssertTrue(source.contains("runControlSSE"))
         XCTAssertTrue(source.contains("falling back to SSE"))
+        XCTAssertFalse(source.contains("components.path = normalizedPath"),
+                       "URL construction must preserve any base URL path prefix")
         XCTAssertFalse(source.contains("headers:"),
                        "diagnostics should not copy request headers or auth tokens")
     }
