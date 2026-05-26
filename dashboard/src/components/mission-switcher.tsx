@@ -12,6 +12,7 @@ import {
   MessageSquarePlus,
   ChevronRight,
   ChevronDown,
+  Pin,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { searchMissions, type Mission, type RunningMissionInfo } from '@/lib/api';
@@ -47,6 +48,25 @@ type MissionSwitcherItem = {
 type MissionSwitcherRow =
   | { kind: 'section'; id: string; label: string }
   | { kind: 'item'; id: string; item: MissionSwitcherItem; itemIndex: number };
+
+const PINNED_MISSIONS_STORAGE_KEY = 'mission-switcher-pinned-missions-v1';
+
+function readPinnedMissionIds(): string[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(PINNED_MISSIONS_STORAGE_KEY) ?? '[]');
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePinnedMissionIds(ids: string[]) {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(PINNED_MISSIONS_STORAGE_KEY, JSON.stringify(ids));
+}
 
 function getWorkspaceLabel(
   mission: Mission,
@@ -634,6 +654,7 @@ export function MissionSwitcher({
     null
   );
   const [serverSearchLoading, setServerSearchLoading] = useState(false);
+  const [pinnedMissionIds, setPinnedMissionIds] = useState<string[]>(() => readPinnedMissionIds());
   // Boss missions whose grouped worker rows are currently expanded. Default
   // empty (everything collapsed) so a boss with many workers doesn't take
   // over the list. The chevron at the left of each boss row toggles this.
@@ -644,6 +665,17 @@ export function MissionSwitcher({
     () => normalizeMetadataText(searchQuery),
     [searchQuery]
   );
+  const pinnedMissionIdSet = useMemo(() => new Set(pinnedMissionIds), [pinnedMissionIds]);
+
+  const togglePinnedMission = useCallback((missionId: string) => {
+    setPinnedMissionIds((prev) => {
+      const next = prev.includes(missionId)
+        ? prev.filter((id) => id !== missionId)
+        : [missionId, ...prev];
+      writePinnedMissionIds(next);
+      return next;
+    });
+  }, []);
   const missionById = useMemo(() => {
     const map = new Map<string, Mission>();
     for (const mission of missions) {
@@ -891,34 +923,55 @@ export function MissionSwitcher({
     return scored.map(({ item }) => item);
   }, [visibleItems, normalizedSearchQuery, workspaceNameById, serverScoreByMissionId]);
 
+  const orderedItems = useMemo(() => {
+    if (pinnedMissionIdSet.size === 0) return filteredItems;
+    const pinned: MissionSwitcherItem[] = [];
+    const unpinned: MissionSwitcherItem[] = [];
+    for (const item of filteredItems) {
+      if (pinnedMissionIdSet.has(item.id)) {
+        pinned.push(item);
+      } else {
+        unpinned.push(item);
+      }
+    }
+    return [...pinned, ...unpinned];
+  }, [filteredItems, pinnedMissionIdSet]);
+
   const renderedRows = useMemo<MissionSwitcherRow[]>(() => {
     const rows: MissionSwitcherRow[] = [];
     let previousType: MissionSwitcherItem['type'] | null = null;
+    let previousPinned = false;
     const hasCurrent = Boolean(currentMissionId && !runningMissionIds.has(currentMissionId));
 
-    filteredItems.forEach((item, itemIndex) => {
+    orderedItems.forEach((item, itemIndex) => {
       const isWorkerItem = Boolean(item.isWorkerOf);
+      const isPinned = pinnedMissionIdSet.has(item.id);
       if (!normalizedSearchQuery) {
-        if (hasCurrent && item.type === 'current' && previousType !== 'current') {
+        if (isPinned && !previousPinned) {
+          rows.push({ kind: 'section', id: 'section-pinned', label: 'Pinned' });
+        }
+        if (!isPinned && hasCurrent && item.type === 'current' && previousType !== 'current') {
           rows.push({ kind: 'section', id: 'section-current', label: 'Current' });
         }
         if (
+          !isPinned &&
           item.type === 'running' &&
           !isWorkerItem &&
           (previousType !== 'running' || previousType === null)
         ) {
           rows.push({ kind: 'section', id: 'section-running', label: 'Running' });
         }
-        if (item.type === 'recent' && !isWorkerItem && previousType !== 'recent') {
+        if (!isPinned && item.type === 'recent' && !isWorkerItem && previousType !== 'recent') {
           rows.push({ kind: 'section', id: 'section-recent', label: 'Recent' });
         }
       }
       rows.push({ kind: 'item', id: item.id, item, itemIndex });
-      previousType = item.type;
+      previousType = isPinned ? previousType : item.type;
+      previousPinned = isPinned;
     });
 
     return rows;
-  }, [currentMissionId, filteredItems, normalizedSearchQuery, runningMissionIds]);
+  }, [currentMissionId, orderedItems, normalizedSearchQuery, pinnedMissionIdSet, runningMissionIds]);
 
   const rowVirtualizer = useVirtualizer({
     count: renderedRows.length,
@@ -998,24 +1051,24 @@ export function MissionSwitcher({
   // happens to be at the old index.
   const selectedItemIdRef = useRef<string | null>(null);
   useEffect(() => {
-    selectedItemIdRef.current = filteredItems[selectedIndex]?.id ?? null;
-  }, [filteredItems, selectedIndex]);
+    selectedItemIdRef.current = orderedItems[selectedIndex]?.id ?? null;
+  }, [orderedItems, selectedIndex]);
 
   useEffect(() => {
-    if (filteredItems.length <= 0) {
+    if (orderedItems.length <= 0) {
       setSelectedIndex(0);
       return;
     }
     const targetId = selectedItemIdRef.current;
     if (targetId) {
-      const idx = filteredItems.findIndex((item) => item.id === targetId);
+      const idx = orderedItems.findIndex((item) => item.id === targetId);
       if (idx >= 0) {
         setSelectedIndex(idx);
         return;
       }
     }
-    setSelectedIndex((prev) => Math.min(prev, filteredItems.length - 1));
-  }, [filteredItems]);
+    setSelectedIndex((prev) => Math.min(prev, orderedItems.length - 1));
+  }, [orderedItems]);
 
   // Handle keyboard navigation
   useEffect(() => {
@@ -1041,7 +1094,7 @@ export function MissionSwitcher({
         case 'ArrowDown':
           e.preventDefault();
           setSelectedIndex((prev) =>
-            Math.min(prev + 1, filteredItems.length - 1)
+            Math.min(prev + 1, orderedItems.length - 1)
           );
           break;
         case 'ArrowUp':
@@ -1052,7 +1105,7 @@ export function MissionSwitcher({
           // Skip tree expansion when the user is editing search text — the
           // arrow key needs to move the input cursor instead.
           if (searchQuery) return;
-          const selected = filteredItems[selectedIndex];
+          const selected = orderedItems[selectedIndex];
           if (!selected) return;
           if (selected.isBoss && bossesWithGroupedWorkers.has(selected.id) && !expandedBossIds.has(selected.id)) {
             e.preventDefault();
@@ -1062,7 +1115,7 @@ export function MissionSwitcher({
         }
         case 'ArrowLeft': {
           if (searchQuery) return;
-          const selected = filteredItems[selectedIndex];
+          const selected = orderedItems[selectedIndex];
           if (!selected) return;
           if (selected.isBoss && expandedBossIds.has(selected.id)) {
             e.preventDefault();
@@ -1084,8 +1137,8 @@ export function MissionSwitcher({
         }
         case 'Enter':
           e.preventDefault();
-          if (filteredItems[selectedIndex]) {
-            handleSelect(filteredItems[selectedIndex].id);
+          if (orderedItems[selectedIndex]) {
+            handleSelect(orderedItems[selectedIndex].id);
           }
           break;
       }
@@ -1096,7 +1149,7 @@ export function MissionSwitcher({
   }, [
     open,
     onClose,
-    filteredItems,
+    orderedItems,
     selectedIndex,
     handleSelect,
     loadingMissionId,
@@ -1179,7 +1232,7 @@ export function MissionSwitcher({
 
         {/* Mission list */}
         <div ref={listRef} className="max-h-[400px] overflow-y-auto py-2">
-          {filteredItems.length === 0 ? (
+          {orderedItems.length === 0 ? (
             <div className="px-4 py-8 text-center text-sm text-white/40">
               No missions found
             </div>
@@ -1212,6 +1265,7 @@ export function MissionSwitcher({
                 const isSelected = index === selectedIndex;
                 const isViewing = item.id === viewingMissionId;
                 const isRunning = item.type === 'running' || Boolean(item.runningInfo);
+                const isPinned = pinnedMissionIdSet.has(item.id);
                 const runningInfo = item.runningInfo;
                 const missionQuickActions = mission
                   ? getMissionQuickActions(mission, isRunning)
@@ -1393,6 +1447,26 @@ export function MissionSwitcher({
                           ? `${getMissionStatusLabel(mission)} · ${getMissionBackendLabel(mission)}`
                           : ''}
                       </span>
+
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          togglePinnedMission(item.id);
+                        }}
+                        className={cn(
+                          "p-1 rounded transition-all shrink-0 hover:bg-white/[0.08]",
+                          isPinned
+                            ? "text-amber-300 opacity-100"
+                            : "text-white/25 opacity-0 group-hover:opacity-100 hover:text-white/60"
+                        )}
+                        title={isPinned ? "Unpin mission" : "Pin mission"}
+                        aria-label={isPinned ? "Unpin mission" : "Pin mission"}
+                        aria-pressed={isPinned}
+                      >
+                        <Pin className={cn("h-3.5 w-3.5", isPinned && "fill-current")} />
+                      </button>
 
                       {/* Viewing indicator */}
                       {isViewing && !isLoading && (

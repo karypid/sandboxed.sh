@@ -54,7 +54,11 @@ import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
 import { inferMissionRole } from "@/lib/mission-role";
-import { getMissionDotColor, isFinishedStatus } from "@/lib/mission-status";
+import {
+  getMissionDotColor,
+  getMissionTitle,
+  isFinishedStatus,
+} from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import { stripRichFileTagsByName } from "@/lib/rich-tags";
@@ -76,6 +80,7 @@ import {
   setMissionStatus,
   resumeMission,
   getCurrentMission,
+  updateMissionTitle,
   uploadFile,
   uploadFileChunked,
   formatBytes,
@@ -159,6 +164,7 @@ import {
   BriefcaseBusiness,
   Inbox,
   Flag,
+  Pencil,
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
 import {
@@ -180,6 +186,8 @@ const LEGACY_CONTROL_DRAFT_KEY = "control-draft";
 const MISSION_DRAFT_CACHE_KEY = "control-mission-drafts-v1";
 const MAX_MISSION_DRAFT_CACHE_BYTES = 64 * 1024;
 const MAX_MISSION_DRAFT_CACHE_ENTRIES = 50;
+const DEFAULT_DOCUMENT_TITLE = "Sandboxed.sh";
+const MAX_DOCUMENT_MISSION_TITLE_LENGTH = 80;
 
 type EventsWorkerRequest = {
   id: number;
@@ -254,6 +262,15 @@ function streamLog(
       console.error(...args);
       break;
   }
+}
+
+function formatMissionDocumentTitle(mission: Mission | null | undefined) {
+  if (!mission) return DEFAULT_DOCUMENT_TITLE;
+  const title = getMissionTitle(mission, {
+    maxLength: MAX_DOCUMENT_MISSION_TITLE_LENGTH,
+    fallback: getMissionShortName(mission.id),
+  }).trim();
+  return title ? `${title} | ${DEFAULT_DOCUMENT_TITLE}` : DEFAULT_DOCUMENT_TITLE;
 }
 
 function readLegacyControlDraft(): string {
@@ -8713,6 +8730,7 @@ export default function ControlClient() {
           queued: willBeQueued,
         },
       ]);
+      scrollToBottom("instant");
       enhancedInputRef.current?.clear();
       setInput("");
       saveControlDraftForMission("", targetMissionId);
@@ -8803,7 +8821,7 @@ export default function ControlClient() {
         submittingRef.current = false;
       }
     },
-    [items, isBusy, applyDesktopSessionState, missionHistoryToItems],
+    [items, isBusy, applyDesktopSessionState, missionHistoryToItems, scrollToBottom],
   );
 
   const handleStop = async () => {
@@ -9149,12 +9167,79 @@ export default function ControlClient() {
       activeMission.short_description?.trim() ||
       getMissionShortName(activeMission.id)
     : null;
+  const [editingMissionTitle, setEditingMissionTitle] = useState(false);
+  const [missionTitleDraft, setMissionTitleDraft] = useState("");
+  const [savingMissionTitle, setSavingMissionTitle] = useState(false);
+  const cancelMissionTitleSaveRef = useRef(false);
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
     : null;
 
+  useEffect(() => {
+    if (!editingMissionTitle) {
+      setMissionTitleDraft(activeMissionSelectorLabel ?? "");
+    }
+  }, [activeMissionSelectorLabel, editingMissionTitle]);
+
+  const saveMissionTitle = useCallback(async () => {
+    if (!activeMission || savingMissionTitle) return;
+    const nextTitle = missionTitleDraft.trim();
+    const previousTitle = activeMission.title ?? "";
+    if (!nextTitle || nextTitle === previousTitle.trim()) {
+      setEditingMissionTitle(false);
+      setMissionTitleDraft(activeMissionSelectorLabel ?? "");
+      return;
+    }
+
+    const applyTitle = (mission: Mission | null) =>
+      mission?.id === activeMission.id ? { ...mission, title: nextTitle } : mission;
+
+    setSavingMissionTitle(true);
+    setRecentMissions((prev) =>
+      prev.map((mission) =>
+        mission.id === activeMission.id ? { ...mission, title: nextTitle } : mission,
+      ),
+    );
+    setCurrentMission(applyTitle);
+    setViewingMission(applyTitle);
+    setEditingMissionTitle(false);
+
+    try {
+      await updateMissionTitle(activeMission.id, nextTitle);
+    } catch (error) {
+      console.error("Failed to update mission title:", error);
+      toast.error("Failed to update mission title");
+      const restoreTitle = (mission: Mission | null) =>
+        mission?.id === activeMission.id ? { ...mission, title: previousTitle } : mission;
+      setRecentMissions((prev) =>
+        prev.map((mission) =>
+          mission.id === activeMission.id ? { ...mission, title: previousTitle } : mission,
+        ),
+      );
+      setCurrentMission(restoreTitle);
+      setViewingMission(restoreTitle);
+      setMissionTitleDraft(previousTitle || activeMissionSelectorLabel || "");
+    } finally {
+      setSavingMissionTitle(false);
+    }
+  }, [
+    activeMission,
+    activeMissionSelectorLabel,
+    missionTitleDraft,
+    savingMissionTitle,
+    setCurrentMission,
+    setViewingMission,
+  ]);
+
   // Update favicon with mission status dot
   useFaviconStatus(activeMission?.status ?? null, viewingMissionIsRunning);
+
+  useEffect(() => {
+    document.title = formatMissionDocumentTitle(activeMission);
+    return () => {
+      document.title = DEFAULT_DOCUMENT_TITLE;
+    };
+  }, [activeMission]);
 
   // Derive the last resolved model from assistant messages (for the debug dropdown)
   const lastResolvedModel = useMemo(() => {
@@ -9335,8 +9420,16 @@ export default function ControlClient() {
           <div className="flex items-center gap-3 min-w-0 overflow-hidden">
             {/* Unified Mission Selector */}
             <div className="relative">
-              <button
+              <div
+                role="button"
+                tabIndex={0}
                 onClick={() => setShowMissionSwitcher(true)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setShowMissionSwitcher(true);
+                  }
+                }}
                 className={cn(
                   "mission-selector-trigger flex h-9 items-center gap-2 px-3 rounded-lg transition-colors",
                 )}
@@ -9354,12 +9447,60 @@ export default function ControlClient() {
                       )}
                       title={missionStatus?.label}
                     />
-                    <span
-                      className="text-sm font-medium text-white/70 truncate max-w-[180px] sm:max-w-[260px]"
-                      title={activeMissionSelectorLabel ?? undefined}
-                    >
-                      {activeMissionSelectorLabel}
-                    </span>
+                    {editingMissionTitle ? (
+                      <input
+                        value={missionTitleDraft}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={(event) =>
+                          setMissionTitleDraft(event.target.value)
+                        }
+                        onBlur={() => {
+                          if (cancelMissionTitleSaveRef.current) {
+                            cancelMissionTitleSaveRef.current = false;
+                            return;
+                          }
+                          void saveMissionTitle();
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            event.currentTarget.blur();
+                          } else if (event.key === "Escape") {
+                            event.preventDefault();
+                            cancelMissionTitleSaveRef.current = true;
+                            setEditingMissionTitle(false);
+                            setMissionTitleDraft(
+                              activeMissionSelectorLabel ?? "",
+                            );
+                          }
+                        }}
+                        autoFocus
+                        disabled={savingMissionTitle}
+                        className="h-6 w-[180px] rounded-md border border-white/[0.12] bg-black/30 px-2 text-sm font-medium text-white/80 outline-none focus:border-indigo-400/60 sm:w-[260px]"
+                      />
+                    ) : (
+                      <span
+                        className="text-sm font-medium text-white/70 truncate max-w-[180px] sm:max-w-[260px]"
+                        title={activeMissionSelectorLabel ?? undefined}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setMissionTitleDraft(
+                            activeMissionSelectorLabel ?? "",
+                          );
+                          cancelMissionTitleSaveRef.current = false;
+                          setEditingMissionTitle(true);
+                        }}
+                      >
+                        {activeMissionSelectorLabel}
+                      </span>
+                    )}
+                    {!editingMissionTitle && (
+                      <Pencil
+                        className="h-3 w-3 text-white/25 transition-colors hover:text-white/60"
+                        aria-hidden="true"
+                      />
+                    )}
                   </>
                 ) : (
                   <>
@@ -9370,7 +9511,7 @@ export default function ControlClient() {
                   </>
                 )}
                 <ChevronDown className="h-3 w-3 text-white/40" />
-              </button>
+              </div>
             </div>
           </div>
 
@@ -10397,14 +10538,15 @@ export default function ControlClient() {
               )}
             </div>
 
-            {/* Scroll to bottom button */}
+            {/* Auto-scroll pause chip */}
             {!isAtBottom && items.length > 0 && (
               <button
                 onClick={() => scrollToBottom()}
-                className="absolute bottom-20 right-6 p-2 rounded-full bg-white/[0.1] border border-white/[0.1] text-white/60 hover:bg-white/[0.15] hover:text-white/80 transition-all shadow-lg"
+                className="absolute bottom-20 right-6 inline-flex items-center gap-2 rounded-full border border-white/[0.1] bg-black/70 px-3 py-2 text-xs font-medium text-white/65 shadow-lg backdrop-blur transition-all hover:bg-white/[0.1] hover:text-white/90"
                 title="Scroll to bottom"
               >
                 <ArrowDown className="h-4 w-4" />
+                Auto-scroll paused
               </button>
             )}
 

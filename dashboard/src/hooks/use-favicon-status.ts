@@ -9,7 +9,7 @@ import type { MissionStatus } from "@/lib/api/missions";
 const STATUS_COLORS: Record<MissionStatus, string> = {
   pending: "#fbbf24", // amber-400
   active: "#818cf8", // indigo-400
-  awaiting_user: "#38bdf8", // sky-400
+  awaiting_user: "#f472b6", // pink-400, reserved for "needs user"
   acknowledged: "#34d399", // emerald-400
   completed: "#34d399", // emerald-400
   // Failure statuses all share `bg-red-400` in `STATUS_DOT_COLORS`
