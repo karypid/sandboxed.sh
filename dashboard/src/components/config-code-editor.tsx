@@ -15,7 +15,7 @@ import { tags } from '@lezer/highlight';
 
 const CodeMirror = dynamic(() => import('@uiw/react-codemirror').then(mod => mod.default), {
   ssr: false,
-  loading: () => <div className="animate-pulse bg-white/5 rounded h-32" />,
+  loading: () => <div className="code-block animate-pulse h-32" />,
 });
 
 type Language = 'json' | 'markdown' | 'bash' | 'toml' | 'plain';
@@ -232,7 +232,7 @@ export function ConfigCodeEditor({
   return (
     <div
       className={cn(
-        'rounded-lg bg-black/20 border border-white/[0.06] focus-within:border-indigo-500/50 transition-colors relative overflow-hidden',
+        'code-block p-0 focus-within:border-indigo-500/50 transition-colors relative overflow-hidden',
         disabled && 'opacity-60',
         className
       )}

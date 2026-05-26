@@ -788,7 +788,7 @@ export default function SettingsPage() {
           </div>
           <div className="flex-1 rounded-xl bg-white/[0.02] border border-white/[0.06] p-5 space-y-4">
             <div className="h-6 w-48 rounded bg-white/[0.06]" />
-            <div className="h-full min-h-0 rounded-lg bg-black/20 border border-white/[0.04]" />
+            <div className="code-block h-full min-h-0 p-0" />
           </div>
         </div>
       </div>
