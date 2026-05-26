@@ -237,6 +237,7 @@ export async function getMissionEventsWithMeta(
     limit?: number;
     sinceSeq?: number;
     beforeSeq?: number;
+    includeCounts?: boolean;
   },
 ): Promise<{ events: StoredEvent[]; meta: MissionEventsMeta }> {
   const params = new URLSearchParams();
@@ -247,6 +248,7 @@ export async function getMissionEventsWithMeta(
     params.set("since_seq", String(options.sinceSeq));
   if (options?.beforeSeq !== undefined)
     params.set("before_seq", String(options.beforeSeq));
+  if (options?.includeCounts === false) params.set("include_counts", "false");
   const query = params.toString();
   const res = await apiFetch(
     `/api/control/missions/${id}/events${query ? `?${query}` : ""}`,

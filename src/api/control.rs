@@ -4639,6 +4639,14 @@ pub struct GetEventsQuery {
     /// when provided.
     #[serde(default)]
     pub before_seq: Option<i64>,
+    /// Whether to include total/count headers. Delta polling only needs
+    /// `X-Max-Sequence`; skipping counts avoids an extra indexed DB scan.
+    #[serde(default = "default_include_event_counts")]
+    pub include_counts: bool,
+}
+
+fn default_include_event_counts() -> bool {
+    true
 }
 
 const INACTIVE_EVENT_SUMMARY_AFTER: chrono::Duration = chrono::Duration::minutes(5);
@@ -4775,11 +4783,15 @@ pub async fn get_mission_events(
     // Metadata headers let the client decide whether it's caught up
     // without a second round-trip. Failures here are non-fatal — we just
     // skip the header rather than breaking the whole response.
-    let total = control
-        .mission_store
-        .count_events(mission_id, types.as_deref())
-        .await
-        .ok();
+    let total = if query.include_counts {
+        control
+            .mission_store
+            .count_events(mission_id, types.as_deref())
+            .await
+            .ok()
+    } else {
+        None
+    };
     let max_seq = control
         .mission_store
         .max_event_sequence(mission_id)

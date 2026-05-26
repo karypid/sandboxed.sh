@@ -421,6 +421,18 @@ import { RelativeTime } from "@/components/ui/relative-time";
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
 
+function scheduleBackgroundHistoryFill(callback: () => void) {
+  if (typeof window === "undefined") return;
+  const start = () => {
+    if ("requestIdleCallback" in window) {
+      window.requestIdleCallback(callback, { timeout: 5_000 });
+      return;
+    }
+    globalThis.setTimeout(callback, 250);
+  };
+  globalThis.setTimeout(start, 1_000);
+}
+
 // Module-level so all duration consumers share the same implementation.
 function formatDuration(seconds: number): string {
   if (seconds <= 0) return "<1s";
@@ -2179,10 +2191,11 @@ const ThinkingPanel = memo(function ThinkingPanel({
               <button
                 type="button"
                 onClick={() => scrollThoughtsToBottom()}
-                className="absolute bottom-3 right-3 flex h-8 w-8 items-center justify-center rounded-full border border-white/[0.1] bg-black/50 text-white/60 shadow-lg transition-colors hover:bg-white/[0.08] hover:text-white"
+                className="absolute bottom-3 right-3 inline-flex items-center gap-2 rounded-full border border-white/[0.1] bg-black/70 px-3 py-2 text-xs font-medium text-white/65 shadow-lg backdrop-blur transition-all hover:bg-white/[0.1] hover:text-white/90"
                 title="Scroll to bottom"
               >
                 <ArrowDown className="h-4 w-4" />
+                Auto-scroll paused
               </button>
             )}
           </>
@@ -4232,6 +4245,8 @@ export default function ControlClient() {
   // Tuned for memory headroom on long missions — see the
   // `chatScrollContainerRef` comment block above.
   const HISTORY_PAGE_SIZE = 5000;
+  const HISTORY_DELTA_PAGE_SIZE = 1000;
+  const HISTORY_FALLBACK_PAGE_SIZE = 1000;
   // Cap how far the background fill walks back from the head on first load.
   // Past this depth the user has to click "Load older messages" — keeps
   // memory + render cost predictable on huge missions while still feeling
@@ -4251,7 +4266,8 @@ export default function ControlClient() {
         const { events, meta } = await getMissionEventsWithMeta(id, {
           types: HISTORY_EVENT_TYPES,
           sinceSeq: opts.sinceSeq,
-          limit: HISTORY_PAGE_SIZE,
+          limit: HISTORY_DELTA_PAGE_SIZE,
+          includeCounts: false,
         });
         const maxSequence = meta.maxSequence ?? opts.sinceSeq;
         // If the page was capped by `limit`, advance the cursor to the
@@ -4263,7 +4279,7 @@ export default function ControlClient() {
             ? events[events.length - 1].sequence
             : opts.sinceSeq;
         const cursor =
-          events.length >= HISTORY_PAGE_SIZE && lastSeq < maxSequence
+          events.length >= HISTORY_DELTA_PAGE_SIZE && lastSeq < maxSequence
             ? lastSeq
             : maxSequence;
         missionMaxSeqRef.current.set(id, cursor);
@@ -4282,7 +4298,8 @@ export default function ControlClient() {
           const delta = await getMissionEventsWithMeta(id, {
             types: HISTORY_EVENT_TYPES,
             sinceSeq: cached.maxSequence,
-            limit: HISTORY_PAGE_SIZE,
+            limit: HISTORY_DELTA_PAGE_SIZE,
+            includeCounts: false,
           });
           // If the server's max sequence is *behind* what we cached, the
           // mission was reset or replaced server-side and our cache is
@@ -4328,7 +4345,7 @@ export default function ControlClient() {
         } catch {
           const fallback = await getMissionEventsWithMeta(id, {
             types: HISTORY_EVENT_TYPES,
-            limit: HISTORY_PAGE_SIZE,
+            limit: HISTORY_FALLBACK_PAGE_SIZE,
           });
           sorted = fallback.events.sort((a, b) => a.sequence - b.sequence);
           metaMaxSeq = fallback.meta.maxSequence;
@@ -4385,9 +4402,9 @@ export default function ControlClient() {
       if (hasMoreLocal) {
         const fillFn = streamOlderHistoryRef.current;
         if (fillFn) {
-          setTimeout(() => {
+          scheduleBackgroundHistoryFill(() => {
             void fillFn(id);
-          }, 0);
+          });
         }
       }
       return sorted;
