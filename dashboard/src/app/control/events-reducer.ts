@@ -262,7 +262,7 @@ export function eventsToItemsImpl(
       case "text_delta": {
         const content = event.content || "";
         if (content.trim().length === 0) break;
-        const mergedContent = lastTextDelta
+        const mergedContent: string = lastTextDelta
           ? mergeStreamFragment(lastTextDelta.content, content)
           : content;
         lastTextDelta = {

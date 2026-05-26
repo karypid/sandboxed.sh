@@ -1,0 +1,80 @@
+import { expect, test } from "@playwright/test";
+
+async function mountThemeFixture(page: import("@playwright/test").Page) {
+  await page.evaluate(() => {
+    const fixture = document.createElement("div");
+    fixture.id = "theme-regression-fixture";
+    fixture.innerHTML = `
+      <div class="panel" data-testid="panel">
+        <p class="muted-text" data-testid="muted">Muted text</p>
+        <button class="icon-button" data-testid="icon-button">Button</button>
+        <p class="prose-glass">
+          <code class="code-inline text-xs font-mono" data-testid="inline-code">sell_fee_split_spec</code>
+        </p>
+        <pre class="code-block" data-testid="code-block"><code>seller_amount + protocol_fee = total_amount</code></pre>
+        <div class="user-message-bubble user-message-bubble-solid" data-testid="user-message">
+          User message
+        </div>
+      </div>
+    `;
+    document.body.appendChild(fixture);
+  });
+}
+
+async function forceTheme(page: import("@playwright/test").Page, theme: "dark" | "light") {
+  await page.addInitScript((nextTheme) => {
+    localStorage.setItem("sandboxed-theme", nextTheme);
+  }, theme);
+  await page.emulateMedia({ colorScheme: theme });
+  await page.goto("/");
+  await page.evaluate((nextTheme) => {
+    document.documentElement.dataset.theme = nextTheme;
+  }, theme);
+  await mountThemeFixture(page);
+}
+
+function parseRgb(input: string): [number, number, number] {
+  const match = input.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (!match) throw new Error(`Expected rgb color, got ${input}`);
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+test("markdown code uses readable semantic colors in dark theme", async ({ page }) => {
+  await forceTheme(page, "dark");
+
+  const inline = page.getByTestId("inline-code");
+  const inlineBg = parseRgb(await inline.evaluate((el) => getComputedStyle(el).backgroundColor));
+  const inlineText = parseRgb(await inline.evaluate((el) => getComputedStyle(el).color));
+
+  expect(inlineBg[0]).toBeLessThan(90);
+  expect(inlineBg[1]).toBeLessThan(90);
+  expect(inlineBg[2]).toBeLessThan(110);
+  expect(inlineText[0]).toBeGreaterThan(150);
+  expect(inlineText[1]).toBeGreaterThan(150);
+  expect(inlineText[2]).toBeGreaterThan(180);
+
+  const blockBg = parseRgb(
+    await page.getByTestId("code-block").evaluate((el) => getComputedStyle(el).backgroundColor)
+  );
+  expect(blockBg[0]).toBeLessThan(60);
+  expect(blockBg[1]).toBeLessThan(70);
+  expect(blockBg[2]).toBeLessThan(80);
+});
+
+test("semantic components switch to light theme via data-theme", async ({ page }) => {
+  await forceTheme(page, "light");
+
+  const inline = page.getByTestId("inline-code");
+  const inlineBg = parseRgb(await inline.evaluate((el) => getComputedStyle(el).backgroundColor));
+  const inlineText = parseRgb(await inline.evaluate((el) => getComputedStyle(el).color));
+  const userText = parseRgb(
+    await page.getByTestId("user-message").evaluate((el) => getComputedStyle(el).color)
+  );
+
+  expect(inlineBg[0]).toBeGreaterThan(200);
+  expect(inlineBg[1]).toBeGreaterThan(210);
+  expect(inlineText[2]).toBeLessThan(160);
+  expect(userText[0]).toBeLessThan(90);
+  expect(userText[1]).toBeLessThan(90);
+  expect(userText[2]).toBeLessThan(160);
+});

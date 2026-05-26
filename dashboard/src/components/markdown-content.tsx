@@ -1008,8 +1008,8 @@ export const MarkdownContent = memo(function MarkdownContent({
           return (
             <code
               className={cn(
-                "px-1.5 py-0.5 rounded bg-white/[0.06] text-indigo-300 text-xs font-mono",
-                "cursor-pointer hover:bg-white/[0.1] hover:text-indigo-200 transition-colors"
+                "code-inline text-xs font-mono",
+                "cursor-pointer transition-colors"
               )}
               onClick={(e) => {
                 e.preventDefault();
@@ -1028,7 +1028,7 @@ export const MarkdownContent = memo(function MarkdownContent({
           );
         }
         return (
-          <code className="px-1.5 py-0.5 rounded bg-white/[0.06] text-indigo-300 text-xs font-mono" {...props}>
+          <code className="code-inline text-xs font-mono" {...props}>
             {children}
           </code>
         );
@@ -1049,12 +1049,12 @@ export const MarkdownContent = memo(function MarkdownContent({
               {codeString}
             </LazyCodeBlock>
           ) : (
-            <pre className="p-4 rounded-lg overflow-x-auto">
+            <pre className="code-block p-4 overflow-x-auto">
               <code className="text-xs font-mono">{codeString}</code>
             </pre>
           )}
           {match && (
-            <div className="absolute left-3 top-2 text-[10px] text-white/30 uppercase tracking-wider">{match[1]}</div>
+            <div className="absolute left-3 top-2 text-[10px] muted-text uppercase tracking-wider">{match[1]}</div>
           )}
         </div>
       );
@@ -1093,7 +1093,7 @@ export const MarkdownContent = memo(function MarkdownContent({
             Render markdown
           </button>
         </div>
-        <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded border border-white/[0.06] bg-[rgb(var(--code-background))] p-3 text-xs leading-relaxed text-[rgb(var(--code-foreground))]">
+        <pre className="code-block max-h-[60vh] overflow-auto whitespace-pre-wrap break-words p-3 text-xs leading-relaxed">
           {content}
         </pre>
       </div>
@@ -1178,7 +1178,7 @@ export function LazyMarkdownContent(props: MarkdownContentProps) {
       ref={ref}
       className={cn("prose-glass text-sm [&_p]:my-2", props.className)}
     >
-      <pre className="whitespace-pre-wrap break-words text-sm leading-relaxed text-white/80">
+      <pre className="code-block whitespace-pre-wrap break-words text-sm leading-relaxed">
         {props.content}
       </pre>
     </div>

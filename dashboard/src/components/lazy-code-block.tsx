@@ -95,10 +95,21 @@ export const LazyCodeBlock = memo(function LazyCodeBlock({
 
   useEffect(() => {
     const query = window.matchMedia("(prefers-color-scheme: light)");
-    const update = () => setIsLight(query.matches);
+    const update = () => {
+      const theme = document.documentElement.dataset.theme;
+      setIsLight(theme ? theme === "light" : query.matches);
+    };
     update();
+    const observer = new MutationObserver(update);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
     query.addEventListener("change", update);
-    return () => query.removeEventListener("change", update);
+    return () => {
+      observer.disconnect();
+      query.removeEventListener("change", update);
+    };
   }, []);
 
   const baseStyle: CSSProperties = {
