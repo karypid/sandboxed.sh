@@ -13426,7 +13426,7 @@ fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage
             "cacheWriteInputTokens",
         ],
     );
-    let cache_read_tokens = usage_value_tokens(
+    let explicit_cache_read_tokens = usage_value_tokens(
         usage,
         &[
             "cache_read_input_tokens",
@@ -13435,6 +13435,13 @@ fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage
             "cachedTokens",
         ],
     );
+    let nested_cached_tokens =
+        nested_usage_value_tokens(usage, &["input_tokens_details", "cached_tokens"])
+            .saturating_add(nested_usage_value_tokens(
+                usage,
+                &["prompt_tokens_details", "cached_tokens"],
+            ));
+    let cache_read_tokens = explicit_cache_read_tokens.saturating_add(nested_cached_tokens);
     // xAI/OpenAI-compatible usage reports usually include cached prompt
     // tokens inside the prompt/input total. Internally we store billable
     // non-cached input separately from discounted cache-read input, so the
@@ -15798,7 +15805,9 @@ mod tests {
                 "usage": {
                     "prompt_tokens": 1200,
                     "completion_tokens": 345,
-                    "cached_tokens": 100
+                    "prompt_tokens_details": {
+                        "cached_tokens": 100
+                    }
                 }
             }
         });

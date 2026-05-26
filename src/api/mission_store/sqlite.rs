@@ -109,15 +109,16 @@ const TELEGRAM_MEMORY_SEARCH_STOPWORDS: &[&str] = &[
 fn usage_cost_with_read_side_estimate(
     model: &str,
     stored_cost_cents: u64,
+    cost_source: &str,
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_tokens: u64,
     cache_read_tokens: u64,
 ) -> u64 {
-    if stored_cost_cents > 0 {
+    if stored_cost_cents > 0 && cost_source == "actual" {
         return stored_cost_cents;
     }
-    crate::cost::cost_cents_from_usage(
+    let estimated = crate::cost::cost_cents_from_usage(
         model,
         &crate::cost::TokenUsage {
             input_tokens,
@@ -125,7 +126,19 @@ fn usage_cost_with_read_side_estimate(
             cache_creation_input_tokens: Some(cache_creation_tokens),
             cache_read_input_tokens: Some(cache_read_tokens),
         },
-    )
+    );
+    if estimated > 0 {
+        return estimated;
+    }
+    stored_cost_cents
+}
+
+fn usage_model_key(raw_model: &str, stored_normalized_model: &str) -> String {
+    let raw_model = raw_model.trim();
+    if !raw_model.is_empty() {
+        return crate::cost::normalized_model(raw_model);
+    }
+    stored_normalized_model.trim().to_string()
 }
 
 #[derive(serde::Serialize)]
@@ -4358,49 +4371,42 @@ impl MissionStore for SqliteMissionStore {
     ) -> Result<Vec<ModelUsageStats>, String> {
         let conn = self.conn.lock().await;
 
-        // Aggregate by normalized model from assistant_message events. Falls back
-        // to the raw `model` string if `model_normalized` is missing. Token and
-        // cost fields tolerate the legacy flat shape (`cost_cents`) and missing
-        // values via COALESCE.
+        // Read individual rows so stale stored `model_normalized` values can be
+        // corrected with the current normalizer and estimated costs can be
+        // recalculated under the corrected model.
         let base_query = r#"
             SELECT
+                COALESCE(json_extract(metadata, '$.model'), '') AS raw_model,
+                COALESCE(json_extract(metadata, '$.model_normalized'), '') AS stored_model,
+                COALESCE(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER), 0) AS input_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER), 0) AS output_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER), 0) AS cache_creation_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER), 0) AS cache_read_tokens,
                 COALESCE(
-                    json_extract(metadata, '$.model_normalized'),
-                    json_extract(metadata, '$.model'),
+                    json_extract(metadata, '$.cost.source'),
                     ''
-                ) AS model,
-                COUNT(*) AS requests,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER)), 0) AS cache_creation_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
-                COALESCE(SUM(
-                    CASE WHEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) > 0
-                    THEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) ELSE 0 END
-                ), 0) AS cost_cents
+                ) AS cost_source,
+                CASE WHEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) > 0
+                THEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) ELSE 0 END AS cost_cents
             FROM mission_events
             WHERE event_type = 'assistant_message'
         "#;
 
         let sql = match since {
-            Some(_) => format!(
-                "{base_query} AND timestamp >= ?1 GROUP BY model ORDER BY cost_cents DESC, requests DESC"
-            ),
-            None => format!(
-                "{base_query} GROUP BY model ORDER BY cost_cents DESC, requests DESC"
-            ),
+            Some(_) => format!("{base_query} AND timestamp >= ?1"),
+            None => base_query.to_string(),
         };
 
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -4411,13 +4417,15 @@ impl MissionStore for SqliteMissionStore {
         };
         let rows = stmt
             .query_map(params.as_slice(), |row| {
-                let model: String = row.get(0)?;
-                let requests: i64 = row.get(1)?;
+                let raw_model: String = row.get(0)?;
+                let stored_model: String = row.get(1)?;
                 let input_tokens: i64 = row.get(2)?;
                 let output_tokens: i64 = row.get(3)?;
                 let cache_creation_tokens: i64 = row.get(4)?;
                 let cache_read_tokens: i64 = row.get(5)?;
-                let cost_cents: i64 = row.get(6)?;
+                let cost_source: String = row.get(6)?;
+                let cost_cents: i64 = row.get(7)?;
+                let model = usage_model_key(&raw_model, &stored_model);
                 let input_tokens = input_tokens.max(0) as u64;
                 let output_tokens = output_tokens.max(0) as u64;
                 let cache_creation_tokens = cache_creation_tokens.max(0) as u64;
@@ -4426,6 +4434,7 @@ impl MissionStore for SqliteMissionStore {
                 let cost_cents = usage_cost_with_read_side_estimate(
                     &model,
                     stored_cost_cents,
+                    &cost_source,
                     input_tokens,
                     output_tokens,
                     cache_creation_tokens,
@@ -4433,7 +4442,7 @@ impl MissionStore for SqliteMissionStore {
                 );
                 Ok(ModelUsageStats {
                     model,
-                    requests: requests.max(0) as u64,
+                    requests: 1,
                     input_tokens,
                     output_tokens,
                     cache_creation_tokens,
@@ -4443,7 +4452,7 @@ impl MissionStore for SqliteMissionStore {
             })
             .map_err(|e| e.to_string())?;
 
-        let mut out: Vec<ModelUsageStats> = Vec::new();
+        let mut by_model: BTreeMap<String, ModelUsageStats> = BTreeMap::new();
         for r in rows {
             let row = r.map_err(|e| e.to_string())?;
             // Skip empty-model rows that carry no usage signal at all
@@ -4456,8 +4465,35 @@ impl MissionStore for SqliteMissionStore {
             {
                 continue;
             }
-            out.push(row);
+            let entry = by_model
+                .entry(row.model.clone())
+                .or_insert_with(|| ModelUsageStats {
+                    model: row.model.clone(),
+                    requests: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    cost_cents: 0,
+                });
+            entry.requests = entry.requests.saturating_add(row.requests);
+            entry.input_tokens = entry.input_tokens.saturating_add(row.input_tokens);
+            entry.output_tokens = entry.output_tokens.saturating_add(row.output_tokens);
+            entry.cache_creation_tokens = entry
+                .cache_creation_tokens
+                .saturating_add(row.cache_creation_tokens);
+            entry.cache_read_tokens = entry
+                .cache_read_tokens
+                .saturating_add(row.cache_read_tokens);
+            entry.cost_cents = entry.cost_cents.saturating_add(row.cost_cents);
         }
+        let mut out: Vec<ModelUsageStats> = by_model.into_values().collect();
+        out.sort_by(|a, b| {
+            b.cost_cents
+                .cmp(&a.cost_cents)
+                .then_with(|| b.requests.cmp(&a.requests))
+                .then_with(|| a.model.cmp(&b.model))
+        });
         Ok(out)
     }
 
@@ -4470,41 +4506,34 @@ impl MissionStore for SqliteMissionStore {
         let base_query = r#"
             SELECT
                 substr(timestamp, 1, 10) AS day,
-                COALESCE(
-                    json_extract(metadata, '$.model_normalized'),
-                    json_extract(metadata, '$.model'),
-                    ''
-                ) AS model,
-                COUNT(*) AS requests,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER)), 0) AS cache_creation_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
-                COALESCE(SUM(
-                    CASE WHEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) > 0
-                    THEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) ELSE 0 END
-                ), 0) AS cost_cents
+                COALESCE(json_extract(metadata, '$.model'), '') AS raw_model,
+                COALESCE(json_extract(metadata, '$.model_normalized'), '') AS stored_model,
+                COALESCE(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER), 0) AS input_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER), 0) AS output_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER), 0) AS cache_creation_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER), 0) AS cache_read_tokens,
+                COALESCE(json_extract(metadata, '$.cost.source'), '') AS cost_source,
+                CASE WHEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) > 0
+                THEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) ELSE 0 END AS cost_cents
             FROM mission_events
             WHERE event_type = 'assistant_message'
         "#;
 
         let sql = match since {
-            Some(_) => {
-                format!("{base_query} AND timestamp >= ?1 GROUP BY day, model ORDER BY day ASC")
-            }
-            None => format!("{base_query} GROUP BY day, model ORDER BY day ASC"),
+            Some(_) => format!("{base_query} AND timestamp >= ?1 ORDER BY day ASC"),
+            None => format!("{base_query} ORDER BY day ASC"),
         };
 
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -4516,13 +4545,15 @@ impl MissionStore for SqliteMissionStore {
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 let day: String = row.get(0)?;
-                let model: String = row.get(1)?;
-                let requests: i64 = row.get(2)?;
+                let raw_model: String = row.get(1)?;
+                let stored_model: String = row.get(2)?;
                 let input_tokens: i64 = row.get(3)?;
                 let output_tokens: i64 = row.get(4)?;
                 let cache_creation_tokens: i64 = row.get(5)?;
                 let cache_read_tokens: i64 = row.get(6)?;
-                let cost_cents: i64 = row.get(7)?;
+                let cost_source: String = row.get(7)?;
+                let cost_cents: i64 = row.get(8)?;
+                let model = usage_model_key(&raw_model, &stored_model);
                 let input_tokens = input_tokens.max(0) as u64;
                 let output_tokens = output_tokens.max(0) as u64;
                 let cache_creation_tokens = cache_creation_tokens.max(0) as u64;
@@ -4530,6 +4561,7 @@ impl MissionStore for SqliteMissionStore {
                 let cost_cents = usage_cost_with_read_side_estimate(
                     &model,
                     cost_cents.max(0) as u64,
+                    &cost_source,
                     input_tokens,
                     output_tokens,
                     cache_creation_tokens,
@@ -4537,7 +4569,7 @@ impl MissionStore for SqliteMissionStore {
                 );
                 Ok((
                     day,
-                    requests.max(0) as u64,
+                    1,
                     input_tokens,
                     output_tokens,
                     cache_read_tokens,
@@ -4581,40 +4613,33 @@ impl MissionStore for SqliteMissionStore {
         let base_query = r#"
             SELECT
                 substr(timestamp, 1, 13) AS hour,
-                COALESCE(
-                    json_extract(metadata, '$.model_normalized'),
-                    json_extract(metadata, '$.model'),
-                    ''
-                ) AS model,
-                COUNT(*) AS requests,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER)), 0) AS cache_creation_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
-                COALESCE(SUM(
-                    CASE WHEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) > 0
-                    THEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) ELSE 0 END
-                ), 0) AS cost_cents
+                COALESCE(json_extract(metadata, '$.model'), '') AS raw_model,
+                COALESCE(json_extract(metadata, '$.model_normalized'), '') AS stored_model,
+                COALESCE(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER), 0) AS input_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER), 0) AS output_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER), 0) AS cache_creation_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER), 0) AS cache_read_tokens,
+                COALESCE(json_extract(metadata, '$.cost.source'), '') AS cost_source,
+                CASE WHEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) > 0
+                THEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) ELSE 0 END AS cost_cents
             FROM mission_events
             WHERE event_type = 'assistant_message'
         "#;
         let sql = match since {
-            Some(_) => {
-                format!("{base_query} AND timestamp >= ?1 GROUP BY hour, model ORDER BY hour ASC")
-            }
-            None => format!("{base_query} GROUP BY hour, model ORDER BY hour ASC"),
+            Some(_) => format!("{base_query} AND timestamp >= ?1 ORDER BY hour ASC"),
+            None => format!("{base_query} ORDER BY hour ASC"),
         };
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let since_owned = since.map(|s| s.to_string());
@@ -4625,13 +4650,15 @@ impl MissionStore for SqliteMissionStore {
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 let hour: String = row.get(0)?;
-                let model: String = row.get(1)?;
-                let requests: i64 = row.get(2)?;
+                let raw_model: String = row.get(1)?;
+                let stored_model: String = row.get(2)?;
                 let input_tokens: i64 = row.get(3)?;
                 let output_tokens: i64 = row.get(4)?;
                 let cache_creation_tokens: i64 = row.get(5)?;
                 let cache_read_tokens: i64 = row.get(6)?;
-                let cost_cents: i64 = row.get(7)?;
+                let cost_source: String = row.get(7)?;
+                let cost_cents: i64 = row.get(8)?;
+                let model = usage_model_key(&raw_model, &stored_model);
                 let input_tokens = input_tokens.max(0) as u64;
                 let output_tokens = output_tokens.max(0) as u64;
                 let cache_creation_tokens = cache_creation_tokens.max(0) as u64;
@@ -4639,6 +4666,7 @@ impl MissionStore for SqliteMissionStore {
                 let cost_cents = usage_cost_with_read_side_estimate(
                     &model,
                     cost_cents.max(0) as u64,
+                    &cost_source,
                     input_tokens,
                     output_tokens,
                     cache_creation_tokens,
@@ -4646,7 +4674,7 @@ impl MissionStore for SqliteMissionStore {
                 );
                 Ok((
                     hour,
-                    requests.max(0) as u64,
+                    1,
                     input_tokens,
                     output_tokens,
                     cache_read_tokens,
@@ -10602,12 +10630,34 @@ mod tests {
                         "input_tokens": 500,
                         "output_tokens": 200
                     },
-                    "cost": { "amount_cents": 4, "source": "estimated" }
+                    "cost": { "amount_cents": 4, "source": "actual" }
                 })
                 .to_string()
             ],
         )
         .expect("insert gpt-4o");
+
+        // Legacy rows may carry a stale normalized model. Prefer the raw model
+        // and recalculate estimated costs with current pricing.
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                4i64,
+                "2026-04-22T00:03:00Z",
+                json!({
+                    "model": "gpt-5.5",
+                    "model_normalized": "gpt-5",
+                    "usage": {
+                        "input_tokens": 10000,
+                        "output_tokens": 2000
+                    },
+                    "cost": { "amount_cents": 33, "source": "estimated" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert legacy gpt-5.5");
 
         drop(conn);
 
@@ -10616,27 +10666,43 @@ mod tests {
             .await
             .expect("aggregate by model");
 
-        // Ordered by cost_cents DESC: sonnet (37) before gpt-4o (4).
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].model, "claude-3-5-sonnet");
-        assert_eq!(rows[0].requests, 2);
-        assert_eq!(rows[0].input_tokens, 3000);
-        assert_eq!(rows[0].output_tokens, 1300);
-        assert_eq!(rows[0].cache_creation_tokens, 200);
-        assert_eq!(rows[0].cache_read_tokens, 400);
-        assert_eq!(rows[0].cost_cents, 37);
+        assert_eq!(rows.len(), 3);
+        let sonnet = rows
+            .iter()
+            .find(|row| row.model == "claude-3-5-sonnet")
+            .expect("sonnet usage");
+        assert_eq!(sonnet.requests, 2);
+        assert_eq!(sonnet.input_tokens, 3000);
+        assert_eq!(sonnet.output_tokens, 1300);
+        assert_eq!(sonnet.cache_creation_tokens, 200);
+        assert_eq!(sonnet.cache_read_tokens, 400);
+        assert_eq!(sonnet.cost_cents, 37);
 
-        assert_eq!(rows[1].model, "gpt-4o");
-        assert_eq!(rows[1].requests, 1);
-        assert_eq!(rows[1].cost_cents, 4);
+        let gpt_4o = rows
+            .iter()
+            .find(|row| row.model == "gpt-4o")
+            .expect("gpt-4o usage");
+        assert_eq!(gpt_4o.requests, 1);
+        assert_eq!(gpt_4o.cost_cents, 4);
+
+        let gpt_55 = rows
+            .iter()
+            .find(|row| row.model == "gpt-5.5")
+            .expect("gpt-5.5 usage");
+        assert_eq!(gpt_55.requests, 1);
+        assert_eq!(gpt_55.input_tokens, 10000);
+        assert_eq!(gpt_55.output_tokens, 2000);
+        assert_eq!(gpt_55.cost_cents, 11);
+        assert!(!rows.iter().any(|row| row.model == "gpt-5"));
 
         // since=… filter should drop the older entries.
         let recent = store
             .get_usage_by_model(Some("2026-04-22T00:01:30Z"))
             .await
             .expect("filtered aggregate");
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].model, "gpt-4o");
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().any(|row| row.model == "gpt-4o"));
+        assert!(recent.iter().any(|row| row.model == "gpt-5.5"));
     }
 
     #[tokio::test]

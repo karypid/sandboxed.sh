@@ -598,6 +598,44 @@ struct TranslateOutcome {
     terminal: bool,
 }
 
+fn usage_tokens(usage: &serde_json::Value, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|key| usage.get(*key).and_then(|v| v.as_u64()))
+        .unwrap_or(0)
+}
+
+fn codex_usage_from_turn_params(params: &serde_json::Value) -> Option<(u64, u64)> {
+    let turn = params.get("turn");
+    let usage = turn
+        .and_then(|turn| turn.get("tokenUsage").or_else(|| turn.get("usage")))
+        .or_else(|| params.get("tokenUsage"))
+        .or_else(|| params.get("usage"))?;
+
+    let input = usage_tokens(
+        usage,
+        &[
+            "inputTokens",
+            "input_tokens",
+            "promptTokens",
+            "prompt_tokens",
+            "totalInputTokens",
+            "total_input_tokens",
+        ],
+    );
+    let output = usage_tokens(
+        usage,
+        &[
+            "outputTokens",
+            "output_tokens",
+            "completionTokens",
+            "completion_tokens",
+            "totalOutputTokens",
+            "total_output_tokens",
+        ],
+    );
+    (input > 0 || output > 0).then_some((input, output))
+}
+
 impl AppServerEventTranslator {
     fn handle_notification(
         &mut self,
@@ -736,25 +774,13 @@ impl AppServerEventTranslator {
                         .unwrap_or("")
                         .to_string();
                     if !turn_id.is_empty() && !self.emitted_usage_for_turn.contains(&turn_id) {
-                        if let Some(usage) = turn.get("tokenUsage").or_else(|| turn.get("usage")) {
-                            let input = usage
-                                .get("inputTokens")
-                                .or_else(|| usage.get("input_tokens"))
-                                .or_else(|| usage.get("promptTokens"))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            let output = usage
-                                .get("outputTokens")
-                                .or_else(|| usage.get("output_tokens"))
-                                .or_else(|| usage.get("completionTokens"))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            if input > 0 || output > 0 {
-                                events.push(ExecutionEvent::Usage {
-                                    input_tokens: input,
-                                    output_tokens: output,
-                                });
-                            }
+                        if let Some((input_tokens, output_tokens)) =
+                            codex_usage_from_turn_params(params)
+                        {
+                            events.push(ExecutionEvent::Usage {
+                                input_tokens,
+                                output_tokens,
+                            });
                         }
                         self.emitted_usage_for_turn.insert(turn_id);
                     }
@@ -1088,6 +1114,40 @@ mod tests {
         // free to REPLACE per item, no overlap merging required).
         assert_eq!(thinkings[1].1, "The recovery log. Do not duplicate.");
         assert_eq!(thinkings[3].1, "Worktrees are ready");
+    }
+
+    #[test]
+    fn codex_turn_completed_extracts_usage_aliases() {
+        let mut translator = AppServerEventTranslator {
+            delta_buffers: HashMap::new(),
+            emitted_usage_for_turn: HashSet::new(),
+            counted_turn_ids: HashSet::new(),
+            goal_iteration: 0,
+            goal_objective: String::new(),
+        };
+
+        let outcome = translator.handle_notification(
+            "turn/completed",
+            &json!({
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed"
+                },
+                "usage": {
+                    "total_input_tokens": 1234,
+                    "total_output_tokens": 56
+                }
+            }),
+            false,
+        );
+
+        assert!(outcome.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::Usage {
+                input_tokens: 1234,
+                output_tokens: 56
+            }
+        )));
     }
 
     #[tokio::test]
