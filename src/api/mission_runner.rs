@@ -149,8 +149,8 @@ struct OpencodeSseParseResult {
     /// The SSE stream indicated the session entered a retry state, meaning
     /// the model API call failed and OpenCode is retrying automatically.
     session_retry: bool,
-    /// Token usage extracted from response.completed events (input, output).
-    usage: Option<(u64, u64)>,
+    /// Token usage extracted from response.completed events.
+    usage: Option<crate::cost::TokenUsage>,
 }
 
 fn tool_result_text(result: &serde_json::Value) -> Option<String> {
@@ -1700,7 +1700,7 @@ fn parse_opencode_sse_event(
 
     let mut message_complete = false;
     let mut model: Option<String> = None;
-    let mut sse_usage: Option<(u64, u64)> = None;
+    let mut sse_usage: Option<crate::cost::TokenUsage> = None;
     let mut extra_events: Vec<AgentEvent> = Vec::new();
     let event = match event_type {
         "response.output_text.delta" => {
@@ -1745,24 +1745,16 @@ fn parse_opencode_sse_event(
                 .and_then(|r| r.get("usage"))
                 .or_else(|| props.get("usage"));
             if let Some(usage_obj) = usage {
-                let input = usage_obj
-                    .get("input_tokens")
-                    .or_else(|| usage_obj.get("prompt_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let output = usage_obj
-                    .get("output_tokens")
-                    .or_else(|| usage_obj.get("completion_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if input > 0 || output > 0 {
+                if let Some(usage) = opencode_usage_from_value(usage_obj) {
                     tracing::info!(
                         mission_id = %mission_id,
-                        input_tokens = input,
-                        output_tokens = output,
+                        input_tokens = usage.input_tokens,
+                        output_tokens = usage.output_tokens,
+                        cache_creation_input_tokens = usage.cache_creation_input_tokens.unwrap_or(0),
+                        cache_read_input_tokens = usage.cache_read_input_tokens.unwrap_or(0),
                         "Extracted token usage from response.completed"
                     );
-                    sse_usage = Some((input, output));
+                    sse_usage = Some(usage);
                 }
             }
             None
@@ -2006,7 +1998,12 @@ fn parse_opencode_sse_event(
                 let input = tok.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
                 let output = tok.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
                 if input > 0 || output > 0 {
-                    sse_usage = Some((input, output));
+                    sse_usage = Some(crate::cost::TokenUsage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    });
                 }
             }
             // Only mark complete on reason=stop. Tool-call steps (reason=tool-calls)
@@ -11178,6 +11175,8 @@ pub async fn run_opencode_turn(
     // Accumulate token usage from SSE response.completed events for cost estimation
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut total_cache_creation_input_tokens: u64 = 0;
+    let mut total_cache_read_input_tokens: u64 = 0;
     let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent);
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
@@ -11644,7 +11643,8 @@ pub async fn run_opencode_turn(
     // Shared accumulator for token usage extracted from SSE response.completed events.
     // Updated only by the dedicated SSE curl task; the stdout parser uses local counters
     // and only accumulates when the SSE task is absent (to avoid double-counting).
-    let sse_usage_tokens: Arc<Mutex<(u64, u64)>> = Arc::new(Mutex::new((0, 0)));
+    let sse_usage_tokens: Arc<Mutex<crate::cost::TokenUsage>> =
+        Arc::new(Mutex::new(crate::cost::TokenUsage::default()));
     let latest_tool_result_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let rate_limit_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
@@ -11803,10 +11803,9 @@ pub async fn run_opencode_turn(
                                                 *guard = Some(session_id);
                                             }
                                         }
-                                        if let Some((input, output)) = parsed.usage {
+                                        if let Some(usage) = parsed.usage {
                                             if let Ok(mut guard) = sse_usage_tokens.lock() {
-                                                guard.0 = guard.0.saturating_add(input);
-                                                guard.1 = guard.1.saturating_add(output);
+                                                merge_token_usage(&mut guard, &usage);
                                             }
                                         }
                                         if let Some(event) = parsed.event {
@@ -12637,9 +12636,19 @@ pub async fn run_opencode_turn(
                                 // can see the same `response.completed` event, which would
                                 // double-count tokens (and inflate cost estimates to ~2x).
                                 if sse_handle.is_none() {
-                                    if let Some((input, output)) = parsed.usage {
-                                        total_input_tokens = total_input_tokens.saturating_add(input);
-                                        total_output_tokens = total_output_tokens.saturating_add(output);
+                                    if let Some(usage) = parsed.usage {
+                                        total_input_tokens = total_input_tokens
+                                            .saturating_add(usage.input_tokens);
+                                        total_output_tokens = total_output_tokens
+                                            .saturating_add(usage.output_tokens);
+                                        total_cache_creation_input_tokens =
+                                            total_cache_creation_input_tokens.saturating_add(
+                                                usage.cache_creation_input_tokens.unwrap_or(0),
+                                            );
+                                        total_cache_read_input_tokens = total_cache_read_input_tokens
+                                            .saturating_add(
+                                                usage.cache_read_input_tokens.unwrap_or(0),
+                                            );
                                     }
                                 }
                                 if let Some(event) = parsed.event {
@@ -13094,17 +13103,27 @@ pub async fn run_opencode_turn(
 
     // Merge shared SSE usage from the curl task into local accumulators
     if let Ok(guard) = sse_usage_tokens.lock() {
-        total_input_tokens = total_input_tokens.saturating_add(guard.0);
-        total_output_tokens = total_output_tokens.saturating_add(guard.1);
+        total_input_tokens = total_input_tokens.saturating_add(guard.input_tokens);
+        total_output_tokens = total_output_tokens.saturating_add(guard.output_tokens);
+        total_cache_creation_input_tokens = total_cache_creation_input_tokens
+            .saturating_add(guard.cache_creation_input_tokens.unwrap_or(0));
+        total_cache_read_input_tokens = total_cache_read_input_tokens
+            .saturating_add(guard.cache_read_input_tokens.unwrap_or(0));
     }
 
     // Compute cost from accumulated token usage and model (if available)
-    if total_input_tokens > 0 || total_output_tokens > 0 {
+    if total_input_tokens > 0
+        || total_output_tokens > 0
+        || total_cache_creation_input_tokens > 0
+        || total_cache_read_input_tokens > 0
+    {
         let usage = crate::cost::TokenUsage {
             input_tokens: total_input_tokens,
             output_tokens: total_output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            cache_creation_input_tokens: (total_cache_creation_input_tokens > 0)
+                .then_some(total_cache_creation_input_tokens),
+            cache_read_input_tokens: (total_cache_read_input_tokens > 0)
+                .then_some(total_cache_read_input_tokens),
         };
         let (cost_cents, cost_source) =
             resolve_cost_cents_and_source(None, model_used.as_deref(), &usage);
@@ -13283,6 +13302,95 @@ fn usage_value_tokens(value: &serde_json::Value, keys: &[&str]) -> u64 {
         .unwrap_or(0)
 }
 
+fn nested_usage_value_tokens(value: &serde_json::Value, path: &[&str]) -> u64 {
+    let mut current = value;
+    for key in path {
+        current = match current.get(*key) {
+            Some(next) => next,
+            None => return 0,
+        };
+    }
+    current.as_u64().unwrap_or(0)
+}
+
+fn merge_token_usage(target: &mut crate::cost::TokenUsage, usage: &crate::cost::TokenUsage) {
+    target.input_tokens = target.input_tokens.saturating_add(usage.input_tokens);
+    target.output_tokens = target.output_tokens.saturating_add(usage.output_tokens);
+    if let Some(tokens) = usage.cache_creation_input_tokens {
+        target.cache_creation_input_tokens = Some(
+            target
+                .cache_creation_input_tokens
+                .unwrap_or(0)
+                .saturating_add(tokens),
+        );
+    }
+    if let Some(tokens) = usage.cache_read_input_tokens {
+        target.cache_read_input_tokens = Some(
+            target
+                .cache_read_input_tokens
+                .unwrap_or(0)
+                .saturating_add(tokens),
+        );
+    }
+}
+
+fn opencode_usage_from_value(usage: &serde_json::Value) -> Option<crate::cost::TokenUsage> {
+    let raw_input_tokens = usage_value_tokens(
+        usage,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+        ],
+    );
+    let output_tokens = usage_value_tokens(
+        usage,
+        &[
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+        ],
+    );
+    let cache_creation_tokens = usage_value_tokens(
+        usage,
+        &[
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+            "prompt_cache_creation_tokens",
+        ],
+    );
+    let explicit_cache_read_tokens = usage_value_tokens(
+        usage,
+        &[
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "prompt_cache_hit_tokens",
+        ],
+    );
+    let included_cached_tokens = usage_value_tokens(usage, &["cached_tokens", "cachedTokens"])
+        .saturating_add(nested_usage_value_tokens(
+            usage,
+            &["input_tokens_details", "cached_tokens"],
+        ))
+        .saturating_add(nested_usage_value_tokens(
+            usage,
+            &["prompt_tokens_details", "cached_tokens"],
+        ));
+    let cache_read_tokens = explicit_cache_read_tokens.saturating_add(included_cached_tokens);
+    let input_tokens = raw_input_tokens.saturating_sub(included_cached_tokens);
+    let token_usage = crate::cost::TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: Some(cache_creation_tokens),
+        cache_read_input_tokens: Some(cache_read_tokens),
+    };
+    token_usage.has_usage().then_some(token_usage)
+}
+
 fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage> {
     let usage = value
         .get("usage")
@@ -13291,7 +13399,7 @@ fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage
         .or_else(|| value.get("response").and_then(|r| r.get("usage")))
         .or_else(|| value.get("message").and_then(|m| m.get("usage")))?;
 
-    let input_tokens = usage_value_tokens(
+    let raw_input_tokens = usage_value_tokens(
         usage,
         &[
             "input_tokens",
@@ -13327,6 +13435,12 @@ fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage
             "cachedTokens",
         ],
     );
+    // xAI/OpenAI-compatible usage reports usually include cached prompt
+    // tokens inside the prompt/input total. Internally we store billable
+    // non-cached input separately from discounted cache-read input, so the
+    // two buckets can be summed for display without double counting and
+    // priced at their respective rates.
+    let input_tokens = raw_input_tokens.saturating_sub(cache_read_tokens);
     let token_usage = crate::cost::TokenUsage {
         input_tokens,
         output_tokens,
@@ -15690,7 +15804,7 @@ mod tests {
         });
 
         let usage = grok_event_usage(&event).expect("usage");
-        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.input_tokens, 1100);
         assert_eq!(usage.output_tokens, 345);
         assert_eq!(usage.cache_read_input_tokens, Some(100));
     }
@@ -16573,7 +16687,11 @@ mod tests {
         let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
             .expect("event should parse");
         assert!(parsed.message_complete);
-        assert_eq!(parsed.usage, Some((1500, 350)));
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(usage.output_tokens, 350);
+        assert_eq!(usage.cache_creation_input_tokens, Some(0));
+        assert_eq!(usage.cache_read_input_tokens, Some(0));
     }
 
     #[test]
@@ -16595,7 +16713,37 @@ mod tests {
         let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
             .expect("event should parse");
         assert!(parsed.message_complete);
-        assert_eq!(parsed.usage, Some((800, 200)));
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 800);
+        assert_eq!(usage.output_tokens, 200);
+    }
+
+    #[test]
+    fn parse_opencode_sse_event_response_completed_extracts_cache_usage() {
+        let mut state = OpencodeSseState::default();
+        let mission_id = Uuid::new_v4();
+        let data = json!({
+            "type": "response.completed",
+            "properties": {
+                "response": {
+                    "usage": {
+                        "input_tokens": 1200,
+                        "output_tokens": 300,
+                        "input_tokens_details": {
+                            "cached_tokens": 500
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
+            .expect("event should parse");
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 700);
+        assert_eq!(usage.output_tokens, 300);
+        assert_eq!(usage.cache_read_input_tokens, Some(500));
     }
 
     #[test]

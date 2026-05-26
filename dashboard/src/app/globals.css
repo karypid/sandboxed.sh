@@ -219,12 +219,16 @@ select:focus-visible {
   }
 
   [class~="text-white/90"],
+  [class~="text-white/85"],
   [class~="text-white/80"],
+  [class~="text-white/75"],
   [class~="text-white/70"] {
     color: rgb(var(--foreground) / 0.78);
   }
 
+  [class~="text-white/65"],
   [class~="text-white/60"],
+  [class~="text-white/55"],
   [class~="text-white/50"] {
     color: rgb(var(--foreground-secondary) / 0.9);
   }
@@ -235,8 +239,26 @@ select:focus-visible {
   [class~="text-white/30"],
   [class~="text-white/25"],
   [class~="text-white/20"],
+  [class~="text-white/15"],
   [class~="text-white/10"] {
     color: rgb(var(--foreground-tertiary) / 0.92);
+  }
+
+  [class~="hover:text-white"]:hover,
+  [class~="hover:text-white/90"]:hover,
+  [class~="hover:text-white/80"]:hover,
+  [class~="hover:text-white/75"]:hover,
+  [class~="hover:text-white/70"]:hover {
+    color: rgb(var(--foreground) / 0.82);
+  }
+
+  [class~="hover:text-white/60"]:hover,
+  [class~="hover:text-white/50"]:hover {
+    color: rgb(var(--foreground-secondary) / 0.95);
+  }
+
+  [class~="hover:text-white/40"]:hover {
+    color: rgb(var(--foreground-tertiary) / 0.95);
   }
 
   [class~="placeholder-white/30"]::placeholder,
