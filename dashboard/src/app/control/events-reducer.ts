@@ -1,5 +1,8 @@
 import type { Mission, SharedFile, StoredEvent } from "@/lib/api";
-import { isStreamContinuation } from "@/lib/stream-continuation";
+import {
+  isStreamContinuation,
+  mergeStreamFragment,
+} from "@/lib/stream-continuation";
 
 export type CostSource = "actual" | "estimated" | "unknown";
 
@@ -259,9 +262,12 @@ export function eventsToItemsImpl(
       case "text_delta": {
         const content = event.content || "";
         if (content.trim().length === 0) break;
+        const mergedContent = lastTextDelta
+          ? mergeStreamFragment(lastTextDelta.content, content)
+          : content;
         lastTextDelta = {
           id: event.event_id ?? `text-delta-${event.id}`,
-          content,
+          content: mergedContent,
           timestamp,
         };
         break;

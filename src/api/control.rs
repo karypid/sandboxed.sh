@@ -5210,6 +5210,42 @@ struct ControlWsHeartbeat {
     seq: i64,
 }
 
+fn suffix_prefix_overlap_len(existing: &str, incoming: &str) -> usize {
+    let max_overlap = existing.chars().count().min(incoming.chars().count());
+    for overlap_chars in (1..=max_overlap).rev() {
+        let existing_start = existing
+            .char_indices()
+            .nth(existing.chars().count() - overlap_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let incoming_end = incoming
+            .char_indices()
+            .nth(overlap_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(incoming.len());
+        if existing[existing_start..] == incoming[..incoming_end] {
+            return incoming_end;
+        }
+    }
+    0
+}
+
+fn merge_text_stream_fragment(buffer: &mut String, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if buffer.is_empty() || fragment.starts_with(buffer.as_str()) {
+        *buffer = fragment.to_string();
+        return;
+    }
+    if buffer.starts_with(fragment) {
+        return;
+    }
+
+    let overlap = suffix_prefix_overlap_len(buffer, fragment);
+    buffer.push_str(&fragment[overlap..]);
+}
+
 fn text_op_events_for_stream(
     ev: AgentEvent,
     text_buffers: &mut HashMap<Uuid, String>,
@@ -5221,18 +5257,20 @@ fn text_op_events_for_stream(
         } => {
             let previous = text_buffers.entry(mission_id).or_default();
             let previous_len = previous.chars().count();
+            let mut next = previous.clone();
+            merge_text_stream_fragment(&mut next, &content);
             let ops = if previous.is_empty() {
                 vec![TextOp::Insert {
                     pos: 0,
-                    text: content.clone(),
+                    text: next.clone(),
                 }]
             } else {
                 vec![TextOp::Replace {
                     range: (0, previous_len),
-                    text: content.clone(),
+                    text: next.clone(),
                 }]
             };
-            *previous = content;
+            *previous = next;
             vec![AgentEvent::TextOp {
                 mission_id,
                 bubble_id: "text_delta_latest".to_string(),
@@ -14750,6 +14788,76 @@ mod tests {
                     &vec![TextOp::Replace {
                         range: (0, 5),
                         text: "hello world".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected text_op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_op_stream_transform_merges_incremental_delta_fragments() {
+        let mission_id = Uuid::new_v4();
+        let mut buffers = HashMap::new();
+
+        let _ = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "No, it is not actually enforced yet.".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        let second = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "\n\nCurrent state:".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        match &second[0] {
+            AgentEvent::TextOp { ops, .. } => {
+                assert_eq!(
+                    ops,
+                    &vec![TextOp::Replace {
+                        range: (0, 36),
+                        text: "No, it is not actually enforced yet.\n\nCurrent state:".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected text_op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_op_stream_transform_ignores_replayed_shorter_prefixes() {
+        let mission_id = Uuid::new_v4();
+        let mut buffers = HashMap::new();
+
+        let _ = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "The docs are accurate about this current state.".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        let second = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "The docs are accurate".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        match &second[0] {
+            AgentEvent::TextOp { ops, .. } => {
+                assert_eq!(
+                    ops,
+                    &vec![TextOp::Replace {
+                        range: (0, 47),
+                        text: "The docs are accurate about this current state.".to_string(),
                     }]
                 );
             }

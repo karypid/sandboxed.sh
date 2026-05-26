@@ -29,7 +29,10 @@ import {
 } from "@/components/enhanced-input";
 import { deriveAssistantTurnStatus } from "@/lib/assistant-turn-status";
 import { perfBus } from "@/lib/perf-bus";
-import { isStreamContinuation } from "@/lib/stream-continuation";
+import {
+  isStreamContinuation,
+  mergeStreamFragment,
+} from "@/lib/stream-continuation";
 import {
   eventsToItemsImpl,
   isRecord,
@@ -7657,7 +7660,10 @@ export default function ControlClient() {
               ) {
                 updated[existingIdx] = {
                   ...existing,
-                  content: pending.content || existing.content,
+                  content: mergeStreamFragment(
+                    existing.content,
+                    pending.content,
+                  ),
                   done: pending.done,
                   endTime: pending.done ? now : existing.endTime,
                 };
@@ -7840,7 +7846,7 @@ export default function ControlClient() {
         const isContinuation = isStreamContinuation(content, existingContent);
 
         pendingStreamRef.current = {
-          content: content || existingPending?.content || "",
+          content: mergeStreamFragment(existingContent, content),
           startTime: isContinuation ? (existingPending?.startTime ?? now) : now,
         };
 
