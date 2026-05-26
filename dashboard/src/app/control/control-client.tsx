@@ -13,6 +13,7 @@ import {
   startTransition,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import dynamic from "next/dynamic";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
 import {
@@ -26,8 +27,6 @@ import {
   type EnhancedInputHandle,
   type FilePasteContext,
 } from "@/components/enhanced-input";
-import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
-import { PerfOverlay } from "@/components/perf-overlay";
 import { deriveAssistantTurnStatus } from "@/lib/assistant-turn-status";
 import { perfBus } from "@/lib/perf-bus";
 import { isStreamContinuation } from "@/lib/stream-continuation";
@@ -48,7 +47,6 @@ import {
 } from "./control-stores";
 import { NowTickProvider, useNow } from "@/lib/now-tick";
 import { startHealthBudgetWatcher } from "@/lib/health-budget";
-import { MissionDebugStats } from "./MissionDebugStats";
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
@@ -404,19 +402,37 @@ import { useVirtualTimelineAnchor } from "@/hooks/use-virtual-timeline-anchor";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { useVisibilityPolling } from "@/hooks/use-visibility-polling";
-import { DesktopStream } from "@/components/desktop-stream";
-import { NewMissionDialog } from "@/components/new-mission-dialog";
 import {
   MissionSwitcher,
   normalizeMetadataText,
 } from "@/components/mission-switcher";
-import { WorkerPanel } from "@/components/worker-panel";
 import { WorkersStrip } from "@/components/workers-strip";
-import {
-  SubagentsPanel,
-  type SubagentEntry,
-} from "@/components/subagents-panel";
+import type { SubagentEntry } from "@/components/subagents-panel";
 import { RelativeTime } from "@/components/ui/relative-time";
+
+const DesktopStream = dynamic(() =>
+  import("@/components/desktop-stream").then((m) => m.DesktopStream),
+);
+const MissionAutomationsDialog = dynamic(() =>
+  import("@/components/mission-automations-dialog").then(
+    (m) => m.MissionAutomationsDialog,
+  ),
+);
+const MissionDebugStats = dynamic(() =>
+  import("./MissionDebugStats").then((m) => m.MissionDebugStats),
+);
+const NewMissionDialog = dynamic(() =>
+  import("@/components/new-mission-dialog").then((m) => m.NewMissionDialog),
+);
+const PerfOverlay = dynamic(() =>
+  import("@/components/perf-overlay").then((m) => m.PerfOverlay),
+);
+const SubagentsPanel = dynamic(() =>
+  import("@/components/subagents-panel").then((m) => m.SubagentsPanel),
+);
+const WorkerPanel = dynamic(() =>
+  import("@/components/worker-panel").then((m) => m.WorkerPanel),
+);
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
@@ -2191,7 +2207,7 @@ const ThinkingPanel = memo(function ThinkingPanel({
               <button
                 type="button"
                 onClick={() => scrollThoughtsToBottom()}
-                className="absolute bottom-3 right-3 inline-flex items-center gap-2 rounded-full border border-white/[0.1] bg-black/70 px-3 py-2 text-xs font-medium text-white/65 shadow-lg backdrop-blur transition-all hover:bg-white/[0.1] hover:text-white/90"
+                className="absolute bottom-3 right-3 inline-flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/90 px-3 py-2 text-xs font-medium text-slate-700 shadow-lg backdrop-blur transition-all hover:bg-white hover:text-slate-950 dark:border-white/[0.1] dark:bg-black/70 dark:text-white/65 dark:hover:bg-white/[0.1] dark:hover:text-white/90"
                 title="Scroll to bottom"
               >
                 <ArrowDown className="h-4 w-4" />
@@ -3838,6 +3854,7 @@ function AttachmentPreview({
 export default function ControlClient() {
   const searchParams = useSearchParams();
   const router = useRouter();
+  const showPerfOverlay = searchParams.get("debug") === "perf";
 
   const [items, setItems] = useControlItemsStore();
   const itemsRef = useRef<ChatItem[]>([]);
@@ -9389,7 +9406,7 @@ export default function ControlClient() {
 
         {/* Opt-in perf overlay — `?debug=perf` only. Mounts no work in normal
           sessions; the bus and observer self-disable when the flag is off. */}
-        <PerfOverlay />
+        {showPerfOverlay && <PerfOverlay />}
 
         {/* Hidden file input */}
         <input
@@ -9417,20 +9434,22 @@ export default function ControlClient() {
           onRefresh={refreshRecentMissions}
         />
 
-        <MissionAutomationsDialog
-          open={showAutomationsDialog}
-          missionId={activeMission?.id ?? null}
-          missionLabel={
-            activeMission
-              ? activeWorkspaceLabel
-                ? `${activeWorkspaceLabel} · ${activeMission.title?.trim() || getMissionShortName(activeMission.id)}`
-                : activeMission.title?.trim() ||
-                  getMissionShortName(activeMission.id)
-              : null
-          }
-          missionBackend={activeMission?.backend ?? null}
-          onClose={() => setShowAutomationsDialog(false)}
-        />
+        {showAutomationsDialog && (
+          <MissionAutomationsDialog
+            open={showAutomationsDialog}
+            missionId={activeMission?.id ?? null}
+            missionLabel={
+              activeMission
+                ? activeWorkspaceLabel
+                  ? `${activeWorkspaceLabel} · ${activeMission.title?.trim() || getMissionShortName(activeMission.id)}`
+                  : activeMission.title?.trim() ||
+                    getMissionShortName(activeMission.id)
+                : null
+            }
+            missionBackend={activeMission?.backend ?? null}
+            onClose={() => setShowAutomationsDialog(false)}
+          />
+        )}
 
         {/* Header */}
         <div className="relative z-10 mb-6 flex items-center justify-between gap-2 lg:gap-4">
@@ -10559,7 +10578,7 @@ export default function ControlClient() {
             {!isAtBottom && items.length > 0 && (
               <button
                 onClick={() => scrollToBottom()}
-                className="absolute bottom-20 right-6 inline-flex items-center gap-2 rounded-full border border-white/[0.1] bg-black/70 px-3 py-2 text-xs font-medium text-white/65 shadow-lg backdrop-blur transition-all hover:bg-white/[0.1] hover:text-white/90"
+                className="absolute bottom-20 right-6 inline-flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/90 px-3 py-2 text-xs font-medium text-slate-700 shadow-lg backdrop-blur transition-all hover:bg-white hover:text-slate-950 dark:border-white/[0.1] dark:bg-black/70 dark:text-white/65 dark:hover:bg-white/[0.1] dark:hover:text-white/90"
                 title="Scroll to bottom"
               >
                 <ArrowDown className="h-4 w-4" />
