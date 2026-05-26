@@ -8,6 +8,21 @@ async function mountThemeFixture(page: import("@playwright/test").Page) {
       <div class="panel" data-testid="panel">
         <p class="muted-text" data-testid="muted">Muted text</p>
         <button class="icon-button" data-testid="icon-button">Button</button>
+        <div class="panel" data-testid="toast">
+          <strong>Toast</strong>
+          <p class="muted-text">Notification body</p>
+        </div>
+        <div class="panel" data-testid="provider-card">
+          <strong>Provider settings</strong>
+          <button class="icon-button" data-testid="provider-test-button">Test connection</button>
+        </div>
+        <div class="panel" data-testid="config-editor">
+          <pre class="code-block"><code>{ "backend": "opencode" }</code></pre>
+        </div>
+        <div class="prose-glass panel" data-testid="rich-preview">
+          <p>Rich markdown preview <code class="code-inline text-xs font-mono">inline_token</code></p>
+          <pre class="code-block"><code>fenced block</code></pre>
+        </div>
         <p class="prose-glass">
           <code class="code-inline text-xs font-mono" data-testid="inline-code">sell_fee_split_spec</code>
         </p>
@@ -32,6 +47,22 @@ async function forceTheme(page: import("@playwright/test").Page, theme: "dark" |
     localStorage.setItem("sandboxed-theme", nextTheme);
   }, theme);
   await page.emulateMedia({ colorScheme: theme });
+  await page.goto("/");
+  await page.evaluate((nextTheme) => {
+    document.documentElement.dataset.theme = nextTheme;
+  }, theme);
+  await mountThemeFixture(page);
+}
+
+async function forceThemeAgainstSystemPreference(
+  page: import("@playwright/test").Page,
+  theme: "dark" | "light"
+) {
+  const opposite = theme === "light" ? "dark" : "light";
+  await page.addInitScript((nextTheme) => {
+    localStorage.setItem("sandboxed-theme", nextTheme);
+  }, theme);
+  await page.emulateMedia({ colorScheme: opposite });
   await page.goto("/");
   await page.evaluate((nextTheme) => {
     document.documentElement.dataset.theme = nextTheme;
@@ -68,7 +99,7 @@ test("markdown code uses readable semantic colors in dark theme", async ({ page 
 });
 
 test("semantic components switch to light theme via data-theme", async ({ page }) => {
-  await forceTheme(page, "light");
+  await forceThemeAgainstSystemPreference(page, "light");
 
   const inline = page.getByTestId("inline-code");
   const inlineBg = parseRgb(await inline.evaluate((el) => getComputedStyle(el).backgroundColor));
@@ -82,10 +113,32 @@ test("semantic components switch to light theme via data-theme", async ({ page }
   const rowText = parseRgb(
     await page.getByTestId("mission-row").evaluate((el) => getComputedStyle(el).color)
   );
+  const toastBg = parseRgb(
+    await page.getByTestId("toast").evaluate((el) => getComputedStyle(el).backgroundColor)
+  );
+  const providerBg = parseRgb(
+    await page.getByTestId("provider-card").evaluate((el) => getComputedStyle(el).backgroundColor)
+  );
+  const configBg = parseRgb(
+    await page
+      .getByTestId("config-editor")
+      .locator(".code-block")
+      .evaluate((el) => getComputedStyle(el).backgroundColor)
+  );
+  const richInlineBg = parseRgb(
+    await page
+      .getByTestId("rich-preview")
+      .locator(".code-inline")
+      .evaluate((el) => getComputedStyle(el).backgroundColor)
+  );
 
   expect(inlineBg[0]).toBeGreaterThan(200);
   expect(inlineBg[1]).toBeGreaterThan(210);
   expect(inlineText[2]).toBeLessThan(160);
+  for (const color of [toastBg, providerBg, configBg, richInlineBg]) {
+    expect(color[0]).toBeGreaterThan(200);
+    expect(color[1]).toBeGreaterThan(210);
+  }
   for (const color of [userText, triggerText, rowText]) {
     expect(color[0]).toBeLessThan(90);
     expect(color[1]).toBeLessThan(90);
