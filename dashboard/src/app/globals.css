@@ -56,6 +56,10 @@
   --code-foreground: 220 224 232;
   --code-inline-background: 255 255 255;
   --code-inline-foreground: 165 180 252;
+
+  /* Brand mark */
+  --brand-logo-background: 18 18 20;
+  --brand-logo-mark: 129 140 248;
 }
 
 @media (prefers-color-scheme: light) {
@@ -83,6 +87,10 @@
     --code-foreground: 31 41 55;
     --code-inline-background: 224 231 255;
     --code-inline-foreground: 49 46 129;
+
+    /* Brand mark */
+    --brand-logo-background: 238 242 255;
+    --brand-logo-mark: 30 64 175;
   }
 }
 
@@ -305,8 +313,20 @@ select:focus-visible {
     color: rgb(4 120 87);
   }
 
+  [class~="text-emerald-300"],
+  [class~="text-emerald-300/80"],
+  [class~="text-emerald-300/70"],
+  [class~="text-emerald-300/60"] {
+    color: rgb(6 95 70 / 0.95);
+  }
+
   [class~="text-emerald-400/70"] {
     color: rgb(4 120 87 / 0.9);
+  }
+
+  [class~="text-emerald-400/80"],
+  [class~="text-emerald-400/60"] {
+    color: rgb(4 120 87 / 0.88);
   }
 
   [class~="text-amber-400"] {

@@ -9208,6 +9208,20 @@ export default function ControlClient() {
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
     : null;
+  const faviconStatus = useMemo<MissionStatus | null>(() => {
+    if (!activeMission) return null;
+    if (viewingMissionIsRunning) return activeMission.status;
+
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item.kind === "user") break;
+      if (item.kind === "assistant") {
+        return item.success ? "completed" : activeMission.status;
+      }
+    }
+
+    return activeMission.status;
+  }, [activeMission, items, viewingMissionIsRunning]);
 
   useEffect(() => {
     if (!editingMissionTitle) {
@@ -9266,7 +9280,7 @@ export default function ControlClient() {
   ]);
 
   // Update favicon with mission status dot
-  useFaviconStatus(activeMission?.status ?? null, viewingMissionIsRunning);
+  useFaviconStatus(faviconStatus, viewingMissionIsRunning);
 
   useEffect(() => {
     document.title = formatMissionDocumentTitle(activeMission);

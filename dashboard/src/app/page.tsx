@@ -36,6 +36,8 @@ import {
   Ban,
   Inbox,
   ArrowRight,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import { cn, formatCents } from '@/lib/utils';
 import { NewMissionDialog } from '@/components/new-mission-dialog';
@@ -80,22 +82,34 @@ function CompactStatusIcon({
 function CompactMissionCard({
   mission,
   isBoss,
+  workers,
+  workersExpanded,
   isRunningForDisplay,
   isActuallyRunning,
+  runningMissionIds,
+  automationMissionIds,
   onCancel,
   onResume,
   onDelete,
+  onToggleWorkers,
 }: {
   mission: Mission;
   isBoss: boolean;
+  workers?: Mission[];
+  workersExpanded?: boolean;
   isRunningForDisplay: boolean;
   isActuallyRunning: boolean;
+  runningMissionIds: Set<string>;
+  automationMissionIds: Set<string>;
   onCancel: (id: string) => void;
   onResume: (id: string) => void;
   onDelete: (id: string) => void;
+  onToggleWorkers?: (id: string) => void;
 }) {
   const color = getMissionTextColor(mission.status, isRunningForDisplay);
   const title = getMissionTitle(mission);
+  const groupedWorkers = workers ?? [];
+  const hasWorkers = groupedWorkers.length > 0;
   const isResumable = !isRunningForDisplay && mission.resumable &&
     (mission.status === 'interrupted' || mission.status === 'blocked' || mission.status === 'failed' ||
       mission.status === 'awaiting_user' || mission.status === 'acknowledged');
@@ -127,6 +141,22 @@ function CompactMissionCard({
           <span className="shrink-0 rounded bg-violet-500/10 border border-violet-500/20 px-1 py-0.5 text-[8px] font-medium text-violet-400">
             B
           </span>
+        )}
+        {hasWorkers && (
+          <button
+            type="button"
+            onClick={() => onToggleWorkers?.(mission.id)}
+            aria-label={workersExpanded ? 'Collapse workers' : 'Expand workers'}
+            aria-expanded={workersExpanded}
+            className="shrink-0 rounded p-0.5 text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/70"
+            title={`${groupedWorkers.length} worker${groupedWorkers.length === 1 ? '' : 's'}`}
+          >
+            {workersExpanded ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+          </button>
         )}
         {mission.parent_mission_id && (
           <span className="shrink-0 rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400">
@@ -173,6 +203,70 @@ function CompactMissionCard({
           )}
         </div>
       </div>
+      {hasWorkers && (
+        <div className="mt-2 border-t border-white/[0.04] pt-1.5">
+          <button
+            type="button"
+            onClick={() => onToggleWorkers?.(mission.id)}
+            className="flex w-full items-center justify-between rounded px-1 py-0.5 text-[9px] text-white/35 transition-colors hover:bg-white/[0.03] hover:text-white/55"
+          >
+            <span className="tabular-nums">
+              {groupedWorkers.length} worker{groupedWorkers.length === 1 ? '' : 's'}
+            </span>
+            <span className="flex items-center gap-1">
+              {groupedWorkers.slice(0, 6).map((worker) => {
+                const workerRunning =
+                  runningMissionIds.has(worker.id) || automationMissionIds.has(worker.id);
+                return (
+                  <CompactStatusIcon
+                    key={worker.id}
+                    status={worker.status}
+                    isRunning={workerRunning}
+                    className={cn(
+                      'h-2.5 w-2.5',
+                      getMissionTextColor(worker.status, workerRunning),
+                      workerRunning && 'animate-spin'
+                    )}
+                  />
+                );
+              })}
+              {groupedWorkers.length > 6 && (
+                <span className="tabular-nums">+{groupedWorkers.length - 6}</span>
+              )}
+            </span>
+          </button>
+          {workersExpanded && (
+            <div className="mt-1 space-y-1">
+              {groupedWorkers.map((worker) => {
+                const workerRunning =
+                  runningMissionIds.has(worker.id) || automationMissionIds.has(worker.id);
+                return (
+                  <Link
+                    key={worker.id}
+                    href={`/control?mission=${worker.id}`}
+                    className="flex items-center gap-1.5 rounded px-1.5 py-1 text-[10px] text-white/50 transition-colors hover:bg-white/[0.04] hover:text-white/75"
+                    title={getMissionTitle(worker)}
+                  >
+                    <CompactStatusIcon
+                      status={worker.status}
+                      isRunning={workerRunning}
+                      className={cn(
+                        'h-3 w-3 shrink-0',
+                        getMissionTextColor(worker.status, workerRunning),
+                        workerRunning && 'animate-spin'
+                      )}
+                    />
+                    <span className="min-w-0 flex-1 truncate">{getMissionTitle(worker)}</span>
+                    <span className="rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400">
+                      W
+                    </span>
+                  </Link>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -292,6 +386,7 @@ function OverviewPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [creatingMission, setCreatingMission] = useState(false);
+  const [expandedBossIds, setExpandedBossIds] = useState<Set<string>>(() => new Set());
   const hasShownErrorRef = useRef(false);
 
   // Check if we should auto-open the new mission dialog (e.g., from workspaces page)
@@ -392,10 +487,47 @@ function OverviewPageContent() {
     return ids;
   }, [missions]);
 
+  const missionIds = useMemo(() => new Set(missions.map((mission) => mission.id)), [missions]);
+
+  const workersByBossId = useMemo(() => {
+    const map = new Map<string, Mission[]>();
+    for (const mission of missions) {
+      if (!mission.parent_mission_id) continue;
+      if (!missionIds.has(mission.parent_mission_id)) continue;
+      const workers = map.get(mission.parent_mission_id) ?? [];
+      workers.push(mission);
+      map.set(mission.parent_mission_id, workers);
+    }
+    for (const workers of map.values()) {
+      workers.sort(
+        (a, b) =>
+          new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+      );
+    }
+    return map;
+  }, [missions, missionIds]);
+
+  const visibleCategorized = useMemo(() => {
+    const result: Record<MissionCategory, Mission[]> = {
+      running: [],
+      'needs-you': [],
+      finished: [],
+      other: [],
+    };
+
+    for (const category of Object.keys(result) as MissionCategory[]) {
+      result[category] = categorized[category].filter(
+        (mission) => !mission.parent_mission_id || !missionIds.has(mission.parent_mission_id)
+      );
+    }
+
+    return result;
+  }, [categorized, missionIds]);
+
   // Build column data for display
   const columnData = useMemo(() => {
     return columns.map((col) => {
-      const colMissions = categorized[col.id]
+      const colMissions = visibleCategorized[col.id]
         .sort(
           (a, b) =>
             new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
@@ -403,7 +535,7 @@ function OverviewPageContent() {
         .slice(0, col.id === 'finished' ? 8 : 10);
       return { ...col, missions: colMissions };
     });
-  }, [categorized]);
+  }, [visibleCategorized]);
 
   const isActive = (stats?.active_tasks ?? 0) > 0;
 
@@ -448,6 +580,18 @@ function OverviewPageContent() {
     },
     [mutateMissions]
   );
+
+  const handleToggleWorkers = useCallback((bossId: string) => {
+    setExpandedBossIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(bossId)) {
+        next.delete(bossId);
+      } else {
+        next.add(bossId);
+      }
+      return next;
+    });
+  }, []);
 
   const handleNewMission = useCallback(
     async (options?: { workspaceId?: string; agent?: string; modelOverride?: string; modelEffort?: ModelEffort; configProfile?: string | null; backend?: string; openInNewTab?: boolean }) => {
@@ -541,14 +685,19 @@ function OverviewPageContent() {
                         key={mission.id}
                         mission={mission}
                         isBoss={bossMissionIds.has(mission.id)}
+                        workers={workersByBossId.get(mission.id)}
+                        workersExpanded={expandedBossIds.has(mission.id)}
                         isRunningForDisplay={
                           runningMissionIds.has(mission.id) ||
                           automationMissionIds.has(mission.id)
                         }
                         isActuallyRunning={runningMissionIds.has(mission.id)}
+                        runningMissionIds={runningMissionIds}
+                        automationMissionIds={automationMissionIds}
                         onCancel={handleCancel}
                         onResume={handleResume}
                         onDelete={handleDelete}
+                        onToggleWorkers={handleToggleWorkers}
                       />
                     ))
                   )}
