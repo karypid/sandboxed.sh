@@ -348,6 +348,10 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     let codex_info = get_codex_info().await;
     components.push(codex_info);
 
+    // Grok Build
+    let grok_info = get_grok_info().await;
+    components.push(grok_info);
+
     // oh-my-opencode
     let omo_info = get_oh_my_opencode_info().await;
     components.push(omo_info);
@@ -356,7 +360,7 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
 }
 
 /// Components that support per-workspace installations. Order is preserved in the response.
-const PER_WORKSPACE_COMPONENTS: &[&str] = &["opencode", "claude_code", "codex"];
+const PER_WORKSPACE_COMPONENTS: &[&str] = &["opencode", "claude_code", "codex", "grok"];
 
 /// Get per-workspace version info for each component. Container workspaces are probed via nspawn
 /// in parallel with a per-probe timeout to keep the page responsive.
@@ -541,6 +545,7 @@ fn component_binary_name(component: &str) -> Option<&'static str> {
         "opencode" => Some("opencode"),
         "claude_code" => Some("claude"),
         "codex" => Some("codex"),
+        "grok" => Some("grok"),
         _ => None,
     }
 }
@@ -694,6 +699,42 @@ async fn get_codex_info() -> ComponentInfo {
     }
 }
 
+/// Get Grok Build CLI version and status.
+async fn get_grok_info() -> ComponentInfo {
+    match Command::new("grok").arg("--version").output().await {
+        Ok(output) if output.status.success() => {
+            let mut version_str = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                if !version_str.is_empty() {
+                    version_str.push(' ');
+                }
+                version_str.push_str(stderr.trim());
+            }
+            let version = extract_version_token(&version_str);
+
+            ComponentInfo {
+                name: "grok".to_string(),
+                version,
+                installed: true,
+                update_available: None,
+                path: which_grok().await,
+                source_path: None,
+                status: ComponentStatus::Ok,
+            }
+        }
+        _ => ComponentInfo {
+            name: "grok".to_string(),
+            version: None,
+            installed: false,
+            update_available: None,
+            path: None,
+            source_path: None,
+            status: ComponentStatus::NotInstalled,
+        },
+    }
+}
+
 /// Find the path to a CLI binary.
 /// Checks `which` first (respects the user's PATH), then explicit fallback paths.
 async fn which_binary(name: &str, fallback_paths: &[&str]) -> Option<String> {
@@ -721,6 +762,11 @@ async fn which_claude_code() -> Option<String> {
 /// Find the path to the Codex binary.
 async fn which_codex() -> Option<String> {
     which_binary("codex", &["/usr/local/bin/codex"]).await
+}
+
+/// Find the path to the Grok Build binary.
+async fn which_grok() -> Option<String> {
+    which_binary("grok", &["/usr/local/bin/grok"]).await
 }
 
 /// Find the path to the OpenCode binary.
@@ -1093,6 +1139,7 @@ fn host_update_stream(
         "opencode" => Ok(Sse::new(Box::pin(stream_opencode_update()))),
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_update()))),
         "codex" => Ok(Sse::new(Box::pin(stream_codex_update()))),
+        "grok" => Ok(Sse::new(Box::pin(stream_grok_update()))),
         "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_update()))),
         other => Err((
             StatusCode::BAD_REQUEST,
@@ -1171,6 +1218,9 @@ fn container_install_command(component: &str) -> Option<String> {
         "opencode" => Some(
             "curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path".to_string(),
         ),
+        "grok" => Some(
+            "curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash".to_string(),
+        ),
         _ => None,
     }
 }
@@ -1188,6 +1238,7 @@ async fn uninstall_component(
         "opencode" => Ok(Sse::new(Box::pin(stream_opencode_uninstall()))),
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_uninstall()))),
         "codex" => Ok(Sse::new(Box::pin(stream_codex_uninstall()))),
+        "grok" => Ok(Sse::new(Box::pin(stream_grok_uninstall()))),
         "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_uninstall()))),
         _ => Err((
             StatusCode::BAD_REQUEST,
@@ -2176,6 +2227,78 @@ fn stream_codex_update() -> impl Stream<Item = Result<Event, std::convert::Infal
 /// Stream the Codex uninstall process.
 fn stream_codex_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     stream_package_uninstall("@openai/codex", ".codex", "Codex")
+}
+
+/// Stream the Grok Build install/update process.
+fn stream_grok_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        yield sse("log", "Starting Grok Build installation/update...", Some(0));
+
+        match Command::new("bash")
+            .args(["-lc", "curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash"])
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                yield sse("log", "Installation complete, verifying...", Some(80));
+
+                let version = Command::new("grok").arg("--version").output().await
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| {
+                        let combined = format!(
+                            "{} {}",
+                            String::from_utf8_lossy(&o.stdout),
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                        extract_version_token(&combined)
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                if version != "unknown" {
+                    yield sse("complete", format!("Grok Build installed successfully! Version: {version}"), Some(100));
+                } else {
+                    yield sse("complete", "Grok Build installed, but version check failed. You may need to restart your shell.", Some(100));
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                yield sse("error", format!("Failed to install Grok Build: {} {}", stderr.trim(), stdout.trim()), None);
+            }
+            Err(e) => {
+                yield sse("error", format!("Failed to run Grok Build installer: {}", e), None);
+            }
+        }
+    }
+}
+
+/// Stream the Grok Build uninstall process.
+fn stream_grok_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        yield sse("log", "Starting Grok Build uninstall...", Some(0));
+
+        for path in ["/usr/local/bin/grok", "/usr/bin/grok"] {
+            if std::path::Path::new(path).exists() {
+                match Command::new("rm").args(["-f", path]).output().await {
+                    Ok(output) if output.status.success() => {
+                        yield sse("log", format!("Removed {path}"), Some(60));
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        yield sse("error", format!("Failed to remove {path}: {}", stderr.trim()), None);
+                        return;
+                    }
+                    Err(e) => {
+                        yield sse("error", format!("Failed to remove {path}: {}", e), None);
+                        return;
+                    }
+                }
+            }
+        }
+
+        yield sse("complete", "Grok Build uninstalled successfully.", Some(100));
+    }
 }
 
 /// Stream the oh-my-opencode update process.

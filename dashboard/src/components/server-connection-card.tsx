@@ -378,6 +378,7 @@ export function ServerConnectionCard({
                     if (components.some((c) => c.name === 'opencode' && c.installed)) backends.push('OpenCode');
                     if (components.some((c) => c.name === 'claude_code' && c.installed)) backends.push('Claude Code');
                     if (components.some((c) => c.name === 'codex' && c.installed)) backends.push('Codex');
+                    if (components.some((c) => c.name === 'grok' && c.installed)) backends.push('Grok Build');
                     return backends.length > 0 ? `${backends.join(' + ')} stack` : 'No backends';
                   })()
                 : 'Loading...'}
