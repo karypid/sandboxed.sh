@@ -7,75 +7,77 @@ import { cn } from '@/lib/utils';
 import { getCurrentMission, type Mission } from '@/lib/api';
 import { BrainLogo } from '@/components/icons';
 import {
-  LayoutDashboard,
-  MessageSquare,
-  Terminal,
-  Settings,
-  Loader,
-  CheckCircle,
-  XCircle,
   ChevronDown,
-  Plug,
-  FileCode,
-  Server,
-  Search,
-  Wrench,
-  LayoutGrid,
-  Library,
-  Cog,
-  Key,
-  Archive,
-  Activity,
-  Cpu,
-  Lock,
-  GitBranch,
-  Sparkles,
-  MessageCircle,
 } from 'lucide-react';
+import {
+  Archive,
+  ChatCircleText,
+  CheckCircle,
+  CirclesFour,
+  CircleNotch,
+  Cpu,
+  GearSix,
+  GitBranch,
+  Key,
+  Layout,
+  Lightning,
+  Lock,
+  MagnifyingGlass,
+  Plugs,
+  Pulse,
+  Robot,
+  SidebarSimple,
+  Sparkle,
+  TerminalWindow,
+  Toolbox,
+  TreeStructure,
+  XCircle,
+  type Icon,
+} from '@phosphor-icons/react';
 
 type NavItem = {
   name: string;
   href: string;
-  icon: React.ComponentType<{ className?: string }>;
-  children?: { name: string; href: string; icon: React.ComponentType<{ className?: string }> }[];
+  icon: Icon;
+  children?: { name: string; href: string; icon: Icon }[];
 };
 
 const navigation: NavItem[] = [
-  { name: 'Overview', href: '/', icon: LayoutDashboard },
-  { name: 'Mission', href: '/control', icon: MessageSquare },
-  { name: 'Workspaces', href: '/workspaces', icon: Server },
-  { name: 'Console', href: '/console', icon: Terminal },
+  { name: 'Overview', href: '/', icon: Layout },
+  { name: 'Mission', href: '/control', icon: ChatCircleText },
+  { name: 'Workspaces', href: '/workspaces', icon: SidebarSimple },
+  { name: 'Console', href: '/console', icon: TerminalWindow },
   { name: 'Routing', href: '/model-routing', icon: GitBranch },
   {
     name: 'Library',
     href: '/config',
-    icon: Library,
+    icon: TreeStructure,
     children: [
-      { name: 'Commands', href: '/config/commands', icon: Terminal },
-      { name: 'Skills', href: '/config/skills', icon: FileCode },
-      { name: 'Workspaces', href: '/config/workspace-templates', icon: LayoutGrid },
-      { name: 'Profiles', href: '/config/settings', icon: Cog },
+      { name: 'Commands', href: '/config/commands', icon: TerminalWindow },
+      { name: 'Skills', href: '/config/skills', icon: Lightning },
+      { name: 'Workspaces', href: '/config/workspace-templates', icon: CirclesFour },
+      { name: 'Profiles', href: '/config/settings', icon: GearSix },
     ],
   },
   {
     name: 'Inspect',
     href: '/inspect',
-    icon: Search,
+    icon: MagnifyingGlass,
     children: [
-      { name: 'System', href: '/inspect/system', icon: Activity },
-      { name: 'MCPs', href: '/inspect/mcps', icon: Plug },
-      { name: 'Tools', href: '/inspect/tools', icon: Wrench },
+      { name: 'System', href: '/inspect/system', icon: Pulse },
+      { name: 'MCPs', href: '/inspect/mcps', icon: Plugs },
+      { name: 'Tools', href: '/inspect/tools', icon: Toolbox },
     ],
   },
   {
     name: 'Settings',
     href: '/settings',
-    icon: Settings,
+    icon: GearSix,
     children: [
       { name: 'Backends', href: '/settings/backends', icon: Cpu },
       { name: 'Providers', href: '/settings/providers', icon: Key },
-      { name: 'LLM', href: '/settings/llm', icon: Sparkles },
-      { name: 'Telegram', href: '/settings/telegram', icon: MessageCircle },
+      { name: 'LLM', href: '/settings/llm', icon: Sparkle },
+      { name: 'Telegram', href: '/settings/telegram', icon: Robot },
       { name: 'Security', href: '/settings/secrets', icon: Lock },
       { name: 'Data', href: '/settings/data', icon: Archive },
     ],
@@ -140,8 +142,8 @@ export const Sidebar = memo(function Sidebar() {
   }, []);
 
   const isActive = currentMission?.status === 'active';
-  const StatusIcon = isActive 
-    ? Loader 
+  const StatusIcon = isActive
+    ? CircleNotch
     : currentMission?.status === 'completed' 
       ? CheckCircle 
       : currentMission?.status === 'failed' 

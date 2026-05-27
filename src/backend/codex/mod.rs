@@ -245,7 +245,10 @@ async fn send_message_streaming_app_server(
 
     // Initialize handshake — without `experimentalApi: true`, every
     // thread/goal/* RPC is rejected.
-    if let Err(e) = session_arc.initialize("sandboxed-sh", "1.2.0").await {
+    if let Err(e) = session_arc
+        .initialize("sandboxed-sh", env!("CARGO_PKG_VERSION"))
+        .await
+    {
         let _ = session_arc.shutdown().await;
         return Err(anyhow::anyhow!("codex app-server initialize failed: {}", e));
     }
@@ -514,7 +517,10 @@ async fn send_message_streaming_app_server(
                     break 'outer;
                 }
             };
-            if let Err(e) = new_session.initialize("sandboxed-sh", "1.2.0").await {
+            if let Err(e) = new_session
+                .initialize("sandboxed-sh", env!("CARGO_PKG_VERSION"))
+                .await
+            {
                 tracing::error!("codex app-server reconnect: initialize failed: {}", e);
                 stream_closed_unexpectedly = true;
                 break 'outer;
