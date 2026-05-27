@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import useSWR from 'swr';
-import { CheckCircle, XCircle, Loader, DollarSign, Activity, Hand } from 'lucide-react';
+import { CheckCircle, XCircle, Loader, DollarSign, Activity, Hand, BarChart3 } from 'lucide-react';
 import { getStats, type Mission, type StatsResponse } from '@/lib/api';
 import { formatCents, cn } from '@/lib/utils';
 import { stableJsonCompare } from '@/lib/swr-config';
@@ -36,10 +36,14 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
   const activeCount = runningMissionIds.size;
   const needsAttention = missions.filter((m) => m.status === 'awaiting_user').length;
 
-  const updatedLast24h = missions.filter((m) => {
-    const ts = new Date(m.updated_at).getTime();
-    return Number.isFinite(ts) && ts >= cutoff;
-  });
+  const updatedLast24h = useMemo(
+    () =>
+      missions.filter((m) => {
+        const ts = new Date(m.updated_at).getTime();
+        return Number.isFinite(ts) && ts >= cutoff;
+      }),
+    [missions, cutoff],
+  );
   const finishedLast24h = updatedLast24h.filter((m) =>
     m.status === 'completed' || m.status === 'acknowledged',
   ).length;
@@ -50,13 +54,23 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
   const completed = dayStats?.completed_tasks ?? finishedLast24h;
   const failed = dayStats?.failed_tasks ?? failedLast24h;
   const spent = dayStats?.total_cost_cents ?? 0;
+  const totalOutcomes = Math.max(completed + failed, 1);
+  const completedPct = (completed / totalOutcomes) * 100;
+  const failedPct = (failed / totalOutcomes) * 100;
+  const hourlyBuckets = useMemo(
+    () => buildHourlyBuckets(updatedLast24h, cutoff),
+    [updatedLast24h, cutoff],
+  );
 
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex items-baseline justify-between">
-        <h2 className="text-sm font-medium text-white/80">Last 24 hours</h2>
-        <span className="text-[10px] uppercase tracking-wider text-white/30">
-          rolling
+    <div className="flex flex-col gap-3.5">
+      <div className="flex items-start justify-between">
+        <div>
+          <h2 className="text-sm font-medium text-white/80">Last 24 hours</h2>
+          <p className="mt-0.5 text-[11px] text-white/35">Rolling mission activity</p>
+        </div>
+        <span className="rounded-md border border-white/[0.06] bg-white/[0.03] px-1.5 py-1 text-[9px] font-medium uppercase tracking-wider text-white/35">
+          Live
         </span>
       </div>
 
@@ -91,34 +105,43 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
         />
       </div>
 
-      <div className="rounded-md border border-white/[0.06] bg-white/[0.02] px-3 py-2.5">
-        <div className="flex items-center justify-between text-xs">
-          <div className="flex items-center gap-2 text-white/60">
-            <Hand
-              className={cn(
-                'h-3.5 w-3.5',
-                needsAttention > 0 ? 'text-amber-400' : 'text-white/30',
-              )}
-            />
-            <span>Needs you</span>
+      <div className="rounded-xl border border-white/[0.06] bg-white/[0.025] p-3">
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-2 text-xs font-medium text-white/65">
+            <BarChart3 className="h-3.5 w-3.5 text-indigo-300/70" />
+            <span>Activity shape</span>
           </div>
-          <span
-            className={cn(
-              'tabular-nums text-sm font-medium',
-              needsAttention > 0 ? 'text-amber-300' : 'text-white/40',
-            )}
-          >
-            {needsAttention}
+          <span className="text-[10px] tabular-nums text-white/35">
+            {updatedLast24h.length} updated
           </span>
         </div>
-        <div className="mt-2 flex items-center justify-between text-xs">
-          <div className="flex items-center gap-2 text-white/60">
-            <Activity className="h-3.5 w-3.5 text-white/30" />
-            <span>Total updated</span>
-          </div>
-          <span className="tabular-nums text-sm font-medium text-white/70">
-            {updatedLast24h.length}
+        <HourlyActivityChart buckets={hourlyBuckets} />
+        <div className="mt-2 flex items-center justify-between text-[10px] text-white/30">
+          <span>24h ago</span>
+          <span>now</span>
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-white/[0.06] bg-white/[0.025] p-3">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-white/65">Outcome mix</span>
+          <span className="text-[10px] tabular-nums text-white/35">
+            {completed + failed} terminal
           </span>
+        </div>
+        <div className="mt-3 flex h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+          <div
+            className="bg-indigo-300/70"
+            style={{ width: `${completedPct}%` }}
+          />
+          <div
+            className="bg-red-300/55"
+            style={{ width: `${failedPct}%` }}
+          />
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <MetricRow icon={Hand} label="Needs you" value={needsAttention} attention={needsAttention > 0} />
+          <MetricRow icon={Activity} label="Updated" value={updatedLast24h.length} />
         </div>
       </div>
     </div>
@@ -141,34 +164,88 @@ function SummaryTile({
   live?: boolean;
 }) {
   const toneIcon = {
-    emerald: 'text-emerald-400',
-    red: 'text-red-400',
-    indigo: 'text-indigo-400',
+    emerald: 'text-indigo-300/75',
+    red: 'text-red-300/70',
+    indigo: 'text-indigo-300/75',
     muted: 'text-white/40',
   }[tone];
 
   const toneValue = {
     emerald: 'text-white',
-    red: 'text-red-300',
-    indigo: 'text-indigo-300',
+    red: 'text-white',
+    indigo: 'text-white',
     muted: 'text-white/80',
   }[tone];
 
   return (
-    <div className="rounded-md border border-white/[0.06] bg-white/[0.02] px-3 py-2.5">
-      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-white/40">
-        <Icon className={cn('h-3 w-3', toneIcon, live && 'animate-spin')} />
+    <div className="rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2.5">
+      <div className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-white/40">
+        <span className="flex h-5 w-5 items-center justify-center rounded-md bg-white/[0.04]">
+          <Icon className={cn('h-3 w-3', toneIcon, live && 'animate-spin')} />
+        </span>
         <span>{label}</span>
       </div>
       <div
         className={cn(
-          'mt-1.5 text-lg font-semibold tabular-nums leading-none',
+          'mt-2 text-xl font-light tabular-nums leading-none tracking-normal',
           toneValue,
           loading && 'opacity-50',
         )}
       >
         {value}
       </div>
+    </div>
+  );
+}
+
+function MetricRow({
+  icon: Icon,
+  label,
+  value,
+  attention,
+}: {
+  icon: typeof Hand;
+  label: string;
+  value: number;
+  attention?: boolean;
+}) {
+  return (
+    <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] px-2.5 py-2">
+      <div className="flex items-center gap-1.5 text-[10px] text-white/40">
+        <Icon className={cn('h-3 w-3', attention ? 'text-amber-300/80' : 'text-white/35')} />
+        <span>{label}</span>
+      </div>
+      <div className={cn('mt-1 text-sm font-medium tabular-nums', attention ? 'text-amber-200/90' : 'text-white/75')}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function HourlyActivityChart({ buckets }: { buckets: number[] }) {
+  const max = Math.max(...buckets, 1);
+  return (
+    <div className="flex h-16 items-end gap-1" aria-label="Mission updates by hour">
+      {buckets.map((count, index) => {
+        const height = count === 0 ? 4 : Math.max(8, Math.round((count / max) * 54));
+        return (
+          <div
+            key={index}
+            className="flex min-w-0 flex-1 items-end"
+            title={`${count} update${count === 1 ? '' : 's'}`}
+          >
+            <div
+              className={cn(
+                'w-full rounded-t-sm border border-white/[0.04] transition-colors',
+                count > 0
+                  ? 'bg-indigo-300/55 hover:bg-indigo-300/75'
+                  : 'bg-white/[0.045]',
+              )}
+              style={{ height }}
+            />
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -192,4 +269,16 @@ function computeWindow(): { sinceIso: string; cutoff: number } {
   const minute = Math.floor(Date.now() / 60_000) * 60_000;
   const cutoff = minute - ONE_DAY_MS;
   return { sinceIso: new Date(cutoff).toISOString(), cutoff };
+}
+
+function buildHourlyBuckets(missions: Mission[], cutoff: number): number[] {
+  const buckets = Array.from({ length: 24 }, () => 0);
+  const hourMs = 60 * 60 * 1000;
+  for (const mission of missions) {
+    const ts = new Date(mission.updated_at).getTime();
+    if (!Number.isFinite(ts) || ts < cutoff) continue;
+    const index = Math.min(23, Math.max(0, Math.floor((ts - cutoff) / hourMs)));
+    buckets[index] += 1;
+  }
+  return buckets;
 }

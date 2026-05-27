@@ -30,7 +30,6 @@ import {
   Lock,
   GitBranch,
   Sparkles,
-  ListTodo,
   MessageCircle,
 } from 'lucide-react';
 
@@ -44,7 +43,6 @@ type NavItem = {
 const navigation: NavItem[] = [
   { name: 'Overview', href: '/', icon: LayoutDashboard },
   { name: 'Mission', href: '/control', icon: MessageSquare },
-  { name: 'Tasks', href: '/tasks', icon: ListTodo },
   { name: 'Workspaces', href: '/workspaces', icon: Server },
   { name: 'Console', href: '/console', icon: Terminal },
   { name: 'Routing', href: '/model-routing', icon: GitBranch },
