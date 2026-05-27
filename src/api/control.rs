@@ -287,76 +287,6 @@ fn assistant_reply_is_successful(content: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_terminal_mission_status(status: &MissionStatus) -> bool {
-    matches!(
-        status,
-        MissionStatus::Completed
-            | MissionStatus::Acknowledged
-            | MissionStatus::Failed
-            | MissionStatus::Interrupted
-            | MissionStatus::Blocked
-            | MissionStatus::NotFeasible
-            | MissionStatus::AwaitingUser
-    )
-}
-
-fn should_persist_synthetic_thought(candidate: &str, assistant_content: &str) -> bool {
-    let candidate = candidate.trim();
-    if candidate.is_empty() {
-        return false;
-    }
-
-    let assistant_content = assistant_content.trim();
-    if assistant_content.is_empty() {
-        return true;
-    }
-
-    assistant_content != candidate && !assistant_content.starts_with(candidate)
-}
-
-fn merge_pending_text_delta(existing: &mut String, content: &str) {
-    if content.starts_with(existing.as_str()) {
-        existing.clear();
-        existing.push_str(content);
-    } else {
-        existing.push_str(content);
-    }
-}
-
-fn synthetic_thought_from_text_delta(
-    pending_text_deltas: &mut HashMap<Uuid, String>,
-    mission_id: Uuid,
-    event: &AgentEvent,
-) -> Option<String> {
-    match event {
-        AgentEvent::TextDelta { content, .. } => {
-            if content.trim().is_empty() {
-                pending_text_deltas.remove(&mission_id);
-            } else {
-                pending_text_deltas
-                    .entry(mission_id)
-                    .and_modify(|existing| merge_pending_text_delta(existing, content))
-                    .or_insert_with(|| content.clone());
-            }
-            None
-        }
-        AgentEvent::Thinking { .. } => {
-            pending_text_deltas.remove(&mission_id);
-            None
-        }
-        AgentEvent::ToolCall { .. } | AgentEvent::UserMessage { .. } | AgentEvent::Error { .. } => {
-            pending_text_deltas.remove(&mission_id)
-        }
-        AgentEvent::AssistantMessage { content, .. } => pending_text_deltas
-            .remove(&mission_id)
-            .filter(|candidate| should_persist_synthetic_thought(candidate, content)),
-        AgentEvent::MissionStatusChanged { status, .. } if is_terminal_mission_status(status) => {
-            pending_text_deltas.remove(&mission_id)
-        }
-        _ => None,
-    }
-}
-
 fn extract_short_description_from_content(content: &str, max_len: usize) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
     let mut inside_fenced_block: Option<char> = None;
@@ -6193,26 +6123,11 @@ fn spawn_control_session(
         let store = Arc::clone(&state.mission_store);
         let mut event_rx = events_tx.subscribe();
         tokio::spawn(async move {
-            let mut pending_text_deltas: HashMap<Uuid, String> = HashMap::new();
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
                         // Extract mission_id from event
                         if let Some(mid) = event.mission_id() {
-                            if let Some(content) = synthetic_thought_from_text_delta(
-                                &mut pending_text_deltas,
-                                mid,
-                                &event,
-                            ) {
-                                let synthetic = AgentEvent::Thinking {
-                                    content,
-                                    done: true,
-                                    mission_id: Some(mid),
-                                };
-                                if let Err(e) = store.log_event(mid, &synthetic).await {
-                                    tracing::warn!("Failed to log synthetic thinking event: {}", e);
-                                }
-                            }
                             if let Err(e) = store.log_event(mid, &event).await {
                                 tracing::warn!("Failed to log event: {}", e);
                             }
@@ -14746,33 +14661,6 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_thought_from_text_delta_flushes_before_tool_call() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let text_delta = AgentEvent::TextDelta {
-            content: "Now let me run the build to see how many errors remain.".to_string(),
-            mission_id: Some(mission_id),
-        };
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta),
-            None
-        );
-
-        let tool_call = AgentEvent::ToolCall {
-            tool_call_id: "tool-1".to_string(),
-            name: "Bash".to_string(),
-            args: serde_json::json!({ "command": "lake build" }),
-            mission_id: Some(mission_id),
-        };
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
-            Some("Now let me run the build to see how many errors remain.".to_string())
-        );
-        assert!(pending.is_empty());
-    }
-
-    #[test]
     fn text_op_stream_transform_converts_cumulative_delta_to_insert_then_replace() {
         let mission_id = Uuid::new_v4();
         let mut buffers = HashMap::new();
@@ -14950,34 +14838,6 @@ mod tests {
         assert!(buffers.is_empty());
     }
 
-    #[test]
-    fn synthetic_thought_from_text_delta_accumulates_incremental_fragments() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let first = AgentEvent::TextDelta {
-            content: "Now let me run ".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let second = AgentEvent::TextDelta {
-            content: "the build.".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let tool_call = AgentEvent::ToolCall {
-            tool_call_id: "tool-1".to_string(),
-            name: "Bash".to_string(),
-            args: serde_json::json!({ "command": "cargo test" }),
-            mission_id: Some(mission_id),
-        };
-
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &first);
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &second);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
-            Some("Now let me run the build.".to_string())
-        );
-    }
-
     #[tokio::test]
     async fn delete_mission_with_children_removes_worker_missions() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
@@ -15024,96 +14884,6 @@ mod tests {
         assert!(store.get_mission(boss.id).await.unwrap().is_none());
         assert!(store.get_mission(worker.id).await.unwrap().is_none());
         assert!(store.get_mission(nested_worker.id).await.unwrap().is_none());
-    }
-
-    #[test]
-    fn synthetic_thought_from_text_delta_replaces_accumulated_fragments() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let first = AgentEvent::TextDelta {
-            content: "Now let me run".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let second = AgentEvent::TextDelta {
-            content: "Now let me run the build".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let tool_call = AgentEvent::ToolCall {
-            tool_call_id: "tool-1".to_string(),
-            name: "Bash".to_string(),
-            args: serde_json::json!({ "command": "cargo test" }),
-            mission_id: Some(mission_id),
-        };
-
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &first);
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &second);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
-            Some("Now let me run the build".to_string())
-        );
-    }
-
-    #[test]
-    fn synthetic_thought_from_text_delta_skips_assistant_echoes() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let text_delta = AgentEvent::TextDelta {
-            content: "Here is the final answer".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let assistant = AgentEvent::AssistantMessage {
-            id: Uuid::new_v4(),
-            content: "Here is the final answer with more detail".to_string(),
-            success: true,
-            cost_cents: 0,
-            cost_source: crate::agents::CostSource::Unknown,
-            usage: None,
-            model: None,
-            model_normalized: None,
-            mission_id: Some(mission_id),
-            shared_files: None,
-            resumable: false,
-            completion_evidence: None,
-        };
-
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &assistant),
-            None
-        );
-    }
-
-    #[test]
-    fn synthetic_thought_from_text_delta_keeps_tool_narration_before_assistant() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let text_delta = AgentEvent::TextDelta {
-            content: "I'll inspect the failing theorem before I answer.".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let assistant = AgentEvent::AssistantMessage {
-            id: Uuid::new_v4(),
-            content: "I found the issue in the induction step.".to_string(),
-            success: true,
-            cost_cents: 0,
-            cost_source: crate::agents::CostSource::Unknown,
-            usage: None,
-            model: None,
-            model_normalized: None,
-            mission_id: Some(mission_id),
-            shared_files: None,
-            resumable: false,
-            completion_evidence: None,
-        };
-
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &assistant),
-            Some("I'll inspect the failing theorem before I answer.".to_string())
-        );
     }
 
     #[tokio::test]

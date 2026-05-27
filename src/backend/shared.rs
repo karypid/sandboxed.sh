@@ -456,10 +456,7 @@ pub fn convert_cli_event(
                 match block {
                     ContentBlock::Text { text } => {
                         if !text.is_empty() {
-                            results.push(ExecutionEvent::Thinking {
-                                content: text,
-                                item_id: None,
-                            });
+                            results.push(ExecutionEvent::TextDelta { content: text });
                         }
                     }
                     ContentBlock::ToolUse { id, name, input } => {
@@ -824,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_assistant_text_produces_thinking() {
+    fn convert_assistant_text_produces_text_delta() {
         let event: CliEvent = serde_json::from_value(json!({
             "type": "assistant",
             "session_id": "s1",
@@ -839,10 +836,10 @@ mod tests {
         let results = convert_cli_event(event, &mut pending);
         assert_eq!(results.len(), 1);
         match &results[0] {
-            ExecutionEvent::Thinking { content, .. } => {
+            ExecutionEvent::TextDelta { content } => {
                 assert_eq!(content, "I will run a command")
             }
-            other => panic!("Expected Thinking, got {:?}", other),
+            other => panic!("Expected TextDelta, got {:?}", other),
         }
     }
 

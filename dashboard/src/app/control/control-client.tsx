@@ -2,7 +2,6 @@
 
 import type React from "react";
 import {
-  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -227,7 +226,7 @@ function isRetriableSendError(error: unknown): boolean {
   );
 }
 
-function appendUnpersistedLiveTail(
+export function appendUnpersistedLiveTail(
   historyItems: ChatItem[],
   liveItems: ChatItem[],
 ): ChatItem[] {
@@ -247,6 +246,14 @@ function appendUnpersistedLiveTail(
       .map((item) => item.content.trim())
       .filter(Boolean),
   );
+  const lastHistoryUserIdx = historyItems.findLastIndex(
+    (item) => item.kind === "user",
+  );
+  const historyHasAssistantAfterLastUser =
+    lastHistoryUserIdx !== -1 &&
+    historyItems
+      .slice(lastHistoryUserIdx + 1)
+      .some((item) => item.kind === "assistant");
 
   const unpersistedTail = liveItems.slice(lastLiveUserIdx + 1).filter((item) => {
     if (existingIds.has(item.id)) return false;
@@ -254,7 +261,11 @@ function appendUnpersistedLiveTail(
       const content = item.content.trim();
       return content.length > 0 && !existingAssistantContent.has(content);
     }
-    return item.kind === "stream" && !item.done && item.content.trim().length > 0;
+    if (item.kind !== "stream" || item.done) return false;
+    const content = item.content.trim();
+    if (!content) return false;
+    if (existingAssistantContent.has(content)) return false;
+    return !historyHasAssistantAfterLastUser;
   });
 
   return unpersistedTail.length > 0
@@ -579,7 +590,7 @@ type ItemViews = {
   chatDisplayItems: ChatItem[];
   /** The last non-queued item; used by a few pinned UI bits. */
   lastNonQueuedItem: ChatItem | undefined;
-  /** Thinking + streaming items, for the side panel. */
+  /** Thinking items, plus stream drafts while the side panel is open. */
   thinkingItems: SidePanelItem[];
   /** Completed (de-duplicated by content) + in-flight thinking count. */
   thinkingItemsCount: number;
@@ -600,7 +611,7 @@ type ItemViews = {
  * Keep this pure — it's called from a `useMemo` and must not touch
  * React state or refs.
  */
-function deriveItemViews(
+export function deriveItemViews(
   items: ChatItem[],
   showThinkingPanel: boolean,
 ): ItemViews {
@@ -621,13 +632,13 @@ function deriveItemViews(
   for (let i = 0; i < dedupedItems.length; i++) {
     const item = dedupedItems[i];
     if (item.kind !== "thinking" && item.kind !== "stream") continue;
-    const key = item.content.trim();
+    const key = `${item.kind}:${item.content.trim()}`;
     if (key) lastThinkingItemIndexByContent.set(key, i);
   }
   if (lastThinkingItemIndexByContent.size > 0) {
     dedupedItems = dedupedItems.filter((item, index) => {
       if (item.kind !== "thinking" && item.kind !== "stream") return true;
-      const key = item.content.trim();
+      const key = `${item.kind}:${item.content.trim()}`;
       return !key || lastThinkingItemIndexByContent.get(key) === index;
     });
   }
@@ -641,22 +652,29 @@ function deriveItemViews(
     if (item.kind === "user" && item.queued) {
       hasQueuedUser = true;
     }
-    if (item.kind === "thinking" || item.kind === "stream") {
+    if (
+      item.kind === "thinking" ||
+      (showThinkingPanel && item.kind === "stream")
+    ) {
       thinkingItems.push(item as SidePanelItem);
+    }
+    if (item.kind === "thinking") {
       if (!item.done) hasActiveThinking = true;
     }
   }
   const lastThinkingIndexByContent = new Map<string, number>();
   for (let i = 0; i < thinkingItems.length; i++) {
-    const key = thinkingItems[i].content.trim();
+    const key = `${thinkingItems[i].kind}:${thinkingItems[i].content.trim()}`;
     if (key) lastThinkingIndexByContent.set(key, i);
   }
   if (lastThinkingIndexByContent.size > 0) {
     thinkingItems = thinkingItems.filter((item, index) => {
-      const key = item.content.trim();
+      const key = `${item.kind}:${item.content.trim()}`;
       return !key || lastThinkingIndexByContent.get(key) === index;
     });
-    hasActiveThinking = thinkingItems.some((item) => !item.done);
+    hasActiveThinking = thinkingItems.some(
+      (item) => item.kind === "thinking" && !item.done,
+    );
   }
 
   let displayItems: ChatItem[];
@@ -696,6 +714,7 @@ function deriveItemViews(
   let completedThinking = 0;
   let activeThinking = 0;
   for (const t of thinkingItems) {
+    if (t.kind !== "thinking") continue;
     if (!t.done) {
       activeThinking += 1;
       continue;
@@ -747,8 +766,8 @@ function deriveItemViews(
         // row with no "Show N previous tools" collapse button.
         continue;
       }
-      // Inline thinking: break the current tool group so ordering
-      // renders as tool → thinking → tool in the chat.
+      // Inline thinking/streaming: break the current tool group so ordering
+      // renders as tool → thought/draft → tool in the chat.
       flushToolGroup();
       currentThinkingGroup.push(item as SidePanelItem);
     } else {
@@ -4240,9 +4259,6 @@ export default function ControlClient() {
     },
     [setThinkingSlice],
   );
-  // Deferred mirror used by the heavy chat-list regrouping memo so the toggle
-  // click stays interactive even on long missions.
-  const deferredShowThinkingPanel = useDeferredValue(showThinkingPanel);
   const thinkingPanelManuallyHidden = thinkingSlice.manuallyHidden;
   const setThinkingPanelManuallyHidden = useCallback(
     (next: boolean | ((prev: boolean) => boolean)) => {
@@ -4571,19 +4587,13 @@ export default function ControlClient() {
     hasActiveThinking,
     groupedItems,
   } = useMemo(
-    // `showThinkingPanel` reroutes thinking items between the inline chat
-    // and the side panel, which flips the structure of `groupedItems` and
-    // forces React to reconcile every chat row. On long missions that can
-    // block the main thread for several seconds, so feed it through
-    // `useDeferredValue`: the toggle button + panel mount react instantly
-    // while the chat-list regrouping is treated as a non-urgent transition.
     () =>
       perfBus.time("replay:group", () => {
-        const views = deriveItemViews(items, deferredShowThinkingPanel);
+        const views = deriveItemViews(items, showThinkingPanel);
         perfBus.updateDiagnostics({ renderCount: views.groupedItems.length });
         return views;
       }),
-    [items, deferredShowThinkingPanel],
+    [items, showThinkingPanel],
   );
   // `deriveItemViews` produces a fresh `thinkingItems` array on every change
   // to `items`, even when the chat update was unrelated to thoughts (e.g. a

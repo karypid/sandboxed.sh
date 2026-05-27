@@ -1340,39 +1340,26 @@ fn strip_think_tags(text: &str) -> String {
     result
 }
 
-/// Prefixes that indicate a thought/reasoning line
-const THOUGHT_PREFIXES: &[&str] = &["thought:", "thoughts:", "thinking:"];
+fn normalize_stream_comparison_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
-fn extract_thought_line(text: &str) -> Option<(String, String)> {
-    let mut thought: Option<String> = None;
-    let mut remaining: Vec<&str> = Vec::new();
+fn thinking_overlaps_visible_answer(thinking: &str, assistant_message: &str) -> bool {
+    const MIN_OVERLAP_LEN: usize = 40;
 
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
-        let is_thought = THOUGHT_PREFIXES
-            .iter()
-            .any(|prefix| lower.starts_with(prefix));
+    let thinking = normalize_stream_comparison_text(thinking);
+    let assistant_message = normalize_stream_comparison_text(assistant_message);
 
-        if thought.is_none() && is_thought {
-            let content = trimmed
-                .split_once(':')
-                .map(|(_, rest)| rest)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !content.is_empty() {
-                thought = Some(content);
-            }
-            continue;
-        }
-        remaining.push(line);
+    if thinking.is_empty() || assistant_message.is_empty() {
+        return false;
     }
 
-    thought.map(|t| {
-        let cleaned = remaining.join("\n").trim().to_string();
-        (t, cleaned)
-    })
+    if thinking == assistant_message {
+        return true;
+    }
+
+    thinking.len() >= MIN_OVERLAP_LEN && assistant_message.starts_with(&thinking)
+        || assistant_message.len() >= MIN_OVERLAP_LEN && thinking.starts_with(&assistant_message)
 }
 
 async fn set_control_state_for_mission(
@@ -5109,7 +5096,6 @@ pub fn run_claudecode_turn<'a>(
         let mut finalized_thinking_indices: std::collections::HashSet<u32> =
             std::collections::HashSet::new(); // Blocks already sent done:true during streaming
         let mut last_text_len: usize = 0; // Track last emitted text length for streaming text deltas
-        let mut thinking_emitted = false;
 
         let mut saw_non_init_event = false;
         let startup_timeout = Duration::from_secs(
@@ -5403,7 +5389,6 @@ pub fn run_claudecode_turn<'a>(
                                                             done: false,
                                                             mission_id: Some(mission_id),
                                                         });
-                                                        thinking_emitted = true;
                                                     }
                                                 }
                                             } else if delta.delta_type == "text_delta" {
@@ -5471,26 +5456,10 @@ pub fn run_claudecode_turn<'a>(
                                         let content_idx = content_idx as u32;
                                         match block {
                                             ContentBlock::Text { text } if !text.is_empty() => {
-                                                // Text content is the final assistant response
-                                                // Don't send as Thinking - it will be in the final AssistantMessage
-                                                if !thinking_emitted {
-                                                    if let Some((thought, cleaned)) =
-                                                        extract_thought_line(&text)
-                                                    {
-                                                        let _ =
-                                                            events_tx.send(AgentEvent::Thinking {
-                                                                content: thought,
-                                                                done: true,
-                                                                mission_id: Some(mission_id),
-                                                            });
-                                                        thinking_emitted = true;
-                                                        final_result = cleaned;
-                                                    } else {
-                                                        final_result = text;
-                                                    }
-                                                } else {
-                                                    final_result = text;
-                                                }
+                                                // Text content is the final assistant response.
+                                                // Thinking must come from explicit provider
+                                                // reasoning/thinking blocks, not answer text.
+                                                final_result = text;
                                             }
                                             ContentBlock::ToolUse { id, name, input } => {
                                                 pending_tools.insert(id.clone(), name.clone());
@@ -5658,7 +5627,6 @@ pub fn run_claudecode_turn<'a>(
                                                     done: true,
                                                     mission_id: Some(mission_id),
                                                 });
-                                                thinking_emitted = true;
                                             }
                                             _ => {}
                                         }
@@ -5706,7 +5674,6 @@ pub fn run_claudecode_turn<'a>(
                                     finalized_thinking_indices.clear();
                                     last_text_len = 0;
                                     block_types.clear();
-                                    thinking_emitted = false;
                                 }
                                 ClaudeEvent::User(evt) => {
                                     for block in evt.message.content {
@@ -11776,18 +11743,6 @@ pub async fn run_opencode_turn(
         }
     }
 
-    if !sse_emitted && !emitted_thinking {
-        if let Some((thought, cleaned)) = extract_thought_line(&final_result) {
-            let _ = events_tx.send(AgentEvent::Thinking {
-                content: thought,
-                done: false,
-                mission_id: Some(mission_id),
-            });
-            emitted_thinking = true;
-            final_result = cleaned;
-        }
-    }
-
     if emitted_thinking || (sse_emitted && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst))
     {
         let _ = events_tx.send(AgentEvent::Thinking {
@@ -13287,6 +13242,14 @@ pub async fn run_codex_turn(
                         }
                     }
                     ExecutionEvent::Thinking { content, item_id } => {
+                        if thinking_overlaps_visible_answer(&content, &assistant_message) {
+                            tracing::debug!(
+                                thinking_len = content.len(),
+                                assistant_len = assistant_message.len(),
+                                "Dropping Codex thinking event that duplicates visible assistant text"
+                            );
+                            continue;
+                        }
                         // Codex emits per-item cumulative snapshots: every
                         // emit with the same `item_id` contains the previous
                         // emit as a prefix. When `item_id` changes we're on a
@@ -13478,19 +13441,6 @@ pub async fn run_codex_turn(
             content: assistant_message.clone(),
             mission_id: Some(mission_id),
         });
-    }
-
-    if !thinking_emitted {
-        if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
-            let _ = events_tx.send(AgentEvent::Thinking {
-                content: thought,
-                done: true,
-                mission_id: Some(mission_id),
-            });
-            thinking_emitted = true;
-            thinking_done_emitted = true;
-            assistant_message = cleaned;
-        }
     }
 
     // Capture a copy of the accumulated reasoning before the flush below
@@ -13895,6 +13845,14 @@ pub async fn run_gemini_turn(
                         });
                     }
                     ExecutionEvent::Thinking { content, item_id: _ } => {
+                        if thinking_overlaps_visible_answer(&content, &assistant_message) {
+                            tracing::debug!(
+                                thinking_len = content.len(),
+                                assistant_len = assistant_message.len(),
+                                "Dropping Gemini thinking event that duplicates visible assistant text"
+                            );
+                            continue;
+                        }
                         merge_stream_fragment(&mut thinking_accumulated, &content);
                         // Stream the canonical cumulative buffer for real-time UI.
                         let _ = events_tx.send(AgentEvent::Thinking {
@@ -13974,19 +13932,6 @@ pub async fn run_gemini_turn(
             else => {
                 break;
             }
-        }
-    }
-
-    if !thinking_emitted {
-        if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
-            let _ = events_tx.send(AgentEvent::Thinking {
-                content: thought,
-                done: true,
-                mission_id: Some(mission_id),
-            });
-            thinking_emitted = true;
-            thinking_done_emitted = true;
-            assistant_message = cleaned;
         }
     }
 
@@ -14444,20 +14389,19 @@ mod tests {
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
         custom_opencode_provider_definition, ensure_opencode_provider_for_model,
         extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
-        is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
-        is_session_corruption_error, is_success_path_auth_error,
-        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
-        is_tool_call_only_output, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, record_codex_error_message,
+        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
+        is_success_path_auth_error, is_success_path_provider_payload_error,
+        is_success_path_rate_limited_error, is_tool_call_only_output,
+        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
+        opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, use_thinking_only_fallback,
-        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        strip_think_tags, summarize_recent_opencode_stderr, thinking_overlaps_visible_answer,
+        use_thinking_only_fallback, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
+        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -15626,50 +15570,35 @@ mod tests {
         assert_eq!(result, "beforeafter");
     }
 
-    // ── extract_thought_line tests ────────────────────────────────────
-
     #[test]
-    fn extract_thought_line_extracts_thought_prefix() {
-        let input = "thought: I need to check the file\nLet me look at it.";
-        let (thought, remaining) = extract_thought_line(input).unwrap();
-        assert_eq!(thought, "I need to check the file");
-        assert_eq!(remaining, "Let me look at it.");
+    fn thinking_overlap_detects_visible_answer_echo() {
+        let answer =
+            "I checked the mission stream and the dashboard is rendering answer drafts inline.";
+        assert!(thinking_overlaps_visible_answer(answer, answer));
     }
 
     #[test]
-    fn extract_thought_line_extracts_thinking_prefix() {
-        let input = "Thinking: Analyzing the problem\nHere is my answer.";
-        let (thought, remaining) = extract_thought_line(input).unwrap();
-        assert_eq!(thought, "Analyzing the problem");
-        assert_eq!(remaining, "Here is my answer.");
+    fn thinking_overlap_detects_cumulative_visible_answer_echo() {
+        let thinking =
+            "I checked the mission stream and the dashboard is rendering answer drafts inline.";
+        let answer = format!("{thinking} The final event still lands as an assistant message.");
+        assert!(thinking_overlaps_visible_answer(thinking, &answer));
     }
 
     #[test]
-    fn extract_thought_line_extracts_thoughts_prefix() {
-        let input = "thoughts: multiple ideas\nLine 2";
-        let (thought, _) = extract_thought_line(input).unwrap();
-        assert_eq!(thought, "multiple ideas");
+    fn thinking_overlap_allows_distinct_reasoning() {
+        let thinking =
+            "Need to inspect whether the provider sent a typed reasoning item before final output.";
+        let answer = "The stream now separates typed reasoning from visible assistant text.";
+        assert!(!thinking_overlaps_visible_answer(thinking, answer));
     }
 
     #[test]
-    fn extract_thought_line_returns_none_without_thought() {
-        let input = "Just regular text\nMore text";
-        assert!(extract_thought_line(input).is_none());
-    }
-
-    #[test]
-    fn extract_thought_line_returns_none_for_empty_thought() {
-        let input = "thought: \nsome text after";
-        assert!(extract_thought_line(input).is_none());
-    }
-
-    #[test]
-    fn extract_thought_line_only_first_thought_line_extracted() {
-        let input = "thought: first\nthought: second\nregular text";
-        let (thought, remaining) = extract_thought_line(input).unwrap();
-        assert_eq!(thought, "first");
-        assert!(remaining.contains("thought: second"));
-        assert!(remaining.contains("regular text"));
+    fn thinking_overlap_allows_short_shared_prefixes() {
+        assert!(!thinking_overlaps_visible_answer(
+            "I checked",
+            "I checked the logs."
+        ));
     }
 
     // ── strip_ansi_codes tests ────────────────────────────────────────
