@@ -4265,6 +4265,19 @@ export default function ControlClient() {
     });
   }, [setShowThinkingPanel, setThinkingPanelManuallyHidden]);
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!event.metaKey || event.code !== "ShiftRight" || event.repeat) {
+        return;
+      }
+      event.preventDefault();
+      handleToggleThinkingPanel();
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [handleToggleThinkingPanel]);
+
   const handleCloseThinkingPanel = useCallback(() => {
     setShowThinkingPanel(false);
     setThinkingPanelManuallyHidden(true);
@@ -4376,16 +4389,20 @@ export default function ControlClient() {
       let eventMergeCount = 0;
       if (cached && cached.events.length > 0) {
         try {
+          const cachedTailMaxSequence = cached.events.reduce(
+            (max, event) => Math.max(max, event.sequence),
+            0,
+          );
           const delta = await getMissionEventsWithMeta(id, {
             types: HISTORY_EVENT_TYPES,
-            sinceSeq: cached.maxSequence,
+            sinceSeq: cachedTailMaxSequence,
             limit: HISTORY_DELTA_PAGE_SIZE,
             includeCounts: false,
           });
           // If the server's max sequence is *behind* what we cached, the
           // mission was reset or replaced server-side and our cache is
           // bogus — drop it and reload fresh.
-          if ((delta.meta.maxSequence ?? 0) >= cached.maxSequence) {
+          if ((delta.meta.maxSequence ?? 0) >= cachedTailMaxSequence) {
             // Merge cached tail + delta. Both are sorted by sequence;
             // dedup defensively in case the server re-sent an overlap row.
             const seen = new Set<number>();
