@@ -20,6 +20,17 @@ const thinkingItem: Extract<ChatItem, { kind: "thinking" }> = {
   done: false,
 };
 
+const assistantItem: Extract<ChatItem, { kind: "assistant" }> = {
+  id: "assistant-1",
+  kind: "assistant",
+  content: "Final answer",
+  success: true,
+  costCents: 0,
+  costSource: "unknown",
+  model: null,
+  timestamp: 2,
+};
+
 describe("deriveItemViews", () => {
   it("routes text_delta stream rows to the side panel when open", () => {
     const views = deriveItemViews([streamItem], true);
@@ -64,6 +75,32 @@ describe("deriveItemViews", () => {
       },
     ]);
   });
+
+  it("does not render completed thoughts after the final assistant row inline", () => {
+    const completedThinking: Extract<ChatItem, { kind: "thinking" }> = {
+      ...thinkingItem,
+      done: true,
+      endTime: 3,
+    };
+
+    const views = deriveItemViews([assistantItem, completedThinking], false);
+
+    expect(views.thinkingItems).toEqual([completedThinking]);
+    expect(views.groupedItems).toEqual([assistantItem]);
+  });
+
+  it("keeps active streams after the final assistant row visible inline", () => {
+    const views = deriveItemViews([assistantItem, streamItem], false);
+
+    expect(views.groupedItems).toEqual([
+      assistantItem,
+      {
+        kind: "thinking_group",
+        groupId: streamItem.id,
+        thoughts: [streamItem],
+      },
+    ]);
+  });
 });
 
 describe("appendUnpersistedLiveTail", () => {
@@ -73,17 +110,6 @@ describe("appendUnpersistedLiveTail", () => {
     content: "Start",
     timestamp: 1,
   };
-  const assistantItem: Extract<ChatItem, { kind: "assistant" }> = {
-    id: "assistant-1",
-    kind: "assistant",
-    content: "Final answer",
-    success: true,
-    costCents: 0,
-    costSource: "unknown",
-    model: null,
-    timestamp: 2,
-  };
-
   it("does not append a stale live stream after a persisted assistant reply", () => {
     const views = appendUnpersistedLiveTail(
       [userItem, assistantItem],

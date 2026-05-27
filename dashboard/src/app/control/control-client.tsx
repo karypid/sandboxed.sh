@@ -730,6 +730,13 @@ export function deriveItemViews(
   const groupedItems: GroupedItem[] = [];
   let currentToolGroup: ToolItem[] = [];
   let currentThinkingGroup: SidePanelItem[] = [];
+  let lastAssistantItemIndex = -1;
+  for (let i = chatDisplayItems.length - 1; i >= 0; i--) {
+    if (chatDisplayItems[i].kind === "assistant") {
+      lastAssistantItemIndex = i;
+      break;
+    }
+  }
   const flushToolGroup = () => {
     if (currentToolGroup.length === 0) return;
     if (currentToolGroup.length === 1) {
@@ -752,7 +759,8 @@ export function deriveItemViews(
     });
     currentThinkingGroup = [];
   };
-  for (const item of chatDisplayItems) {
+  for (let index = 0; index < chatDisplayItems.length; index++) {
+    const item = chatDisplayItems[index];
     if (item.kind === "tool" && !item.isUiTool) {
       flushThinkingGroup();
       currentToolGroup.push(item);
@@ -764,6 +772,17 @@ export function deriveItemViews(
         // between) stay collapsed into a single group in the main
         // chat; otherwise the user sees every tool as an individual
         // row with no "Show N previous tools" collapse button.
+        continue;
+      }
+      if (
+        lastAssistantItemIndex !== -1 &&
+        index > lastAssistantItemIndex &&
+        item.done
+      ) {
+        // A full history replay can race an older live items tail and
+        // leave completed thought groups after the final assistant row.
+        // Completed thoughts remain available in the Thoughts panel; they
+        // should not appear as the visual bottom of a finished turn.
         continue;
       }
       // Inline thinking/streaming: break the current tool group so ordering
