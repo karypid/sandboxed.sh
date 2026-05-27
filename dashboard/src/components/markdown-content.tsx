@@ -147,6 +147,15 @@ function isFilePath(str: string): boolean {
   return looksLikePath || isSimpleFilename;
 }
 
+function isRichFileLinkHref(href: string): boolean {
+  if (!href || href.startsWith("#")) return false;
+  if (href.startsWith("sandboxed-file://")) return true;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+    return /^[a-zA-Z]:/.test(href);
+  }
+  return isFilePath(href.split(/[?#]/, 1)[0]);
+}
+
 function getFileIcon(path: string) {
   if (isImageFile(path)) return ImageIcon;
   if (isCodeFile(path)) return FileCode;
@@ -894,7 +903,7 @@ function InlineFileCard({
   }
 
   return (
-    <div
+    <span
       className={cn(
         "my-2 inline-flex items-center gap-3 px-4 py-3 rounded-xl",
         "bg-white/[0.04] border border-white/[0.06] hover:bg-white/[0.06] hover:border-white/[0.1]",
@@ -902,16 +911,18 @@ function InlineFileCard({
       )}
       onClick={() => showFilePreviewModal(path, resolvedPath, workspaceId, missionId)}
     >
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10">
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10">
         <FileIcon className="h-4 w-4 text-indigo-400" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="text-sm font-medium text-white/80 truncate">{displayName}</div>
-        <div className="text-xs text-white/40">
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-medium text-white/80 truncate">
+          {displayName}
+        </span>
+        <span className="block text-xs text-white/40">
           {ext && <span className="mr-2">{ext}</span>}
           {metadata?.size != null && <span>{formatFileSize(metadata.size)}</span>}
-        </div>
-      </div>
+        </span>
+      </span>
       <button
         onClick={handleDownload}
         disabled={downloading}
@@ -920,7 +931,7 @@ function InlineFileCard({
       >
         <Download className={cn("h-4 w-4", downloading && "animate-pulse")} />
       </button>
-    </div>
+    </span>
   );
 }
 
@@ -971,9 +982,10 @@ export const MarkdownContent = memo(function MarkdownContent({
       return <img src={srcStr} alt={alt} {...props} className="max-w-full rounded" />;
     },
     a({ href, children, ...props }) {
-      // Handle sandboxed-file:// protocol for rich file tags
-      if (href?.startsWith("sandboxed-file://")) {
-        const path = decodeURIComponent(href.replace("sandboxed-file://", ""));
+      if (href && isRichFileLinkHref(href)) {
+        const path = href.startsWith("sandboxed-file://")
+          ? decodeURIComponent(href.replace("sandboxed-file://", ""))
+          : decodeURIComponent(href.split(/[?#]/, 1)[0]);
         const childText = Array.isArray(children) ? children.join("") : String(children || "");
         const displayName = childText || path.split("/").pop() || "file";
         return (
