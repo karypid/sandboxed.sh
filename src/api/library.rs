@@ -18,6 +18,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -352,6 +353,46 @@ fn normalize_skill_name(name: &str) -> Result<String, (StatusCode, String)> {
         ));
     }
     Ok(skill_name)
+}
+
+async fn find_registry_installed_skill_dir(
+    temp_dir: &FsPath,
+    requested_skill_names: &[String],
+) -> Result<Option<PathBuf>, std::io::Error> {
+    let mut candidates = Vec::new();
+    let skill_roots = [
+        temp_dir.join(".claude").join("skills"),
+        temp_dir.join(".agents").join("skills"),
+    ];
+
+    for skill_root in skill_roots {
+        if tokio::fs::metadata(&skill_root).await.is_err() {
+            continue;
+        }
+
+        let mut entries = tokio::fs::read_dir(&skill_root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() && path.join("SKILL.md").exists() {
+                candidates.push(path);
+            }
+        }
+    }
+
+    for requested in requested_skill_names {
+        let requested = normalize_skill_name(requested).map_err(|(_, message)| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+        })?;
+        if let Some(path) = candidates.iter().find(|candidate| {
+            candidate
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy() == requested)
+        }) {
+            return Ok(Some(path.clone()));
+        }
+    }
+
+    Ok(candidates.into_iter().next())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2258,10 +2299,14 @@ async fn install_from_registry(
         .await
         .map_err(internal_error)?;
 
-    // Initialize a minimal structure for the skills CLI
-    // The skills CLI expects certain directories to exist
+    // Initialize minimal structures for the skills CLI. Depending on the
+    // agent it detects, it may write to either Claude or Codex-style roots.
     let claude_skills_dir = temp_dir.join(".claude").join("skills");
     tokio::fs::create_dir_all(&claude_skills_dir)
+        .await
+        .map_err(internal_error)?;
+    let agents_skills_dir = temp_dir.join(".agents").join("skills");
+    tokio::fs::create_dir_all(&agents_skills_dir)
         .await
         .map_err(internal_error)?;
 
@@ -2286,26 +2331,15 @@ async fn install_from_registry(
         ));
     }
 
-    // Find the installed skill in .claude/skills/
-    let mut installed_skill_dir = None;
-    let mut entries = tokio::fs::read_dir(&claude_skills_dir)
+    let source_dir = find_registry_installed_skill_dir(&temp_dir, &request.skills)
         .await
-        .map_err(internal_error)?;
-
-    while let Some(entry) = entries.next_entry().await.map_err(internal_error)? {
-        let path = entry.path();
-        if path.is_dir() && path.join("SKILL.md").exists() {
-            installed_skill_dir = Some(path);
-            break;
-        }
-    }
-
-    let source_dir = installed_skill_dir.ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "No skill found after installation".to_string(),
-        )
-    })?;
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "No skill found after installation in .claude/skills or .agents/skills".to_string(),
+            )
+        })?;
 
     // Determine target name
     let raw_skill_name = request.name.unwrap_or_else(|| {
@@ -2430,6 +2464,56 @@ mod tests {
         assert!(normalize_skill_name("../escape").is_err());
         assert!(normalize_skill_name("nested/name").is_err());
         assert!(normalize_skill_name(".hidden").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_find_registry_installed_skill_dir_accepts_agents_root() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("design-taste-frontend");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        tokio::fs::write(skill_dir.join("SKILL.md"), "# Design Taste")
+            .await
+            .unwrap();
+
+        let found =
+            find_registry_installed_skill_dir(dir.path(), &["design-taste-frontend".to_string()])
+                .await
+                .unwrap();
+
+        assert_eq!(found, Some(skill_dir));
+    }
+
+    #[tokio::test]
+    async fn test_find_registry_installed_skill_dir_prefers_requested_skill() {
+        let dir = tempdir().unwrap();
+        let first_skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("first-skill");
+        let requested_skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("requested-skill");
+        tokio::fs::create_dir_all(&first_skill).await.unwrap();
+        tokio::fs::create_dir_all(&requested_skill).await.unwrap();
+        tokio::fs::write(first_skill.join("SKILL.md"), "# First")
+            .await
+            .unwrap();
+        tokio::fs::write(requested_skill.join("SKILL.md"), "# Requested")
+            .await
+            .unwrap();
+
+        let found = find_registry_installed_skill_dir(dir.path(), &["requested-skill".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(found, Some(requested_skill));
     }
 
     #[tokio::test]
