@@ -1267,24 +1267,15 @@ async fn get_stats(
     let control_state = state.control.get_or_spawn(&user).await;
 
     // Count missions by status
-    let missions = control_state
+    let mission_counts = control_state
         .mission_store
-        .list_missions(1000, 0)
+        .count_missions_by_status()
         .await
         .unwrap_or_default();
-    let mission_total = missions.len();
-    let mission_active = missions
-        .iter()
-        .filter(|m| m.status == super::control::MissionStatus::Active)
-        .count();
-    let mission_completed = missions
-        .iter()
-        .filter(|m| m.status == super::control::MissionStatus::Completed)
-        .count();
-    let mission_failed = missions
-        .iter()
-        .filter(|m| m.status == super::control::MissionStatus::Failed)
-        .count();
+    let mission_total = mission_counts.total;
+    let mission_active = mission_counts.active;
+    let mission_completed = mission_counts.completed;
+    let mission_failed = mission_counts.failed;
 
     // Combine legacy tasks and missions
     let total_tasks = legacy_total + mission_total;

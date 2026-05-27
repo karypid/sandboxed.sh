@@ -3,9 +3,9 @@
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, DailyUsageStats,
     ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode,
-    MissionStatus, MissionStore, ModelUsageStats, PalomaCooldownState, PalomaDecision,
-    PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig, StopPolicy,
-    StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
+    MissionStatus, MissionStatusCounts, MissionStore, ModelUsageStats, PalomaCooldownState,
+    PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
+    StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
     TelegramActionExecutionStatus, TelegramAlert, TelegramAlertPreference, TelegramChannel,
     TelegramChatMission, TelegramConversation, TelegramConversationMessage,
     TelegramConversationMessageDirection, TelegramMissionInterestLevel,
@@ -2319,6 +2319,38 @@ impl MissionStore for SqliteMissionStore {
                 .map_err(|e| e.to_string())?;
 
             Ok(missions)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn count_missions_by_status(&self) -> Result<MissionStatusCounts, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT status, COUNT(*) FROM missions GROUP BY status")
+                .map_err(|e| e.to_string())?;
+
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+
+            let mut counts = MissionStatusCounts::default();
+            for row in rows {
+                let (status, count) = row.map_err(|e| e.to_string())?;
+                let count = usize::try_from(count).unwrap_or(0);
+                counts.total += count;
+                match parse_status(&status) {
+                    MissionStatus::Active => counts.active += count,
+                    MissionStatus::Completed => counts.completed += count,
+                    MissionStatus::Failed => counts.failed += count,
+                    _ => {}
+                }
+            }
+            Ok(counts)
         })
         .await
         .map_err(|e| e.to_string())?
