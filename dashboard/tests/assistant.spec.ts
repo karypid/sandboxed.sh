@@ -23,6 +23,14 @@ test.describe('Assistant page', () => {
               path: '/usr/local/bin/assistant-mcp',
               status: 'ok',
             },
+            {
+              name: 'hermes_assistant',
+              version: null,
+              installed: true,
+              update_available: null,
+              path: '/etc/systemd/system/hermes-assistant-dev.service',
+              status: 'ok',
+            },
           ],
         }),
       });
@@ -38,10 +46,11 @@ test.describe('Assistant page', () => {
     await expect(page).toHaveURL(/\/assistant/);
     await expect(page.getByRole('heading', { name: 'Assistant', exact: true })).toBeVisible();
     await expect(page.getByText('assistant-mcp 0.1.0')).toBeVisible();
+    await expect(page.getByText('Hermes runtime active')).toBeVisible();
     await expect(page.getByRole('button', { name: /Add Gateway/i }).first()).toBeVisible();
   });
 
-  test('shows MCP handoff warning when assistant-mcp is unavailable', async ({ page }) => {
+  test('shows handoff warnings when Hermes bridge and runtime are unavailable', async ({ page }) => {
     await page.route('**/api/system/components', async (route) => {
       await route.fulfill({
         status: 200,
@@ -56,6 +65,14 @@ test.describe('Assistant page', () => {
               path: null,
               status: 'missing',
             },
+            {
+              name: 'hermes_assistant',
+              version: null,
+              installed: false,
+              update_available: null,
+              path: null,
+              status: 'not_installed',
+            },
           ],
         }),
       });
@@ -65,6 +82,7 @@ test.describe('Assistant page', () => {
 
     await expect(page.getByText('assistant-mcp not ready')).toBeVisible();
     await expect(page.getByText('Install assistant-mcp before handing mission control to Hermes.')).toBeVisible();
+    await expect(page.getByText('Hermes runtime not installed')).toBeVisible();
   });
 
   test('keeps the old Telegram settings route as a redirect', async ({ page }) => {

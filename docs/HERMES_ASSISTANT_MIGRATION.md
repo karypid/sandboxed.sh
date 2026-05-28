@@ -91,6 +91,12 @@ Expected dev output once the bridge is installed:
 {"name":"assistant_mcp","version":"0.1.0","installed":true,"update_available":null,"path":"/usr/local/bin/assistant-mcp","status":"ok"}
 ```
 
+The same endpoint also reports the external Hermes runtime as
+`hermes_assistant` when `hermes-assistant-dev.service` or
+`hermes-assistant.service` is installed on the host. It is ready only when the
+systemd service is loaded and active; otherwise the Assistant dashboard keeps the
+runtime card in a cutover-pending state.
+
 For an end-to-end stdio MCP smoke against dev, run:
 
 ```bash

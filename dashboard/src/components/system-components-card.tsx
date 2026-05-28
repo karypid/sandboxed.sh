@@ -24,6 +24,7 @@ import { cn } from '@/lib/utils';
 const componentNames: Record<string, string> = {
   sandboxed_sh: 'sandboxed.sh',
   assistant_mcp: 'Assistant MCP',
+  hermes_assistant: 'Hermes Assistant',
   opencode: 'OpenCode',
   claude_code: 'Claude Code',
   codex: 'Codex',
@@ -34,6 +35,7 @@ const componentNames: Record<string, string> = {
 const componentIcons: Record<string, string> = {
   sandboxed_sh: '🚀',
   assistant_mcp: '🔌',
+  hermes_assistant: '◈',
   opencode: '⚡',
   claude_code: '✦',
   codex: '🧠',

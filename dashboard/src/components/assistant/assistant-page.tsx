@@ -389,6 +389,11 @@ export default function AssistantPage() {
     [systemComponents]
   );
   const assistantMcpReady = assistantMcp?.installed && assistantMcp.status === 'ok';
+  const hermesRuntime = useMemo(
+    () => systemComponents?.components.find((component) => component.name === 'hermes_assistant'),
+    [systemComponents]
+  );
+  const hermesRuntimeReady = hermesRuntime?.installed && hermesRuntime.status === 'ok';
 
   // ESC to close dialogs
   useEffect(() => {
@@ -465,14 +470,36 @@ export default function AssistantPage() {
               {knownConversationCount} known conversation{knownConversationCount === 1 ? '' : 's'}.
             </p>
           </div>
-          <div className="rounded-lg border border-amber-500/15 bg-amber-500/[0.04] p-4">
+          <div className={cn(
+            'rounded-lg border p-4',
+            hermesRuntimeReady
+              ? 'border-emerald-500/15 bg-emerald-500/[0.04]'
+              : 'border-amber-500/15 bg-amber-500/[0.04]'
+          )}>
             <div className="flex items-center justify-between gap-3">
-              <p className="text-xs font-medium uppercase tracking-[0.08em] text-amber-300/80">Runtime</p>
-              <CircleDashed className="h-4 w-4 text-amber-300" />
+              <p className={cn(
+                'text-xs font-medium uppercase tracking-[0.08em]',
+                hermesRuntimeReady ? 'text-emerald-300/80' : 'text-amber-300/80'
+              )}>Runtime</p>
+              {hermesRuntimeReady ? (
+                <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+              ) : (
+                <CircleDashed className="h-4 w-4 text-amber-300" />
+              )}
             </div>
-            <p className="mt-2 text-sm font-medium text-white">Hermes handoff pending</p>
+            <p className="mt-2 text-sm font-medium text-white">
+              {componentsLoading
+                ? 'Checking Hermes runtime'
+                : hermesRuntimeReady
+                  ? 'Hermes runtime active'
+                  : hermesRuntime?.installed
+                    ? 'Hermes runtime not healthy'
+                    : 'Hermes runtime not installed'}
+            </p>
             <p className="mt-1 text-xs text-white/45">
-              {knownMemoryCount} visible memory entr{knownMemoryCount === 1 ? 'y' : 'ies'} in compatibility mode.
+              {hermesRuntimeReady
+                ? `${hermesRuntime.path || 'hermes-assistant.service'} owns the assistant runtime.`
+                : `${knownMemoryCount} visible memory entr${knownMemoryCount === 1 ? 'y' : 'ies'} in compatibility mode.`}
             </p>
           </div>
         </div>

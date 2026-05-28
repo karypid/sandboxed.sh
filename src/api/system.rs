@@ -340,6 +340,10 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     let assistant_mcp_info = get_assistant_mcp_info().await;
     components.push(assistant_mcp_info);
 
+    // External Hermes assistant runtime/gateway service, if installed on this host.
+    let hermes_assistant_info = get_hermes_assistant_info().await;
+    components.push(hermes_assistant_info);
+
     // OpenCode
     let opencode_info = get_opencode_info(&state.config).await;
     components.push(opencode_info);
@@ -764,6 +768,70 @@ async fn get_assistant_mcp_info() -> ComponentInfo {
             status: ComponentStatus::NotInstalled,
         },
     }
+}
+
+async fn get_hermes_assistant_info() -> ComponentInfo {
+    for service_name in ["hermes-assistant-dev.service", "hermes-assistant.service"] {
+        if let Some(info) = get_systemd_service_component("hermes_assistant", service_name).await {
+            return info;
+        }
+    }
+
+    ComponentInfo {
+        name: "hermes_assistant".to_string(),
+        version: None,
+        installed: false,
+        update_available: None,
+        path: None,
+        source_path: None,
+        status: ComponentStatus::NotInstalled,
+    }
+}
+
+async fn get_systemd_service_component(
+    component_name: &str,
+    service_name: &str,
+) -> Option<ComponentInfo> {
+    let output = Command::new("systemctl")
+        .args([
+            "show",
+            service_name,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=FragmentPath",
+            "--value",
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let load_state = lines.next().unwrap_or_default().trim();
+    let active_state = lines.next().unwrap_or_default().trim();
+    let fragment_path = lines.next().unwrap_or_default().trim();
+
+    if load_state != "loaded" {
+        return None;
+    }
+
+    Some(ComponentInfo {
+        name: component_name.to_string(),
+        version: None,
+        installed: true,
+        update_available: None,
+        path: if fragment_path.is_empty() {
+            Some(service_name.to_string())
+        } else {
+            Some(fragment_path.to_string())
+        },
+        source_path: None,
+        status: if active_state == "active" {
+            ComponentStatus::Ok
+        } else {
+            ComponentStatus::Error
+        },
+    })
 }
 
 /// Find the path to a CLI binary.
