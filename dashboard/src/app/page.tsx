@@ -7,6 +7,7 @@ import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import { StatsCard } from '@/components/stats-card';
 import { LastDaySummary } from '@/components/last-day-summary';
+import { ActiveAutomations } from '@/components/active-automations';
 import { ShimmerStat } from '@/components/ui/shimmer';
 import { RelativeTime } from '@/components/ui/relative-time';
 import {
@@ -29,7 +30,7 @@ import {
   Zap,
   Loader,
   Clock,
-  RotateCcw,
+  Play,
   Trash2,
   Hand,
   XCircle,
@@ -131,7 +132,7 @@ const CompactMissionCard = memo(function CompactMissionCard({
         </Link>
         {showOpenedDot && (
           <span
-            className="shrink-0 h-1.5 w-1.5 rounded-full bg-white/40"
+            className="shrink-0 h-1.5 w-1.5 rounded-full bg-[rgb(var(--foreground-tertiary)/0.7)] ring-1 ring-[rgb(var(--background-elevated))]"
             aria-label="Opened"
             title="You've opened this mission"
           />
@@ -177,16 +178,18 @@ const CompactMissionCard = memo(function CompactMissionCard({
             <button
               onClick={() => onResume(mission.id)}
               className="p-0.5 rounded hover:bg-white/[0.08] text-white/40 hover:text-emerald-400 transition-colors"
-              title="Resume"
+              title="Resume mission"
+              aria-label="Resume mission"
             >
-              <RotateCcw className="h-3 w-3" />
+              <Play className="h-3 w-3" />
             </button>
           )}
           {isActuallyRunning && (
             <button
               onClick={() => onCancel(mission.id)}
               className="p-0.5 rounded hover:bg-white/[0.08] text-white/40 hover:text-red-400 transition-colors"
-              title="Cancel"
+              title="Cancel mission"
+              aria-label="Cancel mission"
             >
               <XCircle className="h-3 w-3" />
             </button>
@@ -195,7 +198,8 @@ const CompactMissionCard = memo(function CompactMissionCard({
             <button
               onClick={() => onDelete(mission.id)}
               className="p-0.5 rounded hover:bg-white/[0.08] text-white/40 hover:text-red-400 transition-colors"
-              title="Delete"
+              title="Delete mission"
+              aria-label="Delete mission"
             >
               <Trash2 className="h-3 w-3" />
             </button>
@@ -656,10 +660,14 @@ function OverviewPageContent() {
       </div>
 
       {/* Right sidebar - no glass panel wrapper, just border */}
-      <div className="w-72 h-screen border-l border-white/[0.06] p-4 overflow-y-auto">
+      <div className="w-72 h-screen border-l border-white/[0.06] p-4 overflow-y-auto space-y-4">
         <LastDaySummary
           missions={missions}
           runningMissionIds={runningLikeMissionIds}
+        />
+        <ActiveAutomations
+          missions={missions}
+          runningMissionIds={runningMissionIds}
         />
       </div>
     </div>

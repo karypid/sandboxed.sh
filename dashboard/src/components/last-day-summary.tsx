@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import useSWR from 'swr';
-import { CheckCircle, XCircle, Loader, DollarSign, Activity, Hand, BarChart3 } from 'lucide-react';
+import { CheckCircle, XCircle, Loader, DollarSign, BarChart3 } from 'lucide-react';
 import { getStats, type Mission, type StatsResponse } from '@/lib/api';
 import { formatCents, cn } from '@/lib/utils';
 import { stableJsonCompare } from '@/lib/swr-config';
@@ -34,7 +34,6 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
   );
 
   const activeCount = runningMissionIds.size;
-  const needsAttention = missions.filter((m) => m.status === 'awaiting_user').length;
 
   const updatedLast24h = useMemo(
     () =>
@@ -54,9 +53,6 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
   const completed = dayStats?.completed_tasks ?? finishedLast24h;
   const failed = dayStats?.failed_tasks ?? failedLast24h;
   const spent = dayStats?.total_cost_cents ?? 0;
-  const totalOutcomes = Math.max(completed + failed, 1);
-  const completedPct = (completed / totalOutcomes) * 100;
-  const failedPct = (failed / totalOutcomes) * 100;
   const hourlyBuckets = useMemo(
     () => buildHourlyBuckets(updatedLast24h, cutoff),
     [updatedLast24h, cutoff],
@@ -121,29 +117,6 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
           <span>now</span>
         </div>
       </div>
-
-      <div className="rounded-xl border border-white/[0.06] bg-white/[0.025] p-3">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-white/65">Outcome mix</span>
-          <span className="text-[10px] tabular-nums text-white/35">
-            {completed + failed} terminal
-          </span>
-        </div>
-        <div className="mt-3 flex h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
-          <div
-            className="bg-emerald-300/70"
-            style={{ width: `${completedPct}%` }}
-          />
-          <div
-            className="bg-red-300/55"
-            style={{ width: `${failedPct}%` }}
-          />
-        </div>
-        <div className="mt-3 grid grid-cols-2 gap-2">
-          <MetricRow icon={Hand} label="Needs you" value={needsAttention} attention={needsAttention > 0} />
-          <MetricRow icon={Activity} label="Updated" value={updatedLast24h.length} />
-        </div>
-      </div>
     </div>
   );
 }
@@ -192,30 +165,6 @@ function SummaryTile({
           loading && 'opacity-50',
         )}
       >
-        {value}
-      </div>
-    </div>
-  );
-}
-
-function MetricRow({
-  icon: Icon,
-  label,
-  value,
-  attention,
-}: {
-  icon: typeof Hand;
-  label: string;
-  value: number;
-  attention?: boolean;
-}) {
-  return (
-    <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] px-2.5 py-2">
-      <div className="flex items-center gap-1.5 text-[10px] text-white/40">
-        <Icon className={cn('h-3 w-3', attention ? 'text-amber-400' : 'text-white/35')} />
-        <span>{label}</span>
-      </div>
-      <div className={cn('mt-1 text-sm font-medium tabular-nums', attention ? 'text-amber-400' : 'text-white/75')}>
         {value}
       </div>
     </div>
