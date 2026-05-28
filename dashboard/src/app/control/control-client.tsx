@@ -11,6 +11,7 @@ import {
   memo,
   startTransition,
 } from "react";
+import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import dynamic from "next/dynamic";
 import { useSearchParams, useRouter } from "next/navigation";
@@ -88,6 +89,7 @@ import {
   getRunningMissions,
   isNetworkError,
   cancelMission,
+  deleteMission,
   autoGenerateMissionTitle,
   listWorkspaces,
   getHealth,
@@ -113,6 +115,7 @@ import {
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
 import { AsyncButton } from "@/components/ui/async-button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Send,
   Square,
@@ -165,6 +168,7 @@ import {
   Inbox,
   Flag,
   Pencil,
+  MoreVertical,
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
 import {
@@ -9408,6 +9412,24 @@ export default function ControlClient() {
   const [missionTitleDraft, setMissionTitleDraft] = useState("");
   const [savingMissionTitle, setSavingMissionTitle] = useState(false);
   const cancelMissionTitleSaveRef = useRef(false);
+  const [showMissionMenu, setShowMissionMenu] = useState(false);
+  const [missionMenuPos, setMissionMenuPos] = useState<{
+    top: number;
+    left: number;
+  } | null>(null);
+  const [showDeleteMissionConfirm, setShowDeleteMissionConfirm] =
+    useState(false);
+  const missionMenuRef = useRef<HTMLDivElement>(null);
+  const missionMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const openMissionMenu = useCallback(() => {
+    const rect = missionMenuButtonRef.current?.getBoundingClientRect();
+    if (rect) {
+      setMissionMenuPos({ top: rect.bottom + 6, left: rect.left });
+    }
+    setShowMissionMenu(true);
+  }, []);
+  const missionIsRunningOrActive =
+    viewingMissionIsRunning || activeMission?.status === "active";
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
     : null;
@@ -9481,6 +9503,62 @@ export default function ControlClient() {
     setCurrentMission,
     setViewingMission,
   ]);
+
+  const handleDeleteActiveMission = useCallback(async () => {
+    if (!activeMission) return;
+    const missionId = activeMission.id;
+    try {
+      await deleteMission(missionId);
+    } catch (error) {
+      console.error("Failed to delete mission:", error);
+      toast.error("Failed to delete mission");
+      return;
+    }
+    setShowDeleteMissionConfirm(false);
+    setViewingMissionId(null);
+    setViewingMission(null);
+    setCurrentMission(null);
+    setItems([]);
+    setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
+    setHasDesktopSession(false);
+    setLastMissionId(null);
+    router.replace("/control", { scroll: false });
+    void refreshRecentMissions();
+    toast.success("Mission deleted");
+  }, [
+    activeMission,
+    refreshRecentMissions,
+    router,
+    setCurrentMission,
+    setViewingMission,
+    setViewingMissionId,
+  ]);
+
+  useEffect(() => {
+    if (!showMissionMenu) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        missionMenuRef.current?.contains(target) ||
+        missionMenuButtonRef.current?.contains(target)
+      ) {
+        return;
+      }
+      setShowMissionMenu(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowMissionMenu(false);
+    };
+    const handleResize = () => setShowMissionMenu(false);
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", handleResize);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [showMissionMenu]);
 
   // Update favicon with mission status dot
   useFaviconStatus(faviconStatus, viewingMissionIsRunning);
@@ -9644,6 +9722,73 @@ export default function ControlClient() {
           />
         )}
 
+        <ConfirmDialog
+          open={showDeleteMissionConfirm}
+          title="Delete mission?"
+          description={`"${activeMissionSelectorLabel ?? "This mission"}" will be permanently deleted, along with its workspace files and any child missions. This can't be undone.`}
+          confirmLabel="Delete mission"
+          variant="danger"
+          onConfirm={handleDeleteActiveMission}
+          onCancel={() => setShowDeleteMissionConfirm(false)}
+        />
+
+        {showMissionMenu &&
+          activeMission &&
+          missionMenuPos &&
+          typeof document !== "undefined" &&
+          createPortal(
+            <div
+              ref={missionMenuRef}
+              role="menu"
+              style={{
+                position: "fixed",
+                top: missionMenuPos.top,
+                left: missionMenuPos.left,
+              }}
+              className="z-[60] min-w-[200px] overflow-hidden rounded-xl border border-white/[0.08] bg-[#1a1a1a] py-1 shadow-xl"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setShowMissionMenu(false);
+                  setMissionTitleDraft(activeMissionSelectorLabel ?? "");
+                  cancelMissionTitleSaveRef.current = false;
+                  setEditingMissionTitle(true);
+                }}
+                className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-white/80 transition-colors hover:bg-white/[0.06]"
+              >
+                <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                Rename
+              </button>
+              <div className="my-1 h-px bg-white/[0.06]" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled={missionIsRunningOrActive}
+                onClick={() => {
+                  setShowMissionMenu(false);
+                  setShowDeleteMissionConfirm(true);
+                }}
+                title={
+                  missionIsRunningOrActive
+                    ? "Cancel the mission before deleting"
+                    : undefined
+                }
+                className={cn(
+                  "flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors",
+                  missionIsRunningOrActive
+                    ? "cursor-not-allowed text-white/25"
+                    : "text-red-400 hover:bg-red-500/10",
+                )}
+              >
+                <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                Delete mission
+              </button>
+            </div>,
+            document.body,
+          )}
+
         {/* Header */}
         <div className="relative z-10 mb-6 flex items-center justify-between gap-2 lg:gap-4">
           <div className="flex items-center gap-3 min-w-0 overflow-hidden">
@@ -9716,19 +9861,24 @@ export default function ControlClient() {
                     )}
                     {!editingMissionTitle && (
                       <button
+                        ref={missionMenuButtonRef}
                         type="button"
                         onClick={(event) => {
                           event.preventDefault();
                           event.stopPropagation();
-                          setMissionTitleDraft(activeMissionSelectorLabel ?? "");
-                          cancelMissionTitleSaveRef.current = false;
-                          setEditingMissionTitle(true);
+                          if (showMissionMenu) {
+                            setShowMissionMenu(false);
+                          } else {
+                            openMissionMenu();
+                          }
                         }}
                         className="mission-selector-action inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors focus:outline-none focus:ring-1 focus:ring-indigo-400/50"
-                        aria-label="Rename mission"
-                        title="Rename mission"
+                        aria-label="Mission actions"
+                        aria-haspopup="menu"
+                        aria-expanded={showMissionMenu}
+                        title="Mission actions"
                       >
-                        <Pencil className="h-3 w-3" aria-hidden="true" />
+                        <MoreVertical className="h-3 w-3" aria-hidden="true" />
                       </button>
                     )}
                   </>
