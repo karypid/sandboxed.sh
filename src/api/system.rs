@@ -811,6 +811,22 @@ async fn get_systemd_service_component(
     let active_state = lines.next().unwrap_or_default().trim();
     let fragment_path = lines.next().unwrap_or_default().trim();
 
+    systemd_service_component_from_states(
+        component_name,
+        service_name,
+        load_state,
+        active_state,
+        fragment_path,
+    )
+}
+
+fn systemd_service_component_from_states(
+    component_name: &str,
+    service_name: &str,
+    load_state: &str,
+    active_state: &str,
+    fragment_path: &str,
+) -> Option<ComponentInfo> {
     if load_state != "loaded" {
         return None;
     }
@@ -2590,11 +2606,63 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
 mod tests {
     use super::{
         evaluate_debounce, evaluate_deploy_request, extract_version_token, is_safe_repo_path,
-        normalize_repo_path, select_repo_path, DebounceDecision, DeployRefusal,
-        DEPLOY_DEBOUNCE_SECS,
+        normalize_repo_path, select_repo_path, systemd_service_component_from_states,
+        ComponentStatus, DebounceDecision, DeployRefusal, DEPLOY_DEBOUNCE_SECS,
     };
 
     // ─── Deploy safety rails ────────────────────────────────────────────────
+
+    #[test]
+    fn systemd_service_component_reports_active_service_ok() {
+        let component = systemd_service_component_from_states(
+            "hermes_assistant",
+            "hermes-assistant-dev.service",
+            "loaded",
+            "active",
+            "/etc/systemd/system/hermes-assistant-dev.service",
+        )
+        .expect("loaded service should be reported");
+
+        assert_eq!(component.name, "hermes_assistant");
+        assert!(component.installed);
+        assert_eq!(
+            component.path.as_deref(),
+            Some("/etc/systemd/system/hermes-assistant-dev.service")
+        );
+        assert!(matches!(component.status, ComponentStatus::Ok));
+    }
+
+    #[test]
+    fn systemd_service_component_reports_loaded_inactive_service_error() {
+        let component = systemd_service_component_from_states(
+            "hermes_assistant",
+            "hermes-assistant-dev.service",
+            "loaded",
+            "inactive",
+            "",
+        )
+        .expect("loaded inactive service should be visible");
+
+        assert!(component.installed);
+        assert_eq!(
+            component.path.as_deref(),
+            Some("hermes-assistant-dev.service")
+        );
+        assert!(matches!(component.status, ComponentStatus::Error));
+    }
+
+    #[test]
+    fn systemd_service_component_ignores_unloaded_services() {
+        let component = systemd_service_component_from_states(
+            "hermes_assistant",
+            "hermes-assistant-dev.service",
+            "not-found",
+            "inactive",
+            "",
+        );
+
+        assert!(component.is_none());
+    }
 
     #[test]
     fn debounce_allows_when_no_prior_deploy() {
