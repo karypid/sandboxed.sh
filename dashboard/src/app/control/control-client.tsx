@@ -4474,7 +4474,20 @@ export default function ControlClient() {
             merged.sort((a, b) => a.sequence - b.sequence);
             sorted = merged;
             metaMaxSeq = maxSequence;
-            metaTotal = delta.meta.totalEvents;
+            // The delta fetch above runs with `includeCounts: false`, so the
+            // server omits `X-Total-Events` and `delta.meta.totalEvents` is
+            // undefined. Derive the total from the cached total (always a real
+            // value — writes are gated on `metaTotal !== undefined`) plus the
+            // events this delta genuinely added. Otherwise the total reads as
+            // 0, `computeHasMoreOlder()` returns false, and the "Load older
+            // messages" button vanishes on reopen even though older history
+            // exists.
+            const addedByDelta = merged.length - cached.events.length;
+            metaTotal =
+              delta.meta.totalEvents ??
+              (cached.totalEvents > 0
+                ? cached.totalEvents + addedByDelta
+                : undefined);
             cacheHit = true;
             eventMergeCount = merged.length;
           }
@@ -9599,19 +9612,9 @@ export default function ControlClient() {
             {/* Unified Mission Selector */}
             <div className="relative">
               <div
-                role="button"
-                tabIndex={0}
-                onClick={() => setShowMissionSwitcher(true)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    setShowMissionSwitcher(true);
-                  }
-                }}
                 className={cn(
                   "mission-selector-trigger flex h-9 items-center gap-2 px-3 rounded-lg transition-colors",
                 )}
-                title="Switch mission (⌘K)"
               >
                 {activeMission ? (
                   <>
@@ -9654,11 +9657,11 @@ export default function ControlClient() {
                         }}
                         autoFocus
                         disabled={savingMissionTitle}
-                        className="h-6 w-[180px] rounded-md border border-white/[0.12] bg-black/30 px-2 text-sm font-medium text-white/80 outline-none focus:border-indigo-400/60 sm:w-[260px]"
+                        className="mission-title-input h-6 w-[180px] rounded-md border px-2 text-sm font-medium outline-none focus:border-indigo-400/60 sm:w-[260px]"
                       />
                     ) : (
                       <span
-                        className="text-sm font-medium text-white/70 truncate max-w-[180px] sm:max-w-[260px]"
+                        className="mission-selector-title max-w-[180px] truncate text-sm font-medium sm:max-w-[260px]"
                         title={activeMissionSelectorLabel ?? undefined}
                         onClick={(event) => {
                           event.preventDefault();
@@ -9674,10 +9677,21 @@ export default function ControlClient() {
                       </span>
                     )}
                     {!editingMissionTitle && (
-                      <Pencil
-                        className="h-3 w-3 text-white/25 transition-colors hover:text-white/60"
-                        aria-hidden="true"
-                      />
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setMissionTitleDraft(activeMissionSelectorLabel ?? "");
+                          cancelMissionTitleSaveRef.current = false;
+                          setEditingMissionTitle(true);
+                        }}
+                        className="mission-selector-action inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors focus:outline-none focus:ring-1 focus:ring-indigo-400/50"
+                        aria-label="Rename mission"
+                        title="Rename mission"
+                      >
+                        <Pencil className="h-3 w-3" aria-hidden="true" />
+                      </button>
                     )}
                   </>
                 ) : (
@@ -9688,7 +9702,15 @@ export default function ControlClient() {
                     </span>
                   </>
                 )}
-                <ChevronDown className="h-3 w-3 text-white/40" />
+                <button
+                  type="button"
+                  onClick={() => setShowMissionSwitcher(true)}
+                  className="mission-selector-action inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors focus:outline-none focus:ring-1 focus:ring-indigo-400/50"
+                  aria-label="Switch mission"
+                  title="Switch mission (⌘K)"
+                >
+                  <ChevronDown className="h-3 w-3" aria-hidden="true" />
+                </button>
               </div>
             </div>
           </div>

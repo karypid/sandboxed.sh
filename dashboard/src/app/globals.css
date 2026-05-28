@@ -616,28 +616,44 @@ select:focus-visible {
 }
 
 .mission-selector-trigger {
-  background-color: rgb(var(--accent-soft) / 0.24);
-  border: 1px solid rgb(var(--accent) / 0.22);
-  color: rgb(var(--message-user-text) / 0.92);
+  background-color: rgb(var(--background-elevated) / 0.62);
+  border: 1px solid rgb(var(--border) / 0.08);
+  color: rgb(var(--foreground-secondary));
 }
 
 .mission-selector-trigger:hover {
-  background-color: rgb(var(--accent-soft) / 0.34);
+  background-color: rgb(var(--background-tertiary) / 0.45);
 }
 
-.mission-selector-trigger * {
-  color: inherit !important;
+.mission-selector-title {
+  color: rgb(var(--foreground-secondary));
+}
+
+.mission-selector-action {
+  color: rgb(var(--foreground-tertiary));
+}
+
+.mission-selector-action:hover,
+.mission-selector-action:focus-visible {
+  background-color: rgb(var(--border) / 0.06);
+  color: rgb(var(--foreground));
+}
+
+.mission-title-input {
+  background-color: rgb(var(--background) / 0.58);
+  border-color: rgb(var(--border) / 0.12);
+  color: rgb(var(--foreground) / 0.86);
 }
 
 :root[data-theme="light"] {
   .mission-selector-trigger {
-    background-color: rgb(var(--accent-soft));
-    border-color: rgb(var(--accent) / 0.28);
-    color: rgb(var(--message-user-text));
+    background-color: rgb(var(--background-elevated) / 0.9);
+    border-color: rgb(var(--border) / 0.1);
+    color: rgb(var(--foreground-secondary));
   }
 
   .mission-selector-trigger:hover {
-    background-color: rgb(199 210 254);
+    background-color: rgb(var(--background-tertiary) / 0.65);
   }
 }
 

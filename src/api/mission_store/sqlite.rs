@@ -3756,13 +3756,30 @@ impl MissionStore for SqliteMissionStore {
                         &event_type,
                         &content,
                     );
-                    conn.execute(
-                        "UPDATE mission_events
-                         SET metadata = ?1, timestamp = ?2, content = ?3, content_file = ?4
-                         WHERE id = ?5",
-                        params![metadata_str, now, content_inline, content_file, row_id],
-                    )
-                    .map_err(|e| e.to_string())?;
+                    if event_type == "text_delta" {
+                        let sequence: i64 = conn
+                            .query_row(
+                                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mission_events WHERE mission_id = ?1",
+                                params![&mid],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(1);
+                        conn.execute(
+                            "UPDATE mission_events
+                             SET sequence = ?1, metadata = ?2, timestamp = ?3, content = ?4, content_file = ?5
+                             WHERE id = ?6",
+                            params![sequence, metadata_str, now, content_inline, content_file, row_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        conn.execute(
+                            "UPDATE mission_events
+                             SET metadata = ?1, timestamp = ?2, content = ?3, content_file = ?4
+                             WHERE id = ?5",
+                            params![metadata_str, now, content_inline, content_file, row_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
                     return Ok(());
                 }
             }
@@ -9262,6 +9279,7 @@ mod tests {
     use crate::agents::{
         CompletionConfidence, CompletionEvidence, CompletionSignal, CostSource, TerminalReason,
     };
+    use crate::api::control::AgentEvent;
     use crate::api::mission_store::{
         now_string, Automation, AutomationDriver, CommandSource, FreshSession, MissionMode,
         MissionStatus, MissionStore, PalomaCooldownState, PalomaDecision, PalomaMissionCard,
@@ -12290,6 +12308,77 @@ mod tests {
 
         assert!(mission_ids.contains(&task_mission.id));
         assert!(!mission_ids.contains(&assistant_mission.id));
+    }
+
+    #[tokio::test]
+    async fn text_delta_latest_update_advances_sequence_for_since_seq_replay() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("streaming"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::TextDelta {
+                    content: "first draft".to_string(),
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("first text delta");
+        let first_seq = store
+            .max_event_sequence(mission.id)
+            .await
+            .expect("first max sequence");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::ToolCall {
+                    tool_call_id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    args: json!({ "command": "true" }),
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("tool call");
+        let after_tool_seq = store
+            .max_event_sequence(mission.id)
+            .await
+            .expect("tool max sequence");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::TextDelta {
+                    content: "final useful draft".to_string(),
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("updated text delta");
+        let final_seq = store
+            .max_event_sequence(mission.id)
+            .await
+            .expect("final max sequence");
+
+        assert!(after_tool_seq > first_seq);
+        assert!(final_seq > after_tool_seq);
+
+        let replay = store
+            .get_events_since(mission.id, after_tool_seq, None, None)
+            .await
+            .expect("events since tool");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_type, "text_delta");
+        assert_eq!(replay[0].content, "final useful draft");
+        assert_eq!(replay[0].sequence, final_seq);
     }
 
     #[tokio::test]
