@@ -126,10 +126,10 @@ test.describe('Assistant page', () => {
             {
               name: 'hermes_assistant',
               version: null,
-              installed: false,
+              installed: true,
               update_available: null,
-              path: null,
-              status: 'not_installed',
+              path: '/etc/systemd/system/hermes-assistant-dev.service',
+              status: 'ok',
             },
           ],
         });
@@ -181,6 +181,10 @@ test.describe('Assistant page', () => {
     await expect(page.getByRole('button', { name: 'Edit @hermes_devbot' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Deactivate @hermes_devbot' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Delete @hermes_devbot' })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Edit @hermes_devbot' }).click();
+    await expect(page.getByText('Hermes runtime is active. Keep this compatibility gateway inactive for bot tokens already moved to Hermes.')).toBeVisible();
+    await page.getByRole('button', { name: 'Cancel' }).click();
 
     await page.getByRole('button', { name: 'Expand @hermes_devbot details' }).click();
 

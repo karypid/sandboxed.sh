@@ -1214,6 +1214,14 @@ export default function AssistantPage() {
             <h3 className="text-lg font-medium text-white mb-4">
               Edit @{editingBot.bot_username || 'bot'}
             </h3>
+            {hermesRuntimeReady && (
+              <div className="mb-4 flex gap-3 rounded-lg border border-amber-500/20 bg-amber-500/[0.06] p-3">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+                <p className="text-xs leading-5 text-white/55">
+                  Hermes runtime is active. Keep this compatibility gateway inactive for bot tokens already moved to Hermes.
+                </p>
+              </div>
+            )}
             <div className="space-y-4">
               {/* Mission settings */}
               <div className="border-b border-white/[0.06] pb-3">
