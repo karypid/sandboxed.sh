@@ -583,6 +583,24 @@ fn scrub_sensitive_json(value: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const ENV_KEYS: &[&str] = &[
+        "HERMES_SANDBOXED_API_URL",
+        "SANDBOXED_API_URL",
+        "OPEN_AGENT_API_URL",
+        "HERMES_SANDBOXED_API_TOKEN",
+        "SANDBOXED_API_TOKEN",
+        "OPEN_AGENT_API_TOKEN",
+    ];
+
+    fn clear_env() {
+        for key in ENV_KEYS {
+            std::env::remove_var(key);
+        }
+    }
 
     #[test]
     fn compact_mission_summary_keeps_only_hermes_safe_fields() {
@@ -625,6 +643,40 @@ mod tests {
         assert_eq!(value["mission"]["notes"][0], "visible");
         assert_eq!(value["mission"]["notes"][1], "[redacted]");
         assert_eq!(value["token"], "[redacted]");
+    }
+
+    #[test]
+    fn hermes_connection_env_takes_precedence_over_legacy_names() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::set_var("OPEN_AGENT_API_URL", "https://open-agent.example");
+        std::env::set_var("SANDBOXED_API_URL", "https://sandboxed.example");
+        std::env::set_var("HERMES_SANDBOXED_API_URL", "https://hermes.example/");
+        std::env::set_var("OPEN_AGENT_API_TOKEN", "open-agent-token");
+        std::env::set_var("SANDBOXED_API_TOKEN", "sandboxed-token");
+        std::env::set_var("HERMES_SANDBOXED_API_TOKEN", "hermes-token");
+
+        let server = AssistantMcp::new();
+
+        assert_eq!(server.api_url, "https://hermes.example");
+        assert_eq!(server.api_token.as_deref(), Some("hermes-token"));
+        clear_env();
+    }
+
+    #[test]
+    fn legacy_connection_envs_remain_supported_for_compatibility() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::set_var("OPEN_AGENT_API_URL", "https://open-agent.example");
+        std::env::set_var("SANDBOXED_API_URL", "https://sandboxed.example/");
+        std::env::set_var("OPEN_AGENT_API_TOKEN", "open-agent-token");
+        std::env::set_var("SANDBOXED_API_TOKEN", "sandboxed-token");
+
+        let server = AssistantMcp::new();
+
+        assert_eq!(server.api_url, "https://sandboxed.example");
+        assert_eq!(server.api_token.as_deref(), Some("sandboxed-token"));
+        clear_env();
     }
 }
 
