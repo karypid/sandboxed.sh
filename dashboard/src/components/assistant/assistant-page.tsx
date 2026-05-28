@@ -59,6 +59,10 @@ const BACKEND_LABELS: Record<string, string> = {
   grok: 'Grok Build',
 };
 
+function gatewayLabel(bot: TelegramChannel) {
+  return bot.bot_username ? `@${bot.bot_username}` : 'gateway';
+}
+
 export default function AssistantPage() {
   const { data: bots = [], mutate: mutateBots, isLoading: botsLoading } = useSWR(
     'telegram-bots',
@@ -614,6 +618,7 @@ export default function AssistantPage() {
                   {/* Actions */}
                   <div className="flex items-center gap-1">
                     <button
+                      type="button"
                       onClick={() => {
                         setEditingBot(bot);
                         setEditInstructions(bot.instructions || '');
@@ -625,11 +630,13 @@ export default function AssistantPage() {
                         setEditConfigProfile(bot.default_config_profile || '');
                       }}
                       className="p-2 rounded-lg text-white/40 hover:text-white hover:bg-white/[0.06] transition-colors"
-                      title="Edit"
+                      aria-label={`Edit ${gatewayLabel(bot)}`}
+                      title={`Edit ${gatewayLabel(bot)}`}
                     >
                       <Settings className="h-4 w-4" />
                     </button>
                     <button
+                      type="button"
                       onClick={() => handleToggleActive(bot)}
                       className={cn(
                         'p-2 rounded-lg transition-colors',
@@ -637,6 +644,7 @@ export default function AssistantPage() {
                           ? 'text-emerald-400/60 hover:text-emerald-400 hover:bg-emerald-500/10'
                           : 'text-white/40 hover:text-white hover:bg-white/[0.06]'
                       )}
+                      aria-label={`${bot.active ? 'Deactivate' : 'Activate'} ${gatewayLabel(bot)}`}
                       title={bot.active ? 'Deactivate' : 'Activate'}
                     >
                       {bot.active ? (
@@ -646,9 +654,11 @@ export default function AssistantPage() {
                       )}
                     </button>
                     <button
+                      type="button"
                       onClick={() => handleDelete(bot)}
                       className="p-2 rounded-lg text-red-400/60 hover:text-red-400 hover:bg-red-500/10 transition-colors"
-                      title="Delete"
+                      aria-label={`Delete ${gatewayLabel(bot)}`}
+                      title={`Delete ${gatewayLabel(bot)}`}
                     >
                       <Trash2 className="h-4 w-4" />
                     </button>
@@ -657,7 +667,9 @@ export default function AssistantPage() {
 
                 {/* Expandable details - show chats */}
                 <button
+                  type="button"
                   onClick={() => toggleExpand(bot.id)}
+                  aria-label={`${expandedBots.has(bot.id) ? 'Collapse' : 'Expand'} ${gatewayLabel(bot)} details`}
                   className="w-full flex items-center justify-center gap-1 py-1.5 border-t border-white/[0.04] text-[10px] text-white/30 hover:text-white/50 hover:bg-white/[0.02] transition-colors"
                 >
                   {expandedBots.has(bot.id) ? (
@@ -719,7 +731,7 @@ export default function AssistantPage() {
                         </div>
                       ) : (chatsByBot[bot.id] || []).length === 0 ? (
                         <p className="text-xs text-white/30 italic">
-                          No conversations yet. Message the bot on Telegram to start one.
+                          No conversations yet. Message the connected gateway to start one.
                         </p>
                       ) : (
                         <div className="space-y-1">
@@ -749,14 +761,14 @@ export default function AssistantPage() {
                     </div>
 
                     <div>
-                      <p className="text-[10px] text-white/30 mb-2">Recent Telegram Actions</p>
+                      <p className="text-[10px] text-white/30 mb-2">Recent Gateway Actions</p>
                       {loadingActions.has(bot.id) ? (
                         <div className="flex items-center gap-2 text-xs text-white/40">
                           <Loader className="h-3 w-3 animate-spin" /> Loading...
                         </div>
                       ) : (actionsByBot[bot.id] || []).length === 0 ? (
                         <p className="text-xs text-white/30 italic">
-                          No native Telegram actions recorded yet.
+                          No gateway actions recorded yet.
                         </p>
                       ) : (
                         <div className="space-y-1">
@@ -798,14 +810,14 @@ export default function AssistantPage() {
                     </div>
 
                     <div>
-                      <p className="text-[10px] text-white/30 mb-2">Scheduled Telegram Actions</p>
+                      <p className="text-[10px] text-white/30 mb-2">Scheduled Gateway Messages</p>
                       {loadingScheduled.has(bot.id) ? (
                         <div className="flex items-center gap-2 text-xs text-white/40">
                           <Loader className="h-3 w-3 animate-spin" /> Loading...
                         </div>
                       ) : (scheduledByBot[bot.id] || []).length === 0 ? (
                         <p className="text-xs text-white/30 italic">
-                          No scheduled Telegram messages for this bot.
+                          No scheduled gateway messages for this bot.
                         </p>
                       ) : (
                         <div className="space-y-1">
@@ -863,6 +875,7 @@ export default function AssistantPage() {
                         <button
                           type="button"
                           onClick={() => void loadMemorySearch(bot.id)}
+                          aria-label={`Search structured memory for ${gatewayLabel(bot)}`}
                           className="px-3 py-2 rounded-lg border border-white/[0.08] bg-white/[0.03] text-xs text-white/70 hover:text-white hover:border-white/[0.16] transition-colors"
                         >
                           Search

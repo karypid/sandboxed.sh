@@ -91,4 +91,98 @@ test.describe('Assistant page', () => {
     await expect(page).toHaveURL(/\/assistant/);
     await expect(page.getByRole('heading', { name: 'Assistant', exact: true })).toBeVisible();
   });
+
+  test('labels gateway controls and details with Assistant wording', async ({ page }) => {
+    await page.route('**/api/**', async (route) => {
+      const url = new URL(route.request().url());
+      const path = url.pathname;
+      const json = (body: unknown) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify(body),
+        });
+
+      if (path === '/api/health') {
+        return json({ auth_required: false, auth_mode: 'disabled' });
+      }
+      if (path === '/api/system/components') {
+        return json({
+          components: [
+            {
+              name: 'assistant_mcp',
+              version: '0.1.0',
+              installed: true,
+              update_available: null,
+              path: '/usr/local/bin/assistant-mcp',
+              status: 'ok',
+            },
+            {
+              name: 'hermes_assistant',
+              version: null,
+              installed: false,
+              update_available: null,
+              path: null,
+              status: 'not_installed',
+            },
+          ],
+        });
+      }
+      if (path === '/api/control/telegram/bots') {
+        return json([
+          {
+            id: 'bot-1',
+            mission_id: 'mission-1',
+            bot_username: 'hermes_devbot',
+            allowed_chat_ids: [],
+            trigger_mode: 'mention_or_dm',
+            active: true,
+            instructions: null,
+            auto_create_missions: true,
+            default_backend: 'claudecode',
+            default_model_override: null,
+            default_model_effort: null,
+            default_workspace_id: null,
+            default_config_profile: null,
+            default_agent: null,
+            created_at: '2026-05-28T12:00:00Z',
+            updated_at: '2026-05-28T12:00:00Z',
+          },
+        ]);
+      }
+      if (path === '/api/backends') {
+        return json([{ id: 'claudecode', name: 'Claude Code', enabled: true, settings: {} }]);
+      }
+      if (path === '/api/workspaces' || path === '/api/control/missions' || path === '/api/library/config-profile') {
+        return json([]);
+      }
+      if (path === '/api/providers') {
+        return json({ providers: [] });
+      }
+      if (path === '/api/providers/backend-models') {
+        return json({ backends: {} });
+      }
+      if (path.startsWith('/api/control/telegram/bots/bot-1/')) {
+        return json([]);
+      }
+
+      return route.continue();
+    });
+
+    await page.goto('/assistant');
+
+    await expect(page.getByText('@hermes_devbot')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Edit @hermes_devbot' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Deactivate @hermes_devbot' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Delete @hermes_devbot' })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Expand @hermes_devbot details' }).click();
+
+    await expect(page.getByText('Recent Gateway Actions', { exact: true })).toBeVisible();
+    await expect(page.getByText('No gateway actions recorded yet.')).toBeVisible();
+    await expect(page.getByText('Scheduled Gateway Messages', { exact: true })).toBeVisible();
+    await expect(page.getByText('No scheduled gateway messages for this bot.')).toBeVisible();
+    await expect(page.getByText('No conversations yet. Message the connected gateway to start one.')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Search structured memory for @hermes_devbot' })).toBeVisible();
+  });
 });
