@@ -165,6 +165,41 @@ sandboxed.sh side of the service contract:
   shape for the external Hermes runtime. Replace the placeholder `ExecStart`
   with the actual Hermes binary or launcher from the Hermes repository.
 
+## Dev Runtime Install Checklist
+
+This repository cannot install the external Hermes runtime by itself. After the
+Hermes runtime artifact is available on the dev host, use the example files as
+the sandboxed.sh-side contract:
+
+```bash
+install -d -m 0755 /etc/sandboxed-sh
+install -m 0600 docs/examples/hermes-assistant-dev.env.example \
+  /etc/sandboxed-sh/hermes-assistant-dev.env
+$EDITOR /etc/sandboxed-sh/hermes-assistant-dev.env
+
+install -m 0644 docs/examples/hermes-assistant-dev.service.example \
+  /etc/systemd/system/hermes-assistant-dev.service
+$EDITOR /etc/systemd/system/hermes-assistant-dev.service
+
+systemctl daemon-reload
+systemctl enable --now hermes-assistant-dev.service
+systemctl status hermes-assistant-dev.service --no-pager
+```
+
+Then verify sandboxed.sh can see the runtime:
+
+```bash
+curl -fsS https://agent-backend-dev.thomas.md/api/system/components \
+  | jq -c '.components[] | select(.name == "hermes_assistant")'
+
+scripts/assistant_mcp_smoke.sh \
+  --base-url https://agent-backend-dev.thomas.md \
+  --require-hermes-runtime
+```
+
+Do not move Telegram webhook ownership until the runtime component reports
+`installed: true` and `status: "ok"`.
+
 Only promote to production after:
 
 - Hermes gateway can receive Telegram DMs.
