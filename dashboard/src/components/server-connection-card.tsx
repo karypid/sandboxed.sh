@@ -404,6 +404,7 @@ export function ServerConnectionCard({
             </button>
             <button
               onClick={() => setComponentsExpanded(!componentsExpanded)}
+              aria-label={componentsExpanded ? 'Collapse components' : 'Expand components'}
               className="p-1 rounded-lg text-white/40 hover:text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer"
             >
               {componentsExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
