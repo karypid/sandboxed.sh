@@ -612,6 +612,11 @@ export default function AssistantPage() {
                       >
                         {bot.active ? 'Active' : 'Inactive'}
                       </span>
+                      {hermesRuntimeReady && bot.active && (
+                        <span className="inline-flex items-center rounded-full border border-amber-500/20 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-300">
+                          Compatibility webhook
+                        </span>
+                      )}
                       <span className="inline-flex items-center rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-white/40">
                         {TRIGGER_MODE_LABELS[bot.trigger_mode]}
                       </span>

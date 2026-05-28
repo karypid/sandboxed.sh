@@ -134,7 +134,7 @@ is not to port sandboxed.sh's Telegram webhook code into Hermes. Instead:
 
 1. Keep the old Telegram backend path active behind compatibility flags.
 2. Add an `Assistant` dashboard tab that controls Hermes config, service status,
-   selected model chain, MCP permissions, and Telegram settings.
+   selected model chain, MCP permissions, and compatibility gateway settings.
 3. Configure Hermes gateway for Telegram using the existing bot token and
    allowed users.
 4. Point Hermes at `assistant-mcp` for sandboxed mission control.
