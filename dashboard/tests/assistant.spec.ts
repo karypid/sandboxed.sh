@@ -87,6 +87,7 @@ test.describe('Assistant page', () => {
     await expect(page.getByText('assistant-mcp not ready')).toBeVisible();
     await expect(page.getByText('Install assistant-mcp before handing mission control to Hermes.')).toBeVisible();
     await expect(page.getByText('Hermes runtime not installed')).toBeVisible();
+    await expect(page.getByText('Install hermes-assistant-dev.service before moving webhook ownership.')).toBeVisible();
 
     await page.getByRole('button', { name: /Add Gateway/i }).first().click();
     await expect(page.getByRole('dialog', { name: 'Add Assistant Gateway' })).toBeVisible();

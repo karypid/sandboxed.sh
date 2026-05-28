@@ -385,10 +385,6 @@ export default function AssistantPage() {
     () => Object.values(chatsByBot).reduce((count, chats) => count + chats.length, 0),
     [chatsByBot]
   );
-  const knownMemoryCount = useMemo(
-    () => Object.values(memoryByBot).reduce((count, entries) => count + entries.length, 0),
-    [memoryByBot]
-  );
   const assistantMcp = useMemo(
     () => systemComponents?.components.find((component) => component.name === 'assistant_mcp'),
     [systemComponents]
@@ -502,9 +498,13 @@ export default function AssistantPage() {
                     : 'Hermes runtime not installed'}
             </p>
             <p className="mt-1 text-xs text-white/45">
-              {hermesRuntimeReady
-                ? `${hermesRuntime.path || 'hermes-assistant.service'} owns the assistant runtime.`
-                : `${knownMemoryCount} visible memory entr${knownMemoryCount === 1 ? 'y' : 'ies'} in compatibility mode.`}
+              {componentsLoading
+                ? 'Checking the host runtime service.'
+                : hermesRuntimeReady
+                  ? `${hermesRuntime.path || 'hermes-assistant.service'} owns the assistant runtime.`
+                  : hermesRuntime?.installed
+                    ? `Service reported ${hermesRuntime.status || 'not healthy'}; keep Telegram in compatibility mode.`
+                    : 'Install hermes-assistant-dev.service before moving webhook ownership.'}
             </p>
           </div>
         </div>
