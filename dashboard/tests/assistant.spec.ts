@@ -9,6 +9,24 @@ test.describe('Assistant page', () => {
         body: JSON.stringify({ auth_required: false, auth_mode: 'disabled' }),
       });
     });
+    await page.route('**/api/system/components', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          components: [
+            {
+              name: 'assistant_mcp',
+              version: '0.1.0',
+              installed: true,
+              update_available: null,
+              path: '/usr/local/bin/assistant-mcp',
+              status: 'ok',
+            },
+          ],
+        }),
+      });
+    });
   });
 
   test('is a top-level navigation destination', async ({ page }) => {
@@ -19,6 +37,7 @@ test.describe('Assistant page', () => {
 
     await expect(page).toHaveURL(/\/assistant/);
     await expect(page.getByRole('heading', { name: 'Assistant', exact: true })).toBeVisible();
+    await expect(page.getByText('assistant-mcp 0.1.0')).toBeVisible();
     await expect(page.getByRole('button', { name: /Add Gateway/i }).first()).toBeVisible();
   });
 

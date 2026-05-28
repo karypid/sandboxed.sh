@@ -13,6 +13,7 @@ import {
   listBotStructuredMemory,
   searchBotStructuredMemory,
   listMissions,
+  getSystemComponents,
   type Mission,
   type TelegramActionExecution,
   type TelegramChannel,
@@ -83,6 +84,11 @@ export default function AssistantPage() {
   const { data: missions = [] } = useSWR('missions', listMissions, {
     revalidateOnFocus: false,
   });
+  const { data: systemComponents, isLoading: componentsLoading } = useSWR(
+    'system-components',
+    getSystemComponents,
+    { revalidateOnFocus: false, dedupingInterval: 30000 }
+  );
   const { data: configProfiles = [] } = useSWR('config-profiles', listConfigProfiles, {
     revalidateOnFocus: false,
   });
@@ -378,6 +384,11 @@ export default function AssistantPage() {
     () => Object.values(memoryByBot).reduce((count, entries) => count + entries.length, 0),
     [memoryByBot]
   );
+  const assistantMcp = useMemo(
+    () => systemComponents?.components.find((component) => component.name === 'assistant_mcp'),
+    [systemComponents]
+  );
+  const assistantMcpReady = assistantMcp?.installed && assistantMcp.status === 'ok';
 
   // ESC to close dialogs
   useEffect(() => {
@@ -412,13 +423,35 @@ export default function AssistantPage() {
         </header>
 
         <div className="grid gap-3 md:grid-cols-3">
-          <div className="rounded-lg border border-emerald-500/15 bg-emerald-500/[0.04] p-4">
+          <div className={cn(
+            'rounded-lg border p-4',
+            assistantMcpReady
+              ? 'border-emerald-500/15 bg-emerald-500/[0.04]'
+              : 'border-amber-500/15 bg-amber-500/[0.04]'
+          )}>
             <div className="flex items-center justify-between gap-3">
-              <p className="text-xs font-medium uppercase tracking-[0.08em] text-emerald-300/80">MCP</p>
-              <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+              <p className={cn(
+                'text-xs font-medium uppercase tracking-[0.08em]',
+                assistantMcpReady ? 'text-emerald-300/80' : 'text-amber-300/80'
+              )}>MCP</p>
+              {assistantMcpReady ? (
+                <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+              ) : (
+                <CircleDashed className="h-4 w-4 text-amber-300" />
+              )}
             </div>
-            <p className="mt-2 text-sm font-medium text-white">assistant-mcp ready</p>
-            <p className="mt-1 text-xs text-white/45">Hermes can use sandboxed.sh mission tools.</p>
+            <p className="mt-2 text-sm font-medium text-white">
+              {componentsLoading
+                ? 'Checking assistant-mcp'
+                : assistantMcpReady
+                  ? `assistant-mcp ${assistantMcp.version || ''}`.trim()
+                  : 'assistant-mcp not ready'}
+            </p>
+            <p className="mt-1 text-xs text-white/45">
+              {assistantMcpReady
+                ? `${assistantMcp.path || 'assistant-mcp'} is available for Hermes.`
+                : 'Install assistant-mcp before handing mission control to Hermes.'}
+            </p>
           </div>
           <div className="rounded-lg border border-sky-500/15 bg-sky-500/[0.04] p-4">
             <div className="flex items-center justify-between gap-3">
