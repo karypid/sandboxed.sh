@@ -1471,12 +1471,19 @@ pub struct DeployRequest {
     /// `/opt/sandboxed-sh-<name>/`).
     #[serde(default)]
     pub repo_path: Option<String>,
+    /// Optional guard supplied by deploy tooling. When set, the API refuses
+    /// if the request reached a different systemd service than intended.
+    #[serde(default)]
+    pub expected_service: Option<String>,
 }
 
 /// Reasons we may refuse a deploy without doing any I/O. Surfaced to the MCP
 /// tool so the agent can decide whether to retry with `force=true`.
 #[derive(Debug, PartialEq, Eq)]
 enum DeployRefusal {
+    /// The caller expected to deploy a different service than the API instance
+    /// that received the request.
+    WrongService { expected: String, actual: String },
     /// Calling mission lives on this service; restarting it would kill the
     /// caller. Returned as a refusal so an LLM can't accidentally request
     /// self-destruction; the agent can retry with `force=true` if it knows
@@ -1489,6 +1496,7 @@ enum DeployRefusal {
 impl DeployRefusal {
     fn http_status(&self) -> StatusCode {
         match self {
+            DeployRefusal::WrongService { .. } => StatusCode::CONFLICT,
             DeployRefusal::SelfTarget => StatusCode::CONFLICT,
             DeployRefusal::Debounced { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
@@ -1496,6 +1504,11 @@ impl DeployRefusal {
 
     fn message(&self) -> String {
         match self {
+            DeployRefusal::WrongService { expected, actual } => format!(
+                "Deploy target mismatch: request expected {}, but this API would restart {}. \
+                 Send the request to the correct environment/API URL.",
+                expected, actual
+            ),
             DeployRefusal::SelfTarget => {
                 "Calling mission runs on the service this deploy would restart. \
                  Pass force=true if killing your own turn is acceptable, or run the deploy from a \
@@ -1514,10 +1527,20 @@ impl DeployRefusal {
 /// Pure helper exercised by tests. Returns the refusal that should fire (if
 /// any) given the inputs the handler computed from state + request.
 fn evaluate_deploy_request(
+    actual_service: Option<&str>,
+    expected_service: Option<&str>,
     calling_mission_on_this_service: bool,
     last_deploy_secs_ago: Option<u64>,
     force: bool,
 ) -> Option<DeployRefusal> {
+    if let (Some(actual), Some(expected)) = (actual_service, expected_service) {
+        if actual != expected {
+            return Some(DeployRefusal::WrongService {
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            });
+        }
+    }
     if !force && calling_mission_on_this_service {
         return Some(DeployRefusal::SelfTarget);
     }
@@ -1548,6 +1571,9 @@ pub async fn deploy_sandboxed_sh(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DeployRequest>,
 ) -> Result<Sse<UpdateStream>, (StatusCode, String)> {
+    let actual_service =
+        current_sandboxed_service_name().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
     // Synchronous safety checks BEFORE we open SSE. A 4xx here is easier for
     // the MCP to surface than an early-error SSE event.
     let calling_on_self = match req.calling_mission_id {
@@ -1566,7 +1592,13 @@ pub async fn deploy_sandboxed_sh(
     let marker = deploy_marker_path();
     let last_age = deploy_marker_age_secs(&marker);
 
-    if let Some(refusal) = evaluate_deploy_request(calling_on_self, last_age, req.force) {
+    if let Some(refusal) = evaluate_deploy_request(
+        Some(&actual_service),
+        req.expected_service.as_deref(),
+        calling_on_self,
+        last_age,
+        req.force,
+    ) {
         return Err((refusal.http_status(), refusal.message()));
     }
 
@@ -1581,7 +1613,27 @@ pub async fn deploy_sandboxed_sh(
         );
     }
 
-    Ok(Sse::new(Box::pin(stream_deploy(state, req))))
+    Ok(Sse::new(Box::pin(stream_deploy(
+        state,
+        req,
+        actual_service,
+    ))))
+}
+
+fn current_sandboxed_service_name() -> Result<String, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to detect current binary path: {}", e))?;
+    let exe_name = current_exe
+        .file_name()
+        .ok_or_else(|| {
+            format!(
+                "Current binary path has no file name: {}",
+                current_exe.display()
+            )
+        })?
+        .to_string_lossy()
+        .to_string();
+    Ok(format!("{}.service", exe_name))
 }
 
 /// The actual deploy stream — git checkout (optional), build (optional),
@@ -1592,6 +1644,7 @@ pub async fn deploy_sandboxed_sh(
 fn stream_deploy(
     state: Arc<AppState>,
     req: DeployRequest,
+    service_name: String,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
         yield sse("log", "Starting deploy with safety rails", Some(0));
@@ -1646,14 +1699,11 @@ fn stream_deploy(
                 return;
             }
         };
-        // `exe_name` is the *deployed* filename (e.g. `sandboxed-sh-prod` or
-        // `sandboxed-sh-dev`). The cargo bin name is always `sandboxed-sh`
-        // — Cargo writes to `target/debug/sandboxed-sh` regardless of how
-        // we rename it on install. Same for `orchestrator-mcp`.
-        let exe_name = current_exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+        // The cargo bin name is always `sandboxed-sh` regardless of how we
+        // rename it on install (e.g. `sandboxed-sh-prod` or `sandboxed-sh-dev`).
+        // Same for `orchestrator-mcp`.
         const MAIN_CARGO_BIN: &str = "sandboxed-sh";
         const MCP_CARGO_BIN: &str = "orchestrator-mcp";
-        let service_name = format!("{}.service", exe_name);
         let install_dest_main = current_exe.to_string_lossy().to_string();
         // Match the MCP install location: same dir as the main binary, fixed name.
         let install_dest_mcp = current_exe
@@ -2439,7 +2489,7 @@ mod tests {
 
     #[test]
     fn deploy_refuses_self_target_by_default() {
-        let r = evaluate_deploy_request(true, None, false);
+        let r = evaluate_deploy_request(None, None, true, None, false);
         assert_eq!(r, Some(DeployRefusal::SelfTarget));
     }
 
@@ -2448,15 +2498,21 @@ mod tests {
         // force=true bypasses self-protection (caller explicitly accepts
         // the in-flight turn dying). Still respects debounce unless the
         // debounce is also force-bypassed, which it is.
-        assert_eq!(evaluate_deploy_request(true, None, true), None);
+        assert_eq!(evaluate_deploy_request(None, None, true, None, true), None);
     }
 
     #[test]
     fn deploy_cross_service_no_self_protection() {
         // calling_on_self=false → no self-target refusal, no debounce
         // hit, no refusal at all.
-        assert_eq!(evaluate_deploy_request(false, None, false), None);
-        assert_eq!(evaluate_deploy_request(false, Some(10_000), false), None);
+        assert_eq!(
+            evaluate_deploy_request(None, None, false, None, false),
+            None
+        );
+        assert_eq!(
+            evaluate_deploy_request(None, None, false, Some(10_000), false),
+            None
+        );
     }
 
     #[test]
@@ -2464,14 +2520,17 @@ mod tests {
         // calling_on_self=false, but a deploy fired 30s ago — debounce
         // should refuse even though the self check passed.
         assert_eq!(
-            evaluate_deploy_request(false, Some(30), false),
+            evaluate_deploy_request(None, None, false, Some(30), false),
             Some(DeployRefusal::Debounced { since_secs: 30 })
         );
     }
 
     #[test]
     fn deploy_force_bypasses_both_self_and_debounce() {
-        assert_eq!(evaluate_deploy_request(true, Some(0), true), None);
+        assert_eq!(
+            evaluate_deploy_request(None, None, true, Some(0), true),
+            None
+        );
     }
 
     #[test]
@@ -2480,8 +2539,38 @@ mod tests {
         // meaningful one (self-target) so the agent sees the actual reason
         // instead of being told "wait a bit and retry" only to discover
         // it'd kill itself.
-        let r = evaluate_deploy_request(true, Some(30), false);
+        let r = evaluate_deploy_request(None, None, true, Some(30), false);
         assert_eq!(r, Some(DeployRefusal::SelfTarget));
+    }
+
+    #[test]
+    fn deploy_refuses_wrong_expected_service() {
+        let r = evaluate_deploy_request(
+            Some("sandboxed-sh-prod.service"),
+            Some("sandboxed-sh-dev.service"),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(
+            r,
+            Some(DeployRefusal::WrongService {
+                expected: "sandboxed-sh-dev.service".to_string(),
+                actual: "sandboxed-sh-prod.service".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn deploy_expected_service_match_allows_next_checks() {
+        let r = evaluate_deploy_request(
+            Some("sandboxed-sh-dev.service"),
+            Some("sandboxed-sh-dev.service"),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(r, None);
     }
 
     #[test]
