@@ -103,13 +103,27 @@ hermes_runtime_status="$(
     [.components[] | select(.name == "hermes_assistant") | .status][0] // "not_reported"
   ' "$tmp_components"
 )"
+hermes_runtime_installed="$(
+  jq -r '
+    [.components[] | select(.name == "hermes_assistant") | .installed][0] // false
+  ' "$tmp_components"
+)"
+hermes_runtime_path="$(
+  jq -r '
+    [.components[] | select(.name == "hermes_assistant") | .path][0] // ""
+  ' "$tmp_components"
+)"
 
 if [[ "$REQUIRE_HERMES_RUNTIME" == "1" ]]; then
-  jq -e '
+  if ! jq -e '
     .components[]
     | select(.name == "hermes_assistant")
     | .installed == true and .status == "ok"
-  ' "$tmp_components" >/dev/null
+  ' "$tmp_components" >/dev/null; then
+    echo "hermes_assistant is not ready: installed=$hermes_runtime_installed status=$hermes_runtime_status path=${hermes_runtime_path:-none}" >&2
+    echo "Install and start hermes-assistant-dev.service, then rerun with --require-hermes-runtime." >&2
+    exit 1
+  fi
 fi
 
 echo "component assistant_mcp=ok"
