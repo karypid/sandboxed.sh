@@ -2354,6 +2354,20 @@ function MissionWorkbenchPanel({
       mission.status === "blocked" ||
       mission.status === "failed");
 
+  // Effective model: an explicit per-mission override wins, otherwise fall
+  // back to the model recorded from the last run's metadata. Strip any
+  // `provider/` prefix for display (matching the assistant message badge) but
+  // keep the full value in the tooltip.
+  const modelOverride = mission?.model_override?.trim() || undefined;
+  const modelRecorded = mission?.metadata_model?.trim() || undefined;
+  const modelRaw = modelOverride || modelRecorded || null;
+  const modelEffort = mission?.model_effort?.trim() || undefined;
+  const modelDisplay = modelRaw
+    ? modelRaw.includes("/")
+      ? modelRaw.split("/").pop()
+      : modelRaw
+    : null;
+
   const [markAsOpen, setMarkAsOpen] = useState(false);
   const markAsRef = useRef<HTMLDivElement>(null);
 
@@ -2458,6 +2472,30 @@ function MissionWorkbenchPanel({
               <Row label="Role">
                 <span className="capitalize font-mono text-white/70">
                   {role ?? "mission"}
+                </span>
+              </Row>
+              <Row label="Model">
+                <span className="flex min-w-0 items-center justify-end gap-1.5">
+                  {modelOverride && (
+                    <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-indigo-300/80">
+                      override
+                    </span>
+                  )}
+                  <span
+                    className={cn(
+                      "max-w-[130px] truncate font-mono",
+                      modelDisplay ? "text-white/70" : "text-white/40",
+                    )}
+                    title={
+                      modelRaw
+                        ? modelEffort
+                          ? `${modelRaw} (${modelEffort} effort)`
+                          : modelRaw
+                        : undefined
+                    }
+                  >
+                    {modelDisplay ?? "Default"}
+                  </span>
                 </span>
               </Row>
               <Row label="Workspace">
