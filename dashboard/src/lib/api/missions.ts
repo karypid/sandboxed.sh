@@ -435,7 +435,14 @@ export async function updateMissionSettings(
 
 export async function deleteMission(
   id: string,
-): Promise<{ ok: boolean; deleted: string; deleted_ids?: string[]; deleted_count?: number }> {
+): Promise<{
+  ok: boolean;
+  deleted: string;
+  deleted_ids?: string[];
+  deleted_count?: number;
+  deleted_workspace_dirs?: string[];
+  deleted_workspace_dir_count?: number;
+}> {
   const res = await apiFetch(`/api/control/missions/${id}`, {
     method: "DELETE",
   });

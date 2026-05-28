@@ -5066,6 +5066,14 @@ pub async fn delete_mission(
     let control = control_for_user(&state, &user).await;
     let running = get_running_missions(&control).await?;
 
+    let deleted_workspace_dirs = cleanup_mission_workspace_dirs_for_delete(
+        &control.mission_store,
+        &state.workspaces,
+        mission_id,
+        &running,
+    )
+    .await?;
+
     let deleted_ids =
         delete_mission_with_children(&control.mission_store, mission_id, &running).await?;
 
@@ -5073,11 +5081,14 @@ pub async fn delete_mission(
         clear_mission_metadata_refresh_state(*id);
     }
 
+    let deleted_workspace_dir_count = deleted_workspace_dirs.len();
     Ok(Json(serde_json::json!({
         "ok": true,
         "deleted": mission_id,
         "deleted_ids": deleted_ids,
-        "deleted_count": deleted_ids.len()
+        "deleted_count": deleted_ids.len(),
+        "deleted_workspace_dirs": deleted_workspace_dirs,
+        "deleted_workspace_dir_count": deleted_workspace_dir_count
     })))
 }
 
@@ -5153,6 +5164,85 @@ async fn delete_mission_with_children(
     }
 
     Ok(ids_to_delete)
+}
+
+async fn cleanup_mission_workspace_dirs_for_delete(
+    mission_store: &Arc<dyn MissionStore>,
+    workspaces: &workspace::SharedWorkspaceStore,
+    mission_id: Uuid,
+    running: &[super::mission_runner::RunningMissionInfo],
+) -> Result<Vec<String>, (StatusCode, String)> {
+    let Some(root_mission) = mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    };
+
+    let child_ids = collect_child_mission_ids(mission_store, mission_id).await?;
+    let mut ids_to_delete = Vec::with_capacity(child_ids.len() + 1);
+    ids_to_delete.push(mission_id);
+    ids_to_delete.extend(child_ids.iter().copied());
+
+    if let Some(running_mission) = running
+        .iter()
+        .find(|m| ids_to_delete.contains(&m.mission_id))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot delete a running mission or worker ({}). Cancel it first.",
+                running_mission.mission_id
+            ),
+        ));
+    }
+
+    let mut missions = Vec::with_capacity(ids_to_delete.len());
+    missions.push(root_mission);
+    for child_id in child_ids {
+        if let Some(child) = mission_store
+            .get_mission(child_id)
+            .await
+            .map_err(internal_error)?
+        {
+            missions.push(child);
+        }
+    }
+
+    let mut deleted_dirs = Vec::new();
+    for mission in missions {
+        let Some(ws) = workspaces.get(mission.workspace_id).await else {
+            continue;
+        };
+        let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
+        if !dir.exists() {
+            continue;
+        }
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Failed to delete mission workspace directory {}: {}",
+                        dir.display(),
+                        err
+                    ),
+                ));
+            }
+        }
+        tracing::info!(
+            mission_id = %mission.id,
+            workspace_id = %mission.workspace_id,
+            path = %dir.display(),
+            "removed mission workspace directory during explicit delete",
+        );
+        deleted_dirs.push(dir.to_string_lossy().to_string());
+    }
+
+    Ok(deleted_dirs)
 }
 
 /// Delete all empty "Untitled" missions.
@@ -14884,6 +14974,51 @@ mod tests {
         assert!(store.get_mission(boss.id).await.unwrap().is_none());
         assert!(store.get_mission(worker.id).await.unwrap().is_none());
         assert!(store.get_mission(nested_worker.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_mission_workspace_dirs_for_delete_removes_worker_dirs() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let workspaces = Arc::new(workspace::WorkspaceStore::new(temp.path().to_path_buf()).await);
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = store
+            .create_mission(Some("Boss mission"), None, None, None, None, None, None)
+            .await
+            .expect("boss mission should be created");
+        let worker = store
+            .create_mission_with_parent(
+                Some("Worker mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("worker mission should be created");
+
+        let boss_dir = workspace::mission_workspace_dir_for_root(temp.path(), boss.id);
+        let worker_dir = workspace::mission_workspace_dir_for_root(temp.path(), worker.id);
+        tokio::fs::create_dir_all(&boss_dir)
+            .await
+            .expect("boss workspace dir should be created");
+        tokio::fs::create_dir_all(&worker_dir)
+            .await
+            .expect("worker workspace dir should be created");
+
+        let deleted_dirs =
+            cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, boss.id, &[])
+                .await
+                .expect("workspace cleanup should succeed");
+
+        assert_eq!(deleted_dirs.len(), 2);
+        assert!(!boss_dir.exists());
+        assert!(!worker_dir.exists());
+        assert!(store.get_mission(boss.id).await.unwrap().is_some());
+        assert!(store.get_mission(worker.id).await.unwrap().is_some());
     }
 
     #[tokio::test]
