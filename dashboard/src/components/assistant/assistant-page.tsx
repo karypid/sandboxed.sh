@@ -985,8 +985,15 @@ export default function AssistantPage() {
       {/* Create Dialog */}
       {showCreateDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]">
-            <h3 className="text-lg font-medium text-white mb-4">Add Assistant Gateway</h3>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="assistant-create-gateway-title"
+            className="w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]"
+          >
+            <h3 id="assistant-create-gateway-title" className="text-lg font-medium text-white mb-4">
+              Add Assistant Gateway
+            </h3>
             <div
               className={cn(
                 'mb-4 flex gap-3 rounded-lg border p-3',
@@ -1210,8 +1217,13 @@ export default function AssistantPage() {
       {/* Edit Dialog */}
       {editingBot && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]">
-            <h3 className="text-lg font-medium text-white mb-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="assistant-edit-gateway-title"
+            className="w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]"
+          >
+            <h3 id="assistant-edit-gateway-title" className="text-lg font-medium text-white mb-4">
               Edit @{editingBot.bot_username || 'bot'}
             </h3>
             {hermesRuntimeReady && (

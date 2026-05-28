@@ -50,6 +50,7 @@ test.describe('Assistant page', () => {
     await expect(page.getByRole('button', { name: /Add Gateway/i }).first()).toBeVisible();
 
     await page.getByRole('button', { name: /Add Gateway/i }).first().click();
+    await expect(page.getByRole('dialog', { name: 'Add Assistant Gateway' })).toBeVisible();
     await expect(page.getByText('Hermes runtime is active. Do not add a compatibility gateway for a bot token Hermes already owns.')).toBeVisible();
   });
 
@@ -88,6 +89,7 @@ test.describe('Assistant page', () => {
     await expect(page.getByText('Hermes runtime not installed')).toBeVisible();
 
     await page.getByRole('button', { name: /Add Gateway/i }).first().click();
+    await expect(page.getByRole('dialog', { name: 'Add Assistant Gateway' })).toBeVisible();
     await expect(page.getByText('This compatibility gateway registers the Telegram webhook until Hermes owns the bot.')).toBeVisible();
   });
 
@@ -183,6 +185,7 @@ test.describe('Assistant page', () => {
     await expect(page.getByRole('button', { name: 'Delete @hermes_devbot' })).toBeVisible();
 
     await page.getByRole('button', { name: 'Edit @hermes_devbot' }).click();
+    await expect(page.getByRole('dialog', { name: 'Edit @hermes_devbot' })).toBeVisible();
     await expect(page.getByText('Hermes runtime is active. Keep this compatibility gateway inactive for bot tokens already moved to Hermes.')).toBeVisible();
     await page.getByRole('button', { name: 'Cancel' }).click();
 
