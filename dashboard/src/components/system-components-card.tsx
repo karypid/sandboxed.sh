@@ -22,16 +22,22 @@ import { cn } from '@/lib/utils';
 
 // Component display names
 const componentNames: Record<string, string> = {
-  open_agent: 'sandboxed.sh',
+  sandboxed_sh: 'sandboxed.sh',
+  assistant_mcp: 'Assistant MCP',
   opencode: 'OpenCode',
+  claude_code: 'Claude Code',
   codex: 'Codex',
+  grok: 'Grok Build',
 };
 
 // Component icons
 const componentIcons: Record<string, string> = {
-  open_agent: '🚀',
+  sandboxed_sh: '🚀',
+  assistant_mcp: '🔌',
   opencode: '⚡',
+  claude_code: '✦',
   codex: '🧠',
+  grok: '𝕏',
 };
 
 interface UpdateLog {
@@ -208,7 +214,7 @@ export function SystemComponentsCard() {
                   </div>
 
                   {/* Update button */}
-                  {component.status === 'update_available' && component.name !== 'open_agent' && (
+                  {component.status === 'update_available' && component.name !== 'sandboxed_sh' && (
                     <button
                       onClick={() => handleUpdate(component)}
                       disabled={updatingComponent !== null}

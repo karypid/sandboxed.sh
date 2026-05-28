@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+const SERVER_VERSION: &str = "0.1.0";
+
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[serde(rename = "jsonrpc")]
@@ -476,7 +478,7 @@ impl AssistantMcp {
                 req.id,
                 json!({
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "sandboxed-hermes-assistant", "version": "0.1.0"},
+                    "serverInfo": {"name": "sandboxed-hermes-assistant", "version": SERVER_VERSION},
                     "capabilities": {"tools": {}}
                 }),
             ),
@@ -628,6 +630,11 @@ mod tests {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("assistant-mcp {SERVER_VERSION}");
+        return;
+    }
+
     let server = AssistantMcp::new();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

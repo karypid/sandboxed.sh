@@ -336,6 +336,10 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
         status,
     });
 
+    // Hermes assistant MCP connector
+    let assistant_mcp_info = get_assistant_mcp_info().await;
+    components.push(assistant_mcp_info);
+
     // OpenCode
     let opencode_info = get_opencode_info(&state.config).await;
     components.push(opencode_info);
@@ -731,6 +735,37 @@ async fn get_grok_info() -> ComponentInfo {
     }
 }
 
+async fn get_assistant_mcp_info() -> ComponentInfo {
+    match Command::new("assistant-mcp")
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let version = extract_version_token(&String::from_utf8_lossy(&output.stdout));
+
+            ComponentInfo {
+                name: "assistant_mcp".to_string(),
+                version,
+                installed: true,
+                update_available: None,
+                path: which_assistant_mcp().await,
+                source_path: None,
+                status: ComponentStatus::Ok,
+            }
+        }
+        _ => ComponentInfo {
+            name: "assistant_mcp".to_string(),
+            version: None,
+            installed: false,
+            update_available: None,
+            path: which_assistant_mcp().await,
+            source_path: None,
+            status: ComponentStatus::NotInstalled,
+        },
+    }
+}
+
 /// Find the path to a CLI binary.
 /// Checks `which` first (respects the user's PATH), then explicit fallback paths.
 async fn which_binary(name: &str, fallback_paths: &[&str]) -> Option<String> {
@@ -763,6 +798,11 @@ async fn which_codex() -> Option<String> {
 /// Find the path to the Grok Build binary.
 async fn which_grok() -> Option<String> {
     which_binary("grok", &["/usr/local/bin/grok"]).await
+}
+
+/// Find the path to the Hermes assistant MCP connector.
+async fn which_assistant_mcp() -> Option<String> {
+    which_binary("assistant-mcp", &["/usr/local/bin/assistant-mcp"]).await
 }
 
 /// Find the path to the OpenCode binary.
