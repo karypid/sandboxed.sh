@@ -39,6 +39,7 @@ import {
   CheckCircle2,
   CircleDashed,
   Settings,
+  AlertTriangle,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from '@/components/toast';
@@ -986,6 +987,26 @@ export default function AssistantPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]">
             <h3 className="text-lg font-medium text-white mb-4">Add Assistant Gateway</h3>
+            <div
+              className={cn(
+                'mb-4 flex gap-3 rounded-lg border p-3',
+                hermesRuntimeReady
+                  ? 'border-amber-500/20 bg-amber-500/[0.06]'
+                  : 'border-sky-500/20 bg-sky-500/[0.05]'
+              )}
+            >
+              <AlertTriangle
+                className={cn(
+                  'mt-0.5 h-4 w-4 shrink-0',
+                  hermesRuntimeReady ? 'text-amber-300' : 'text-sky-300'
+                )}
+              />
+              <p className="text-xs leading-5 text-white/55">
+                {hermesRuntimeReady
+                  ? 'Hermes runtime is active. Do not add a compatibility gateway for a bot token Hermes already owns.'
+                  : 'This compatibility gateway registers the Telegram webhook until Hermes owns the bot.'}
+              </p>
+            </div>
             <div className="space-y-4">
               <div>
                 <label className="block text-sm text-white/60 mb-1">Bot Token</label>

@@ -48,6 +48,9 @@ test.describe('Assistant page', () => {
     await expect(page.getByText('assistant-mcp 0.1.0')).toBeVisible();
     await expect(page.getByText('Hermes runtime active')).toBeVisible();
     await expect(page.getByRole('button', { name: /Add Gateway/i }).first()).toBeVisible();
+
+    await page.getByRole('button', { name: /Add Gateway/i }).first().click();
+    await expect(page.getByText('Hermes runtime is active. Do not add a compatibility gateway for a bot token Hermes already owns.')).toBeVisible();
   });
 
   test('shows handoff warnings when Hermes bridge and runtime are unavailable', async ({ page }) => {
@@ -83,6 +86,9 @@ test.describe('Assistant page', () => {
     await expect(page.getByText('assistant-mcp not ready')).toBeVisible();
     await expect(page.getByText('Install assistant-mcp before handing mission control to Hermes.')).toBeVisible();
     await expect(page.getByText('Hermes runtime not installed')).toBeVisible();
+
+    await page.getByRole('button', { name: /Add Gateway/i }).first().click();
+    await expect(page.getByText('This compatibility gateway registers the Telegram webhook until Hermes owns the bot.')).toBeVisible();
   });
 
   test('keeps the old Telegram settings route as a redirect', async ({ page }) => {
