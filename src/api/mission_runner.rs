@@ -2884,7 +2884,7 @@ async fn run_mission_turn(
         config.default_model = Some(resolve_gemini_default_model());
     } else if backend_id == "grok" && model_override.is_none() {
         // Pin Grok Build to its own default model. Without this the global
-        // DEFAULT_MODEL (typically `anthropic/claude-opus-4-6`) flows
+        // DEFAULT_MODEL (typically `anthropic/claude-opus-4-8`) flows
         // through to `--model` and the grok CLI rejects it as "unknown
         // model id" — the mission then fails on the first turn with a
         // confusing chdir error from the rejected-CLI path. See prod
@@ -12338,6 +12338,16 @@ pub async fn run_grok_turn(
                     .with_terminal_reason(TerminalReason::LlmError);
                 }
             }
+        } else if let Err(err) = crate::api::ai_providers::write_grok_oauth_auth_file(
+            &entry.refresh_token,
+            &entry.access_token,
+            entry.expires_at,
+        ) {
+            tracing::warn!(
+                mission_id = %mission_id,
+                error = %err,
+                "Failed to materialize fresh xAI OAuth token into Grok auth file"
+            );
         }
     }
 

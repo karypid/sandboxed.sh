@@ -731,13 +731,47 @@ export function deriveItemViews(
   }
   const thinkingItemsCount = completedThinking + activeThinking;
 
+  let orderedChatDisplayItems = chatDisplayItems;
+  if (!missionIsRunning) {
+    const finalAssistantIndex = chatDisplayItems.findLastIndex(
+      (item) => item.kind === "assistant",
+    );
+    if (finalAssistantIndex !== -1) {
+      const beforeFinalAssistant = chatDisplayItems.slice(
+        0,
+        finalAssistantIndex,
+      );
+      const finalAssistant = chatDisplayItems[finalAssistantIndex];
+      const afterFinalAssistant = chatDisplayItems.slice(
+        finalAssistantIndex + 1,
+      );
+      const lateTools: ChatItem[] = [];
+      const remainingAfterFinalAssistant: ChatItem[] = [];
+      for (const item of afterFinalAssistant) {
+        if (item.kind === "tool" && !item.isUiTool) {
+          lateTools.push(item);
+        } else {
+          remainingAfterFinalAssistant.push(item);
+        }
+      }
+      if (lateTools.length > 0) {
+        orderedChatDisplayItems = [
+          ...beforeFinalAssistant,
+          ...lateTools,
+          finalAssistant,
+          ...remainingAfterFinalAssistant,
+        ];
+      }
+    }
+  }
+
   // Pass 3: group consecutive tool/thinking blocks for collapsed display.
   const groupedItems: GroupedItem[] = [];
   let currentToolGroup: ToolItem[] = [];
   let currentThinkingGroup: SidePanelItem[] = [];
   let lastAssistantItemIndex = -1;
-  for (let i = chatDisplayItems.length - 1; i >= 0; i--) {
-    if (chatDisplayItems[i].kind === "assistant") {
+  for (let i = orderedChatDisplayItems.length - 1; i >= 0; i--) {
+    if (orderedChatDisplayItems[i].kind === "assistant") {
       lastAssistantItemIndex = i;
       break;
     }
@@ -764,13 +798,18 @@ export function deriveItemViews(
     });
     currentThinkingGroup = [];
   };
-  for (let index = 0; index < chatDisplayItems.length; index++) {
-    const item = chatDisplayItems[index];
+  for (let index = 0; index < orderedChatDisplayItems.length; index++) {
+    const item = orderedChatDisplayItems[index];
     if (item.kind === "tool" && !item.isUiTool) {
       flushThinkingGroup();
       currentToolGroup.push(item);
     } else if (item.kind === "thinking" || item.kind === "stream") {
-      if (showThinkingPanel) {
+      const isTerminalStreamOnlyResponse =
+        item.kind === "stream" &&
+        item.done &&
+        !missionIsRunning &&
+        index > lastAssistantItemIndex;
+      if (showThinkingPanel && !isTerminalStreamOnlyResponse) {
         // Thinking/stream items are routed to the side panel in this
         // mode — they don't render inline at all. Keep the tool group
         // open across them so consecutive tool calls (with thinking
