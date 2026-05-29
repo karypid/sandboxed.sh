@@ -11,6 +11,7 @@ const streamItem: Extract<ChatItem, { kind: "stream" }> = {
   kind: "stream",
   content: "Visible assistant draft",
   done: false,
+  startTime: 1,
 };
 
 const thinkingItem: Extract<ChatItem, { kind: "thinking" }> = {
@@ -18,6 +19,7 @@ const thinkingItem: Extract<ChatItem, { kind: "thinking" }> = {
   kind: "thinking",
   content: "Typed provider reasoning",
   done: false,
+  startTime: 1,
 };
 
 const assistantItem: Extract<ChatItem, { kind: "assistant" }> = {
@@ -39,6 +41,38 @@ describe("deriveItemViews", () => {
     expect(views.thinkingItemsCount).toBe(0);
     expect(views.hasActiveThinking).toBe(false);
     expect(views.groupedItems).toEqual([]);
+  });
+
+  it("keeps a completed terminal draft visible inline when the side panel is open", () => {
+    const completedStream: Extract<ChatItem, { kind: "stream" }> = {
+      ...streamItem,
+      done: true,
+      endTime: 3,
+    };
+
+    const views = deriveItemViews([completedStream], true, false);
+
+    expect(views.thinkingItems).toEqual([completedStream]);
+    expect(views.groupedItems).toEqual([
+      {
+        kind: "thinking_group",
+        groupId: completedStream.id,
+        thoughts: [completedStream],
+      },
+    ]);
+  });
+
+  it("routes a completed draft to the side panel when an assistant reply follows it", () => {
+    const completedStream: Extract<ChatItem, { kind: "stream" }> = {
+      ...streamItem,
+      done: true,
+      endTime: 3,
+    };
+
+    const views = deriveItemViews([completedStream, assistantItem], true, false);
+
+    expect(views.thinkingItems).toEqual([completedStream]);
+    expect(views.groupedItems).toEqual([assistantItem]);
   });
 
   it("routes real thinking rows to the side panel when open", () => {
@@ -87,6 +121,24 @@ describe("deriveItemViews", () => {
 
     expect(views.thinkingItems).toEqual([completedThinking]);
     expect(views.groupedItems).toEqual([assistantItem]);
+  });
+
+  it("renders late completed tool rows before the final assistant row", () => {
+    const toolItem: Extract<ChatItem, { kind: "tool" }> = {
+      id: "tool-call-1",
+      kind: "tool",
+      toolCallId: "call-1",
+      name: "bash",
+      args: { command: "true" },
+      result: { output: "" },
+      isUiTool: false,
+      startTime: 1,
+      endTime: 2,
+    };
+
+    const views = deriveItemViews([assistantItem, toolItem], false, false);
+
+    expect(views.groupedItems).toEqual([toolItem, assistantItem]);
   });
 
   it("keeps completed thoughts of a new turn inline while the mission runs", () => {
