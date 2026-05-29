@@ -1006,6 +1006,29 @@ fn hermes_soul_markdown(channel: &super::mission_store::TelegramChannel) -> Stri
     format!("{instructions}\n")
 }
 
+fn choose_telegram_home_channel(
+    allowed_chat_ids: &[i64],
+    mappings: &[super::mission_store::TelegramChatMission],
+) -> Option<(i64, String)> {
+    if allowed_chat_ids.len() == 1 {
+        return Some((allowed_chat_ids[0], "Thomas".to_string()));
+    }
+
+    mappings
+        .iter()
+        .filter(|mapping| mapping.chat_id > 0)
+        .max_by_key(|mapping| &mapping.created_at)
+        .map(|mapping| {
+            (
+                mapping.chat_id,
+                mapping
+                    .chat_title
+                    .clone()
+                    .unwrap_or_else(|| "Thomas".to_string()),
+            )
+        })
+}
+
 fn hermes_service_unit(runtime_name: &str, env_path: &str, service_after: &str) -> String {
     format!(
         r#"[Unit]
@@ -1188,6 +1211,12 @@ async fn adopt_hermes_assistant(
         .default_workspace_id
         .map(|id| id.to_string())
         .unwrap_or_default();
+    let chat_mappings = control
+        .mission_store
+        .list_telegram_chat_missions(channel.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let home_channel = choose_telegram_home_channel(&channel.allowed_chat_ids, &chat_mappings);
 
     run_host_command("install", &["-d", "-m", "0755", "/etc/sandboxed-sh"])
         .await
@@ -1223,10 +1252,12 @@ async fn adopt_hermes_assistant(
     env.push_str(&env_line("HERMES_ASSISTANT_MODEL", &model));
     env.push_str(&env_line("TELEGRAM_BOT_TOKEN", &channel.bot_token));
     env.push_str(&env_line("TELEGRAM_ALLOWED_USERS", &allowed_users));
-    if channel.allowed_chat_ids.len() == 1 {
-        let home_channel = channel.allowed_chat_ids[0].to_string();
-        env.push_str(&env_line("TELEGRAM_HOME_CHANNEL", &home_channel));
-        env.push_str(&env_line("TELEGRAM_HOME_CHANNEL_NAME", "Thomas"));
+    if let Some((home_channel_id, home_channel_name)) = home_channel {
+        env.push_str(&env_line(
+            "TELEGRAM_HOME_CHANNEL",
+            &home_channel_id.to_string(),
+        ));
+        env.push_str(&env_line("TELEGRAM_HOME_CHANNEL_NAME", &home_channel_name));
     }
     if req.allow_all_users {
         env.push_str("GATEWAY_ALLOW_ALL_USERS=true\n");
@@ -1314,6 +1345,11 @@ async fn adopt_hermes_assistant(
     ];
     if allowed_users.is_empty() && req.allow_all_users {
         notes.push("Hermes was configured with GATEWAY_ALLOW_ALL_USERS=true.".to_string());
+    }
+    if channel.allowed_chat_ids.is_empty() && !chat_mappings.is_empty() {
+        notes.push(
+            "Telegram home channel was inferred from an existing private chat mapping.".to_string(),
+        );
     }
 
     Ok(Json(AdoptHermesAssistantResponse {
