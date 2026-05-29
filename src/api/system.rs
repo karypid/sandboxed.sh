@@ -311,6 +311,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/components/by-workspace", get(get_components_by_workspace))
         .route("/hermes-assistant/adopt", post(adopt_hermes_assistant))
         .route("/hermes-assistant/status", get(get_hermes_assistant_status))
+        .route("/hermes-assistant/stop", post(stop_hermes_assistant))
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
         .route("/deploy", post(deploy_sandboxed_sh))
@@ -810,6 +811,7 @@ pub struct AdoptHermesAssistantResponse {
     pub service_name: String,
     pub env_path: String,
     pub config_path: String,
+    pub soul_path: String,
     pub workspace_path: String,
     pub api_url: String,
     pub model: String,
@@ -827,8 +829,10 @@ pub struct HermesAssistantStatusResponse {
     pub service_active: bool,
     pub env_path: String,
     pub config_path: String,
+    pub soul_path: String,
     pub env_present: bool,
     pub config_present: bool,
+    pub soul_present: bool,
     pub token_present: bool,
     pub telegram_ok: Option<bool>,
     pub telegram_bot_username: Option<String>,
@@ -836,6 +840,13 @@ pub struct HermesAssistantStatusResponse {
     pub telegram_pending_update_count: Option<i64>,
     pub telegram_last_error: Option<String>,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StopHermesAssistantResponse {
+    pub ok: bool,
+    pub service_name: String,
+    pub service_active: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -973,6 +984,15 @@ display:
       cleanup_progress: true
 "#
     )
+}
+
+fn hermes_soul_markdown(channel: &super::mission_store::TelegramChannel) -> String {
+    let instructions = channel.instructions.as_deref().unwrap_or_default().trim();
+    if instructions.is_empty() {
+        return "You are the sandboxed.sh Assistant. Help the operator manage missions, workspaces, and related development work through the available tools.\n".to_string();
+    }
+
+    format!("{instructions}\n")
 }
 
 fn hermes_service_unit(runtime_name: &str, env_path: &str, service_after: &str) -> String {
@@ -1133,6 +1153,7 @@ async fn adopt_hermes_assistant(
     let service_name = format!("{runtime_name}.service");
     let env_path = format!("/etc/sandboxed-sh/{runtime_name}.env");
     let config_path = format!("/var/lib/{runtime_name}/config.yaml");
+    let soul_path = format!("/var/lib/{runtime_name}/SOUL.md");
     let workspace_path = format!("/var/lib/{runtime_name}/workspace");
     let api_url = local_api_url(&state.config);
     let model = if req.model.trim().is_empty() {
@@ -1198,6 +1219,9 @@ async fn adopt_hermes_assistant(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     write_private_file(&config_path, &hermes_config_yaml(runtime_name))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_private_file(&soul_path, &hermes_soul_markdown(&channel))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1278,6 +1302,7 @@ async fn adopt_hermes_assistant(
         service_name,
         env_path,
         config_path,
+        soul_path,
         workspace_path,
         api_url,
         model,
@@ -1297,6 +1322,7 @@ async fn get_hermes_assistant_status(
     let service_name = format!("{runtime_name}.service");
     let env_path = format!("/etc/sandboxed-sh/{runtime_name}.env");
     let config_path = format!("/var/lib/{runtime_name}/config.yaml");
+    let soul_path = format!("/var/lib/{runtime_name}/SOUL.md");
     let service_active = Command::new("systemctl")
         .args(["is-active", "--quiet", &service_name])
         .status()
@@ -1306,6 +1332,7 @@ async fn get_hermes_assistant_status(
     let env_contents = tokio::fs::read_to_string(&env_path).await.ok();
     let env_present = env_contents.is_some();
     let config_present = tokio::fs::metadata(&config_path).await.is_ok();
+    let soul_present = tokio::fs::metadata(&soul_path).await.is_ok();
     let token = env_contents
         .as_deref()
         .and_then(|contents| parse_env_value(contents, "TELEGRAM_BOT_TOKEN"))
@@ -1399,8 +1426,10 @@ async fn get_hermes_assistant_status(
         service_active,
         env_path,
         config_path,
+        soul_path,
         env_present,
         config_present,
+        soul_present,
         token_present,
         telegram_ok,
         telegram_bot_username,
@@ -1409,6 +1438,30 @@ async fn get_hermes_assistant_status(
         telegram_last_error,
         notes,
     })
+}
+
+async fn stop_hermes_assistant(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<StopHermesAssistantResponse>, (StatusCode, String)> {
+    let runtime_name = assistant_runtime_name(&state.config);
+    let service_name = format!("{runtime_name}.service");
+
+    run_host_command("systemctl", &["disable", "--now", &service_name])
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+    let service_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", &service_name])
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    Ok(Json(StopHermesAssistantResponse {
+        ok: !service_active,
+        service_name,
+        service_active,
+    }))
 }
 
 async fn get_systemd_service_component(
