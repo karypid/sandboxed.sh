@@ -3,26 +3,26 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import useSWR from 'swr';
 import {
-  listTelegramBots,
-  createTelegramBot,
-  updateTelegramChannel,
-  deleteTelegramChannel,
-  listBotChats,
-  listBotActionExecutions,
-  listBotScheduledMessages,
-  listBotStructuredMemory,
-  searchBotStructuredMemory,
+  listAssistantGateways,
+  createAssistantGateway,
+  updateAssistantGateway,
+  deleteAssistantGateway,
+  listAssistantGatewayChats,
+  listAssistantGatewayActions,
+  listAssistantGatewayScheduledMessages,
+  listAssistantGatewayMemory,
+  searchAssistantGatewayMemory,
   listMissions,
   getSystemComponents,
   type Mission,
-  type TelegramActionExecution,
-  type TelegramChannel,
-  type TelegramChatMission,
-  type TelegramScheduledMessage,
-  type TelegramStructuredMemoryEntry,
-  type TelegramStructuredMemorySearchHit,
+  type AssistantGateway,
+  type AssistantGatewayActionExecution,
+  type AssistantGatewayChat,
+  type AssistantGatewayScheduledMessage,
+  type AssistantGatewayMemoryEntry,
+  type AssistantGatewayMemorySearchHit,
   type TelegramTriggerMode,
-  type CreateTelegramBotInput,
+  type CreateAssistantGatewayInput,
 } from '@/lib/api';
 import { listBackends, listWorkspaces, listBackendModelOptions, listProviders, listConfigProfiles, type Backend, type BackendModelOption, type Provider, type Workspace, type ConfigProfileSummary } from '@/lib/api';
 import {
@@ -40,9 +40,11 @@ import {
   CircleDashed,
   Settings,
   AlertTriangle,
+  GitBranch,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from '@/components/toast';
+import { listModelChains, type ModelChain } from '@/lib/api/model-routing';
 
 const TRIGGER_MODE_LABELS: Record<TelegramTriggerMode, string> = {
   mention_or_dm: 'Mentions, replies & DMs',
@@ -60,14 +62,14 @@ const BACKEND_LABELS: Record<string, string> = {
   grok: 'Grok Build',
 };
 
-function gatewayLabel(bot: TelegramChannel) {
+function gatewayLabel(bot: AssistantGateway) {
   return bot.bot_username ? `@${bot.bot_username}` : 'gateway';
 }
 
 export default function AssistantPage() {
   const { data: bots = [], mutate: mutateBots, isLoading: botsLoading } = useSWR(
-    'telegram-bots',
-    listTelegramBots,
+    'assistant-gateways',
+    listAssistantGateways,
     { revalidateOnFocus: false }
   );
   const { data: backends = [] } = useSWR('backends', listBackends, {
@@ -97,13 +99,17 @@ export default function AssistantPage() {
   const { data: configProfiles = [] } = useSWR('config-profiles', listConfigProfiles, {
     revalidateOnFocus: false,
   });
+  const { data: modelChains = [] } = useSWR<ModelChain[]>('model-chains', listModelChains, {
+    revalidateOnFocus: false,
+    dedupingInterval: 60000,
+  });
 
   // Chat mappings keyed by bot ID
-  const [chatsByBot, setChatsByBot] = useState<Record<string, TelegramChatMission[]>>({});
-  const [actionsByBot, setActionsByBot] = useState<Record<string, TelegramActionExecution[]>>({});
-  const [scheduledByBot, setScheduledByBot] = useState<Record<string, TelegramScheduledMessage[]>>({});
-  const [memoryByBot, setMemoryByBot] = useState<Record<string, TelegramStructuredMemoryEntry[]>>({});
-  const [memorySearchByBot, setMemorySearchByBot] = useState<Record<string, TelegramStructuredMemorySearchHit[]>>({});
+  const [chatsByBot, setChatsByBot] = useState<Record<string, AssistantGatewayChat[]>>({});
+  const [actionsByBot, setActionsByBot] = useState<Record<string, AssistantGatewayActionExecution[]>>({});
+  const [scheduledByBot, setScheduledByBot] = useState<Record<string, AssistantGatewayScheduledMessage[]>>({});
+  const [memoryByBot, setMemoryByBot] = useState<Record<string, AssistantGatewayMemoryEntry[]>>({});
+  const [memorySearchByBot, setMemorySearchByBot] = useState<Record<string, AssistantGatewayMemorySearchHit[]>>({});
   const [memorySearchQueryByBot, setMemorySearchQueryByBot] = useState<Record<string, string>>({});
   const [expandedBots, setExpandedBots] = useState<Set<string>>(new Set());
   const [loadingChats, setLoadingChats] = useState<Set<string>>(new Set());
@@ -153,7 +159,7 @@ export default function AssistantPage() {
   const modelOptions = useMemo(() => getModelOptionsForBackend(createBackend), [getModelOptionsForBackend, createBackend]);
 
   // Edit dialog
-  const [editingBot, setEditingBot] = useState<TelegramChannel | null>(null);
+  const [editingBot, setEditingBot] = useState<AssistantGateway | null>(null);
   const [editInstructions, setEditInstructions] = useState('');
   const [editTriggerMode, setEditTriggerMode] = useState<TelegramTriggerMode>('mention_or_dm');
   const [editBackend, setEditBackend] = useState('');
@@ -169,7 +175,7 @@ export default function AssistantPage() {
     if (chatsByBot[botId]) return; // already loaded
     setLoadingChats((prev) => new Set(prev).add(botId));
     try {
-      const chats = await listBotChats(botId);
+      const chats = await listAssistantGatewayChats(botId);
       setChatsByBot((prev) => ({ ...prev, [botId]: chats }));
     } catch {
       // ignore
@@ -186,7 +192,7 @@ export default function AssistantPage() {
     if (scheduledByBot[botId]) return;
     setLoadingScheduled((prev) => new Set(prev).add(botId));
     try {
-      const scheduled = await listBotScheduledMessages(botId, { limit: 8 });
+      const scheduled = await listAssistantGatewayScheduledMessages(botId, { limit: 8 });
       setScheduledByBot((prev) => ({ ...prev, [botId]: scheduled }));
     } catch {
       // ignore
@@ -203,7 +209,7 @@ export default function AssistantPage() {
     if (actionsByBot[botId]) return;
     setLoadingActions((prev) => new Set(prev).add(botId));
     try {
-      const actions = await listBotActionExecutions(botId, { limit: 8 });
+      const actions = await listAssistantGatewayActions(botId, { limit: 8 });
       setActionsByBot((prev) => ({ ...prev, [botId]: actions }));
     } catch {
       // ignore
@@ -220,7 +226,7 @@ export default function AssistantPage() {
     if (memoryByBot[botId]) return;
     setLoadingMemory((prev) => new Set(prev).add(botId));
     try {
-      const memory = await listBotStructuredMemory(botId, { limit: 8 });
+      const memory = await listAssistantGatewayMemory(botId, { limit: 8 });
       setMemoryByBot((prev) => ({ ...prev, [botId]: memory }));
     } catch {
       // ignore
@@ -241,7 +247,7 @@ export default function AssistantPage() {
     }
     setLoadingMemorySearch((prev) => new Set(prev).add(botId));
     try {
-      const hits = await searchBotStructuredMemory(botId, { q: query, limit: 6 });
+      const hits = await searchAssistantGatewayMemory(botId, { q: query, limit: 6 });
       setMemorySearchByBot((prev) => ({ ...prev, [botId]: hits }));
     } catch {
       // ignore
@@ -277,7 +283,7 @@ export default function AssistantPage() {
     if (!createBotToken.trim()) return;
     setCreating(true);
     try {
-      const input: CreateTelegramBotInput = {
+      const input: CreateAssistantGatewayInput = {
         bot_token: createBotToken.trim(),
       };
       if (createBotUsername.trim()) input.bot_username = createBotUsername.trim();
@@ -295,7 +301,7 @@ export default function AssistantPage() {
       if (createWorkspaceId) input.default_workspace_id = createWorkspaceId;
       if (createConfigProfile.trim()) input.default_config_profile = createConfigProfile.trim();
 
-      const bot = await createTelegramBot(input);
+      const bot = await createAssistantGateway(input);
       await mutateBots();
       setShowCreateDialog(false);
       resetCreateForm();
@@ -307,9 +313,9 @@ export default function AssistantPage() {
     }
   };
 
-  const handleToggleActive = async (bot: TelegramChannel) => {
+  const handleToggleActive = async (bot: AssistantGateway) => {
     try {
-      await updateTelegramChannel(bot.id, { active: !bot.active });
+      await updateAssistantGateway(bot.id, { active: !bot.active });
       await mutateBots();
       toast.success(bot.active ? 'Bot deactivated' : 'Bot activated');
     } catch (err) {
@@ -317,10 +323,10 @@ export default function AssistantPage() {
     }
   };
 
-  const handleDelete = async (bot: TelegramChannel) => {
+  const handleDelete = async (bot: AssistantGateway) => {
     if (!confirm(`Delete bot @${bot.bot_username || bot.id.slice(0, 8)}?`)) return;
     try {
-      await deleteTelegramChannel(bot.id);
+      await deleteAssistantGateway(bot.id);
       await mutateBots();
       toast.success('Bot deleted');
     } catch (err) {
@@ -332,7 +338,7 @@ export default function AssistantPage() {
     if (!editingBot) return;
     setSaving(true);
     try {
-      await updateTelegramChannel(editingBot.id, {
+      await updateAssistantGateway(editingBot.id, {
         instructions: editInstructions.trim() || '',
         trigger_mode: editTriggerMode,
         default_backend: editBackend || undefined,
@@ -395,6 +401,15 @@ export default function AssistantPage() {
     [systemComponents]
   );
   const hermesRuntimeReady = hermesRuntime?.installed && hermesRuntime.status === 'ok';
+  const assistantChain = useMemo(
+    () =>
+      modelChains.find((chain) => chain.id === 'builtin/assistant') ||
+      modelChains.find((chain) => chain.id === 'assistant') ||
+      modelChains.find((chain) => chain.is_default) ||
+      modelChains.find((chain) => chain.id === 'builtin/smart') ||
+      null,
+    [modelChains]
+  );
 
   // ESC to close dialogs
   useEffect(() => {
@@ -428,7 +443,7 @@ export default function AssistantPage() {
           </button>
         </header>
 
-        <div className="grid gap-3 md:grid-cols-3">
+        <div className="grid gap-3 md:grid-cols-4">
           <div className={cn(
             'rounded-lg border p-4',
             assistantMcpReady
@@ -505,6 +520,20 @@ export default function AssistantPage() {
                   : hermesRuntime?.installed
                     ? `Service reported ${hermesRuntime.status || 'not healthy'}; keep Telegram in compatibility mode.`
                     : 'Install hermes-assistant-dev.service before moving webhook ownership.'}
+            </p>
+          </div>
+          <div className="rounded-lg border border-violet-500/15 bg-violet-500/[0.04] p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-medium uppercase tracking-[0.08em] text-violet-300/80">Routing</p>
+              <GitBranch className="h-4 w-4 text-violet-300" />
+            </div>
+            <p className="mt-2 text-sm font-medium text-white">
+              {assistantChain?.id || 'builtin/assistant'}
+            </p>
+            <p className="mt-1 text-xs text-white/45">
+              {assistantChain
+                ? `${assistantChain.entries.length} fallback ${assistantChain.entries.length === 1 ? 'entry' : 'entries'} via /v1.`
+                : 'Hermes should use the sandboxed.sh /v1 proxy chain.'}
             </p>
           </div>
         </div>

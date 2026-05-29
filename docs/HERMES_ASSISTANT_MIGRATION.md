@@ -41,6 +41,19 @@ The assistant should run from a dedicated sandboxed workspace, preferably the
 existing `assistant` container workspace. It should be managed as a persistent
 service, not as an assistant-mode mission that receives every Telegram message.
 
+This matches the upstream Hermes shape as of 2026-05-29: Hermes has a single
+messaging gateway process for Telegram and other platforms, supports Telegram
+text, images, files, typing, and streaming edits, supports custom
+OpenAI-compatible model endpoints with `provider: custom`, and loads stdio or
+HTTP MCP servers from `mcp_servers` in `config.yaml`.
+
+References:
+
+- https://hermes-agent.nousresearch.com/docs/user-guide/messaging/
+- https://hermes-agent.nousresearch.com/docs/user-guide/messaging/telegram/
+- https://hermes-agent.nousresearch.com/docs/user-guide/configuration/
+- https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp/
+
 ## Experimental MCP
 
 This branch adds `assistant-mcp`, a narrow MCP server for Hermes. It intentionally
@@ -161,9 +174,10 @@ sandboxed.sh side of the service contract:
 
 - `docs/examples/hermes-assistant-dev.env.example` lists the API, model proxy,
   Telegram gateway, and MCP bridge variables Hermes needs.
+- `docs/examples/hermes-config.yaml.example` points Hermes at the sandboxed.sh
+  `/v1` model proxy and registers `assistant-mcp` as a stdio MCP.
 - `docs/examples/hermes-assistant-dev.service.example` shows a minimal systemd
-  shape for the external Hermes runtime. Replace the placeholder `ExecStart`
-  with the actual Hermes binary or launcher from the Hermes repository.
+  shape for `hermes gateway`.
 
 ## Dev Runtime Install Checklist
 
@@ -173,9 +187,14 @@ the sandboxed.sh-side contract:
 
 ```bash
 install -d -m 0755 /etc/sandboxed-sh
+install -d -m 0755 /var/lib/hermes-assistant-dev/workspace
 install -m 0600 docs/examples/hermes-assistant-dev.env.example \
   /etc/sandboxed-sh/hermes-assistant-dev.env
 $EDITOR /etc/sandboxed-sh/hermes-assistant-dev.env
+
+install -m 0600 docs/examples/hermes-config.yaml.example \
+  /var/lib/hermes-assistant-dev/config.yaml
+$EDITOR /var/lib/hermes-assistant-dev/config.yaml
 
 install -m 0644 docs/examples/hermes-assistant-dev.service.example \
   /etc/systemd/system/hermes-assistant-dev.service

@@ -11,6 +11,7 @@ const streamItem: Extract<ChatItem, { kind: "stream" }> = {
   kind: "stream",
   content: "Visible assistant draft",
   done: false,
+  startTime: 1,
 };
 
 const thinkingItem: Extract<ChatItem, { kind: "thinking" }> = {
@@ -18,6 +19,7 @@ const thinkingItem: Extract<ChatItem, { kind: "thinking" }> = {
   kind: "thinking",
   content: "Typed provider reasoning",
   done: false,
+  startTime: 1,
 };
 
 const assistantItem: Extract<ChatItem, { kind: "assistant" }> = {

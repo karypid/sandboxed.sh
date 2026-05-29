@@ -6,12 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/sandboxed-sh/hermes-assistant-dev.env
-WorkingDirectory=/opt/hermes-assistant
+WorkingDirectory=/var/lib/hermes-assistant-dev
 
-# Replace this with the Hermes runtime entrypoint. The environment file above
-# defines the sandboxed.sh API, model proxy, Telegram gateway, and assistant-mcp
-# command that Hermes should use.
-ExecStart=/opt/hermes-assistant/bin/hermes-assistant
+# Install Hermes on the host first. The gateway process owns Telegram and loads
+# ~/.hermes/config.yaml from HERMES_HOME.
+ExecStart=/usr/local/bin/hermes gateway
 
 Restart=always
 RestartSec=5
