@@ -14,7 +14,7 @@ use axum::{
         Json,
     },
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use tokio::process::Command;
 
 use uuid::Uuid;
 
+use super::auth::AuthUser;
 use super::routes::AppState;
 use crate::util::home_dir;
 use crate::workspace::{Workspace, WorkspaceStatus, WorkspaceType};
@@ -308,6 +309,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/components", get(get_components))
         .route("/components/by-workspace", get(get_components_by_workspace))
+        .route("/hermes-assistant/adopt", post(adopt_hermes_assistant))
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
         .route("/deploy", post(deploy_sandboxed_sh))
@@ -786,6 +788,435 @@ async fn get_hermes_assistant_info() -> ComponentInfo {
         source_path: None,
         status: ComponentStatus::NotInstalled,
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdoptHermesAssistantRequest {
+    pub gateway_id: Uuid,
+    #[serde(default)]
+    pub allow_all_users: bool,
+    #[serde(default = "default_hermes_model")]
+    pub model: String,
+    #[serde(default)]
+    pub install_hermes_if_missing: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdoptHermesAssistantResponse {
+    pub ok: bool,
+    pub gateway_id: Uuid,
+    pub gateway_username: Option<String>,
+    pub service_name: String,
+    pub env_path: String,
+    pub config_path: String,
+    pub workspace_path: String,
+    pub api_url: String,
+    pub model: String,
+    pub allowed_users_count: usize,
+    pub allow_all_users: bool,
+    pub legacy_gateway_active: bool,
+    pub hermes_installed: bool,
+    pub hermes_status: ComponentStatus,
+    pub notes: Vec<String>,
+}
+
+fn default_hermes_model() -> String {
+    "builtin/assistant".to_string()
+}
+
+fn assistant_runtime_name(config: &crate::config::Config) -> &'static str {
+    if config.port == 3002
+        || std::env::var("SANDBOXED_ENV")
+            .map(|v| v.eq_ignore_ascii_case("dev"))
+            .unwrap_or(false)
+        || std::env::var("OPEN_AGENT_ENV")
+            .map(|v| v.eq_ignore_ascii_case("dev"))
+            .unwrap_or(false)
+    {
+        "hermes-assistant-dev"
+    } else {
+        "hermes-assistant"
+    }
+}
+
+fn local_api_url(config: &crate::config::Config) -> String {
+    format!("http://127.0.0.1:{}", config.port)
+}
+
+fn env_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn env_line(key: &str, value: &str) -> String {
+    format!("{key}={}\n", env_quote(value))
+}
+
+fn comma_join_i64(values: &[i64]) -> String {
+    values
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn hermes_config_yaml(runtime_name: &str) -> String {
+    format!(
+        r#"model:
+  provider: custom
+  default: ${{HERMES_ASSISTANT_MODEL}}
+  base_url: ${{OPENAI_BASE_URL}}
+  api_key: ${{OPENAI_API_KEY}}
+
+terminal:
+  backend: local
+  cwd: /var/lib/{runtime_name}/workspace
+
+mcp_servers:
+  sandboxed_assistant:
+    command: ${{HERMES_ASSISTANT_MCP_COMMAND}}
+    env:
+      HERMES_SANDBOXED_API_URL: ${{HERMES_SANDBOXED_API_URL}}
+      HERMES_SANDBOXED_API_TOKEN: ${{HERMES_SANDBOXED_API_TOKEN}}
+      JWT_SECRET: ${{JWT_SECRET}}
+      HERMES_ASSISTANT_USER_ID: ${{HERMES_ASSISTANT_USER_ID}}
+      HERMES_DEFAULT_WORKSPACE_ID: ${{HERMES_DEFAULT_WORKSPACE_ID}}
+    timeout: 120
+    connect_timeout: 15
+    tools:
+      include:
+        - list_active_missions
+        - list_missions
+        - get_mission
+        - get_mission_events
+        - start_mission
+        - send_message_to_mission
+        - cancel_mission
+        - list_workspaces
+      prompts: false
+      resources: false
+
+display:
+  platforms:
+    telegram:
+      tool_progress: off
+      cleanup_progress: true
+"#
+    )
+}
+
+fn hermes_service_unit(runtime_name: &str, env_path: &str, service_after: &str) -> String {
+    format!(
+        r#"[Unit]
+Description=Hermes Assistant gateway
+After=network-online.target {service_after}
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile={env_path}
+WorkingDirectory=/var/lib/{runtime_name}
+ExecStart=/usr/local/bin/hermes gateway --accept-hooks run
+Restart=always
+RestartSec=5
+TimeoutStopSec=240
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+"#
+    )
+}
+
+async fn run_host_command(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        Ok(format!("{stdout}{stderr}"))
+    } else {
+        Err(format!(
+            "{program} exited with {}: {}{}",
+            output.status, stdout, stderr
+        ))
+    }
+}
+
+async fn ensure_hermes_installed(install_if_missing: bool) -> Result<bool, String> {
+    if Command::new("hermes")
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+
+    if !install_if_missing {
+        return Ok(false);
+    }
+
+    run_host_command(
+        "sh",
+        &[
+            "-lc",
+            "set -e; curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-browser; for p in /root/.local/bin/hermes /root/.hermes/bin/hermes /usr/local/bin/hermes; do if [ -x \"$p\" ]; then install -m 0755 \"$p\" /usr/local/bin/hermes; exit 0; fi; done; command -v hermes >/dev/null",
+        ],
+    )
+    .await?;
+
+    Ok(true)
+}
+
+async fn write_private_file(path: &str, contents: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = format!("{path}.tmp");
+    tokio::fs::write(&tmp, contents)
+        .await
+        .map_err(|e| format!("failed to write {tmp}: {e}"))?;
+    tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|e| format!("failed to chmod {tmp}: {e}"))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .map_err(|e| format!("failed to install {path}: {e}"))?;
+    Ok(())
+}
+
+async fn rollback_legacy_gateway(
+    state: &Arc<AppState>,
+    control: &super::control::ControlState,
+    mut channel: super::mission_store::TelegramChannel,
+) {
+    channel.active = true;
+    channel.updated_at = super::mission_store::now_string();
+    if control
+        .mission_store
+        .update_telegram_channel(channel.clone())
+        .await
+        .is_ok()
+    {
+        let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+        let _ = state
+            .telegram_bridge
+            .start_channel(
+                channel,
+                control.cmd_tx.clone(),
+                control.events_tx.clone(),
+                control.mission_store.clone(),
+                &public_url,
+            )
+            .await;
+    }
+}
+
+/// Adopt an existing Assistant/Telegram gateway into the host Hermes runtime.
+///
+/// The token is read from the existing encrypted/local mission store and written
+/// only to root-owned host files. The response intentionally returns no secret
+/// values.
+async fn adopt_hermes_assistant(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<AdoptHermesAssistantRequest>,
+) -> Result<Json<AdoptHermesAssistantResponse>, (StatusCode, String)> {
+    let control = state.control.get_or_spawn(&user).await;
+    let mut channel = control
+        .mission_store
+        .get_telegram_channel(req.gateway_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Assistant gateway {} not found", req.gateway_id),
+            )
+        })?;
+
+    let allowed_users = comma_join_i64(&channel.allowed_chat_ids);
+    if allowed_users.is_empty() && !req.allow_all_users {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Gateway has no allowed chat/user IDs. Set allowed users first or explicitly allow all users for this adopt run.".to_string(),
+        ));
+    }
+
+    let hermes_installed = ensure_hermes_installed(req.install_hermes_if_missing)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !hermes_installed {
+        return Err((
+            StatusCode::FAILED_DEPENDENCY,
+            "Hermes is not installed. Retry with install_hermes_if_missing=true.".to_string(),
+        ));
+    }
+
+    let runtime_name = assistant_runtime_name(&state.config);
+    let service_name = format!("{runtime_name}.service");
+    let env_path = format!("/etc/sandboxed-sh/{runtime_name}.env");
+    let config_path = format!("/var/lib/{runtime_name}/config.yaml");
+    let workspace_path = format!("/var/lib/{runtime_name}/workspace");
+    let api_url = local_api_url(&state.config);
+    let model = if req.model.trim().is_empty() {
+        default_hermes_model()
+    } else {
+        req.model.trim().to_string()
+    };
+    let proxy_key = state
+        .proxy_api_keys
+        .create(format!(
+            "Hermes Assistant {}",
+            chrono::Utc::now().to_rfc3339()
+        ))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .key;
+    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+    let user_id = user.id.clone();
+    let default_workspace_id = channel
+        .default_workspace_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+
+    run_host_command("install", &["-d", "-m", "0755", "/etc/sandboxed-sh"])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    run_host_command(
+        "install",
+        &["-d", "-m", "0755", &format!("/var/lib/{runtime_name}")],
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    run_host_command("install", &["-d", "-m", "0755", &workspace_path])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut env = String::new();
+    env.push_str(&env_line("HOME", &format!("/var/lib/{runtime_name}")));
+    env.push_str(&env_line(
+        "HERMES_HOME",
+        &format!("/var/lib/{runtime_name}"),
+    ));
+    env.push_str("HERMES_ACCEPT_HOOKS=1\n");
+    env.push_str(&env_line("HERMES_SANDBOXED_API_URL", &api_url));
+    env.push_str("HERMES_SANDBOXED_API_TOKEN=\n");
+    env.push_str(&env_line("JWT_SECRET", &jwt_secret));
+    env.push_str(&env_line("HERMES_ASSISTANT_USER_ID", &user_id));
+    env.push_str(&env_line(
+        "HERMES_DEFAULT_WORKSPACE_ID",
+        &default_workspace_id,
+    ));
+    env.push_str(&env_line("OPENAI_BASE_URL", &format!("{api_url}/v1")));
+    env.push_str(&env_line("OPENAI_API_KEY", &proxy_key));
+    env.push_str(&env_line("HERMES_ASSISTANT_MODEL", &model));
+    env.push_str(&env_line("TELEGRAM_BOT_TOKEN", &channel.bot_token));
+    env.push_str(&env_line("TELEGRAM_ALLOWED_USERS", &allowed_users));
+    if req.allow_all_users {
+        env.push_str("GATEWAY_ALLOW_ALL_USERS=true\n");
+    }
+    env.push_str("HERMES_ASSISTANT_MCP_COMMAND=/usr/local/bin/assistant-mcp\n");
+
+    write_private_file(&env_path, &env)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_private_file(&config_path, &hermes_config_yaml(runtime_name))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let service_path = format!("/etc/systemd/system/{service_name}");
+    let service_after = if runtime_name.ends_with("-dev") {
+        "sandboxed-sh-dev.service"
+    } else {
+        "sandboxed-sh.service"
+    };
+    tokio::fs::write(
+        &service_path,
+        hermes_service_unit(runtime_name, &env_path, service_after),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to write service: {e}"),
+        )
+    })?;
+
+    let was_active = channel.active;
+    if channel.active {
+        channel.active = false;
+        channel.updated_at = super::mission_store::now_string();
+        control
+            .mission_store
+            .update_telegram_channel(channel.clone())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        state.telegram_bridge.stop_channel(channel.id).await;
+    }
+
+    let start_result = async {
+        run_host_command("systemctl", &["daemon-reload"]).await?;
+        run_host_command("systemctl", &["enable", "--now", &service_name]).await?;
+        run_host_command("systemctl", &["restart", &service_name]).await?;
+        run_host_command("systemctl", &["is-active", "--quiet", &service_name]).await
+    }
+    .await;
+
+    if let Err(error) = start_result {
+        if was_active {
+            rollback_legacy_gateway(&state, &control, channel.clone()).await;
+        }
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Hermes service failed to start; legacy gateway rollback attempted: {error}"),
+        ));
+    }
+
+    let hermes_info = get_systemd_service_component("hermes_assistant", &service_name)
+        .await
+        .unwrap_or(ComponentInfo {
+            name: "hermes_assistant".to_string(),
+            version: None,
+            installed: true,
+            update_available: None,
+            path: Some(service_path),
+            source_path: None,
+            status: ComponentStatus::Error,
+        });
+
+    let mut notes = vec![
+        "Telegram bot token was copied from the existing gateway without being returned."
+            .to_string(),
+        "Legacy sandboxed webhook was deactivated for this gateway before starting Hermes."
+            .to_string(),
+    ];
+    if allowed_users.is_empty() && req.allow_all_users {
+        notes.push("Hermes was configured with GATEWAY_ALLOW_ALL_USERS=true.".to_string());
+    }
+
+    Ok(Json(AdoptHermesAssistantResponse {
+        ok: matches!(hermes_info.status, ComponentStatus::Ok),
+        gateway_id: channel.id,
+        gateway_username: channel.bot_username.clone(),
+        service_name,
+        env_path,
+        config_path,
+        workspace_path,
+        api_url,
+        model,
+        allowed_users_count: channel.allowed_chat_ids.len(),
+        allow_all_users: req.allow_all_users,
+        legacy_gateway_active: false,
+        hermes_installed,
+        hermes_status: hermes_info.status,
+        notes,
+    }))
 }
 
 async fn get_systemd_service_component(

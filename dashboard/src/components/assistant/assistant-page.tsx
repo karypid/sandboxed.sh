@@ -12,6 +12,7 @@ import {
   listAssistantGatewayScheduledMessages,
   listAssistantGatewayMemory,
   searchAssistantGatewayMemory,
+  adoptHermesAssistant,
   listMissions,
   getSystemComponents,
   type Mission,
@@ -91,7 +92,7 @@ export default function AssistantPage() {
   const { data: missions = [] } = useSWR('missions', listMissions, {
     revalidateOnFocus: false,
   });
-  const { data: systemComponents, isLoading: componentsLoading } = useSWR(
+  const { data: systemComponents, mutate: mutateSystemComponents, isLoading: componentsLoading } = useSWR(
     'system-components',
     getSystemComponents,
     { revalidateOnFocus: false, dedupingInterval: 30000 }
@@ -117,6 +118,7 @@ export default function AssistantPage() {
   const [loadingScheduled, setLoadingScheduled] = useState<Set<string>>(new Set());
   const [loadingMemory, setLoadingMemory] = useState<Set<string>>(new Set());
   const [loadingMemorySearch, setLoadingMemorySearch] = useState<Set<string>>(new Set());
+  const [adoptingGatewayId, setAdoptingGatewayId] = useState<string | null>(null);
 
   // Create dialog
   const [showCreateDialog, setShowCreateDialog] = useState(false);
@@ -334,6 +336,36 @@ export default function AssistantPage() {
     }
   };
 
+  const handleAdoptHermes = async (bot: AssistantGateway) => {
+    const allowAllUsers = !bot.allowed_chat_ids?.length;
+    const label = gatewayLabel(bot);
+    const warning = allowAllUsers
+      ? `${label} does not have allowed user IDs configured. Adopt it into Hermes with open Telegram access?`
+      : `Move ${label} from the compatibility webhook to Hermes?`;
+    if (!confirm(warning)) return;
+
+    setAdoptingGatewayId(bot.id);
+    try {
+      const result = await adoptHermesAssistant({
+        gateway_id: bot.id,
+        allow_all_users: allowAllUsers,
+        model: assistantChain?.id || 'builtin/assistant',
+        install_hermes_if_missing: true,
+      });
+      await Promise.all([mutateBots(), mutateSystemComponents()]);
+      toast.success(
+        result.ok
+          ? `${label} is now managed by ${result.service_name}`
+          : `${label} was adopted, but Hermes reported ${result.hermes_status}`
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to adopt gateway into Hermes');
+      await Promise.all([mutateBots(), mutateSystemComponents()]);
+    } finally {
+      setAdoptingGatewayId(null);
+    }
+  };
+
   const handleSaveEdit = async () => {
     if (!editingBot) return;
     setSaving(true);
@@ -545,7 +577,7 @@ export default function AssistantPage() {
               <p className="text-sm font-medium text-white">Compatibility gateway still active</p>
               <p className="mt-1 text-xs leading-5 text-white/50">
                 Hermes runtime is active while {activeGatewayCount} compatibility gateway{activeGatewayCount === 1 ? '' : 's'} {activeGatewayCount === 1 ? 'remains' : 'remain'} active.
-                Move bot webhook ownership to Hermes, then deactivate the matching gateway here.
+                Use Adopt on the matching gateway to copy the existing token into Hermes and stop the legacy webhook.
               </p>
               <a
                 href="#assistant-gateways"
@@ -672,6 +704,23 @@ export default function AssistantPage() {
 
                   {/* Actions */}
                   <div className="flex items-center gap-1">
+                    {assistantMcpReady && bot.active && (
+                      <button
+                        type="button"
+                        onClick={() => void handleAdoptHermes(bot)}
+                        disabled={adoptingGatewayId === bot.id}
+                        className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-2.5 text-xs font-medium text-emerald-300 transition-colors hover:border-emerald-500/30 hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-60"
+                        aria-label={`Adopt ${gatewayLabel(bot)} into Hermes`}
+                        title="Move this bot token and Telegram ownership to Hermes"
+                      >
+                        {adoptingGatewayId === bot.id ? (
+                          <Loader className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <CheckCircle2 className="h-3.5 w-3.5" />
+                        )}
+                        Adopt
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => {

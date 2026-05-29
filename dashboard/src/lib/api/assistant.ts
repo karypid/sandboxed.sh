@@ -26,6 +26,31 @@ export type AssistantGatewayActionExecution = TelegramActionExecution;
 export type CreateAssistantGatewayInput = CreateTelegramBotInput;
 export type UpdateAssistantGatewayInput = UpdateTelegramChannelInput;
 
+export interface AdoptHermesAssistantInput {
+  gateway_id: string;
+  allow_all_users?: boolean;
+  model?: string;
+  install_hermes_if_missing?: boolean;
+}
+
+export interface AdoptHermesAssistantResult {
+  ok: boolean;
+  gateway_id: string;
+  gateway_username?: string | null;
+  service_name: string;
+  env_path: string;
+  config_path: string;
+  workspace_path: string;
+  api_url: string;
+  model: string;
+  allowed_users_count: number;
+  allow_all_users: boolean;
+  legacy_gateway_active: boolean;
+  hermes_installed: boolean;
+  hermes_status: "ok" | "update_available" | "not_installed" | "error";
+  notes: string[];
+}
+
 const gatewayPath = "/api/control/assistant/gateways";
 
 export async function listAssistantGateways(): Promise<AssistantGateway[]> {
@@ -122,5 +147,15 @@ export async function searchAssistantGatewayMemory(
   return apiGet<AssistantGatewayMemorySearchHit[]>(
     `${gatewayPath}/${gatewayId}/memory-search?${params.toString()}`,
     "Failed to search assistant gateway memory"
+  );
+}
+
+export async function adoptHermesAssistant(
+  input: AdoptHermesAssistantInput
+): Promise<AdoptHermesAssistantResult> {
+  return apiPost<AdoptHermesAssistantResult>(
+    "/api/system/hermes-assistant/adopt",
+    input,
+    "Failed to adopt gateway into Hermes"
   );
 }
