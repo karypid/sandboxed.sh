@@ -310,6 +310,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/components", get(get_components))
         .route("/components/by-workspace", get(get_components_by_workspace))
         .route("/hermes-assistant/adopt", post(adopt_hermes_assistant))
+        .route("/hermes-assistant/status", get(get_hermes_assistant_status))
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
         .route("/deploy", post(deploy_sandboxed_sh))
@@ -820,6 +821,48 @@ pub struct AdoptHermesAssistantResponse {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct HermesAssistantStatusResponse {
+    pub service_name: String,
+    pub service_active: bool,
+    pub env_path: String,
+    pub config_path: String,
+    pub env_present: bool,
+    pub config_present: bool,
+    pub token_present: bool,
+    pub telegram_ok: Option<bool>,
+    pub telegram_bot_username: Option<String>,
+    pub telegram_webhook_configured: Option<bool>,
+    pub telegram_pending_update_count: Option<i64>,
+    pub telegram_last_error: Option<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramApiResponse<T> {
+    ok: bool,
+    #[serde(default)]
+    result: Option<T>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TelegramGetMeResult {
+    #[serde(default)]
+    username: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TelegramWebhookInfoResult {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    pending_update_count: Option<i64>,
+    #[serde(default)]
+    last_error_message: Option<String>,
+}
+
 fn default_hermes_model() -> String {
     "builtin/assistant".to_string()
 }
@@ -849,6 +892,34 @@ fn env_quote(value: &str) -> String {
 
 fn env_line(key: &str, value: &str) -> String {
     format!("{key}={}\n", env_quote(value))
+}
+
+fn env_unquote(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        return trimmed[1..trimmed.len() - 1].replace("'\\''", "'");
+    }
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        return trimmed[1..trimmed.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+    }
+    trimmed.to_string()
+}
+
+fn parse_env_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (candidate, value) = line.split_once('=')?;
+        if candidate.trim() == key {
+            Some(env_unquote(value))
+        } else {
+            None
+        }
+    })
 }
 
 fn comma_join_i64(values: &[i64]) -> String {
@@ -1217,6 +1288,127 @@ async fn adopt_hermes_assistant(
         hermes_status: hermes_info.status,
         notes,
     }))
+}
+
+async fn get_hermes_assistant_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<HermesAssistantStatusResponse> {
+    let runtime_name = assistant_runtime_name(&state.config);
+    let service_name = format!("{runtime_name}.service");
+    let env_path = format!("/etc/sandboxed-sh/{runtime_name}.env");
+    let config_path = format!("/var/lib/{runtime_name}/config.yaml");
+    let service_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", &service_name])
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false);
+    let env_contents = tokio::fs::read_to_string(&env_path).await.ok();
+    let env_present = env_contents.is_some();
+    let config_present = tokio::fs::metadata(&config_path).await.is_ok();
+    let token = env_contents
+        .as_deref()
+        .and_then(|contents| parse_env_value(contents, "TELEGRAM_BOT_TOKEN"))
+        .filter(|value| !value.trim().is_empty());
+    let token_present = token.is_some();
+
+    let mut telegram_ok = None;
+    let mut telegram_bot_username = None;
+    let mut telegram_webhook_configured = None;
+    let mut telegram_pending_update_count = None;
+    let mut telegram_last_error = None;
+    let mut notes = Vec::new();
+
+    if let Some(token) = token {
+        let client = reqwest::Client::new();
+        let base = format!("https://api.telegram.org/bot{token}");
+
+        match client
+            .get(format!("{base}/getMe"))
+            .send()
+            .await
+            .and_then(|resp| resp.error_for_status())
+        {
+            Ok(resp) => match resp
+                .json::<TelegramApiResponse<TelegramGetMeResult>>()
+                .await
+            {
+                Ok(body) => {
+                    telegram_ok = Some(body.ok);
+                    telegram_bot_username = body.result.and_then(|result| result.username);
+                    if !body.ok {
+                        telegram_last_error = body.description;
+                    }
+                }
+                Err(error) => {
+                    telegram_ok = Some(false);
+                    telegram_last_error = Some(format!("Telegram getMe decode failed: {error}"));
+                }
+            },
+            Err(error) => {
+                telegram_ok = Some(false);
+                telegram_last_error = Some(format!("Telegram getMe failed: {error}"));
+            }
+        }
+
+        match client
+            .get(format!("{base}/getWebhookInfo"))
+            .send()
+            .await
+            .and_then(|resp| resp.error_for_status())
+        {
+            Ok(resp) => match resp
+                .json::<TelegramApiResponse<TelegramWebhookInfoResult>>()
+                .await
+            {
+                Ok(body) => {
+                    if let Some(result) = body.result {
+                        telegram_webhook_configured = Some(!result.url.trim().is_empty());
+                        telegram_pending_update_count = result.pending_update_count;
+                        if result.last_error_message.is_some() {
+                            telegram_last_error = result.last_error_message;
+                        }
+                    }
+                }
+                Err(error) => {
+                    telegram_last_error = Some(format!("Telegram webhook decode failed: {error}"));
+                }
+            },
+            Err(error) => {
+                telegram_last_error = Some(format!("Telegram getWebhookInfo failed: {error}"));
+            }
+        }
+    } else {
+        notes.push("TELEGRAM_BOT_TOKEN is not present in the Hermes env file.".to_string());
+    }
+
+    if telegram_webhook_configured == Some(false) {
+        notes.push(
+            "Telegram has no webhook configured; Hermes should receive updates by polling."
+                .to_string(),
+        );
+    }
+    if telegram_webhook_configured == Some(true) {
+        notes.push(
+            "Telegram still has a webhook configured, which can block polling mode.".to_string(),
+        );
+    }
+
+    Json(HermesAssistantStatusResponse {
+        service_name,
+        service_active,
+        env_path,
+        config_path,
+        env_present,
+        config_present,
+        token_present,
+        telegram_ok,
+        telegram_bot_username,
+        telegram_webhook_configured,
+        telegram_pending_update_count,
+        telegram_last_error,
+        notes,
+    })
 }
 
 async fn get_systemd_service_component(
