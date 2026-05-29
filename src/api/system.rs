@@ -1217,6 +1217,11 @@ async fn adopt_hermes_assistant(
     env.push_str(&env_line("HERMES_ASSISTANT_MODEL", &model));
     env.push_str(&env_line("TELEGRAM_BOT_TOKEN", &channel.bot_token));
     env.push_str(&env_line("TELEGRAM_ALLOWED_USERS", &allowed_users));
+    if channel.allowed_chat_ids.len() == 1 {
+        let home_channel = channel.allowed_chat_ids[0].to_string();
+        env.push_str(&env_line("TELEGRAM_HOME_CHANNEL", &home_channel));
+        env.push_str(&env_line("TELEGRAM_HOME_CHANNEL_NAME", "Thomas"));
+    }
     if req.allow_all_users {
         env.push_str("GATEWAY_ALLOW_ALL_USERS=true\n");
     }
