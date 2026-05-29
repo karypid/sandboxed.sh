@@ -1205,7 +1205,7 @@ async fn adopt_hermes_assistant(
     let service_after = if runtime_name.ends_with("-dev") {
         "sandboxed-sh-dev.service"
     } else {
-        "sandboxed-sh.service"
+        "sandboxed-sh-prod.service"
     };
     tokio::fs::write(
         &service_path,
