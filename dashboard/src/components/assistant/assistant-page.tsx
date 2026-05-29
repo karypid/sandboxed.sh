@@ -463,7 +463,7 @@ export default function AssistantPage() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full max-w-5xl space-y-6">
+      <div className="w-full min-w-[720px] max-w-5xl space-y-6">
         {/* Header */}
         <header className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
@@ -1096,7 +1096,11 @@ export default function AssistantPage() {
           <div className="grid gap-3 text-sm text-white/60 md:grid-cols-3">
             <div>
               <p className="text-white/80">Gateway</p>
-              <p className="mt-1 text-xs text-white/40">Telegram remains visible here until Hermes owns the bot webhook.</p>
+              <p className="mt-1 text-xs text-white/40">
+                {hermesStatus?.telegram_ok
+                  ? 'Hermes owns Telegram; the compatibility record stays here for rollback and audit.'
+                  : 'Use Adopt to move Telegram from the compatibility webhook to Hermes.'}
+              </p>
             </div>
             <div>
               <p className="text-white/80">Mission control</p>
