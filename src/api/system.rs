@@ -958,13 +958,31 @@ fn comma_join_i64(values: &[i64]) -> String {
         .join(",")
 }
 
-fn hermes_config_yaml(runtime_name: &str) -> String {
+/// YAML single-quoted scalar. Hermes does not interpolate `${VAR}` references
+/// in config.yaml, so every value is inlined literally and must be quoted to
+/// survive slashes, secrets, and other YAML-significant characters.
+fn yaml_squote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hermes_config_yaml(
+    runtime_name: &str,
+    model: &str,
+    base_url: &str,
+    api_key: &str,
+    mcp_command: &str,
+    api_url: &str,
+    jwt_secret: &str,
+    user_id: &str,
+    default_workspace_id: &str,
+) -> String {
     format!(
         r#"model:
   provider: custom
-  default: ${{HERMES_ASSISTANT_MODEL}}
-  base_url: ${{OPENAI_BASE_URL}}
-  api_key: ${{OPENAI_API_KEY}}
+  default: {model}
+  base_url: {base_url}
+  api_key: {api_key}
   api_mode: chat_completions
 
 terminal:
@@ -973,13 +991,12 @@ terminal:
 
 mcp_servers:
   sandboxed_assistant:
-    command: ${{HERMES_ASSISTANT_MCP_COMMAND}}
+    command: {mcp_command}
     env:
-      HERMES_SANDBOXED_API_URL: ${{HERMES_SANDBOXED_API_URL}}
-      HERMES_SANDBOXED_API_TOKEN: ${{HERMES_SANDBOXED_API_TOKEN}}
-      JWT_SECRET: ${{JWT_SECRET}}
-      HERMES_ASSISTANT_USER_ID: ${{HERMES_ASSISTANT_USER_ID}}
-      HERMES_DEFAULT_WORKSPACE_ID: ${{HERMES_DEFAULT_WORKSPACE_ID}}
+      HERMES_SANDBOXED_API_URL: {api_url}
+      JWT_SECRET: {jwt_secret}
+      HERMES_ASSISTANT_USER_ID: {user_id}
+      HERMES_DEFAULT_WORKSPACE_ID: {default_workspace_id}
     timeout: 120
     connect_timeout: 15
     tools:
@@ -1000,7 +1017,15 @@ display:
     telegram:
       tool_progress: off
       cleanup_progress: true
-"#
+"#,
+        model = yaml_squote(model),
+        base_url = yaml_squote(base_url),
+        api_key = yaml_squote(api_key),
+        mcp_command = yaml_squote(mcp_command),
+        api_url = yaml_squote(api_url),
+        jwt_secret = yaml_squote(jwt_secret),
+        user_id = yaml_squote(user_id),
+        default_workspace_id = yaml_squote(default_workspace_id),
     )
 }
 
@@ -1277,9 +1302,22 @@ async fn adopt_hermes_assistant(
     write_private_file(&dotenv_path, &env)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    write_private_file(&config_path, &hermes_config_yaml(runtime_name))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_private_file(
+        &config_path,
+        &hermes_config_yaml(
+            runtime_name,
+            &model,
+            &format!("{api_url}/v1"),
+            &proxy_key,
+            "/usr/local/bin/assistant-mcp",
+            &api_url,
+            &jwt_secret,
+            &user_id,
+            &default_workspace_id,
+        ),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     write_private_file(&soul_path, &hermes_soul_markdown(&channel))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
