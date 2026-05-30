@@ -835,13 +835,17 @@ impl ModelChainStore {
                 id: "builtin/smart".to_string(),
                 name: "Smart (Default)".to_string(),
                 entries: vec![
-                    ChainEntry {
-                        provider_id: "zai".to_string(),
-                        model_id: "glm-5.1".to_string(),
-                    },
+                    // MiniMax leads because it emits visible OpenAI-compatible
+                    // `message.content`. GLM-5.1 streams long `reasoning_content`
+                    // before visible text, which the Hermes gateway treats as an
+                    // empty provider response. GLM stays as the fallback.
                     ChainEntry {
                         provider_id: "minimax".to_string(),
                         model_id: "MiniMax-M2.7".to_string(),
+                    },
+                    ChainEntry {
+                        provider_id: "zai".to_string(),
+                        model_id: "glm-5.1".to_string(),
                     },
                 ],
                 is_default: true,
@@ -863,6 +867,19 @@ impl ModelChainStore {
                         entry.model_id = "MiniMax-M2.7".to_string();
                         migrated = true;
                     }
+                }
+                // One-time reorder: older builtin/smart was persisted GLM-first,
+                // which makes the Hermes gateway see empty `content` while GLM
+                // streams `reasoning_content`. Lead with MiniMax instead. Only
+                // touch the stock two-entry shape so operator-added fallbacks or
+                // custom orderings are left alone.
+                if chain.entries.len() == 2
+                    && chain.entries[0].provider_id == "zai"
+                    && chain.entries[1].provider_id == "minimax"
+                {
+                    chain.entries.swap(0, 1);
+                    migrated = true;
+                    tracing::info!("Reordered builtin/smart to lead with MiniMax");
                 }
                 if migrated {
                     chain.updated_at = now;
