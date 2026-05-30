@@ -7714,14 +7714,33 @@ async fn oauth_callback(
     let provider_type_id = id.clone();
     match oauth_callback_inner(State(state.clone()), AxumPath(id), Json(req)).await {
         Ok(json) => {
-            if ProviderType::from_id(&provider_type_id) == Some(ProviderType::Xai) {
+            // Resolve the provider type. The add-provider flow passes a
+            // provider-type id ("anthropic", ...); the reconnect button passes
+            // the stored provider's *UUID*, which `ProviderType::from_id` does
+            // not recognize. Look the UUID up in the store so reconnect still
+            // mirrors the fresh OAuth into the row instead of leaving it with
+            // expired tokens.
+            let resolved_type_and_uuid = match ProviderType::from_id(&provider_type_id) {
+                Some(pt) => Some((pt, None)),
+                None => match uuid::Uuid::parse_str(&provider_type_id) {
+                    Ok(uuid) => state
+                        .ai_providers
+                        .get(uuid)
+                        .await
+                        .map(|existing| (existing.provider_type, Some(uuid))),
+                    Err(_) => None,
+                },
+            };
+
+            if resolved_type_and_uuid.map(|(pt, _)| pt) == Some(ProviderType::Xai) {
+                // xAI tracks creds in auth.json only; don't mirror to the store.
                 return json.into_response();
             }
 
             // After successful OAuth, upsert the provider in AIProviderStore.
             // The OAuth callback already synced creds to auth.json; now mirror that
             // into the store so multiple accounts of the same type are tracked.
-            if let Some(provider_type) = ProviderType::from_id(&provider_type_id) {
+            if let Some((provider_type, existing_uuid)) = resolved_type_and_uuid {
                 let backends = use_for_backends
                     .unwrap_or_else(|| default_backends_for_provider(provider_type));
 
@@ -7782,9 +7801,8 @@ async fn oauth_callback(
                 // If the caller referenced an existing provider by UUID (the
                 // reconnect button passes the stored provider's id), refresh
                 // that row in place instead of inserting a duplicate. The
-                // add-provider flow passes a provider-type id (not a UUID) and
-                // falls through to `add`.
-                if let Ok(uuid) = uuid::Uuid::parse_str(&provider_type_id) {
+                // add-provider flow has no UUID and falls through to `add`.
+                if let Some(uuid) = existing_uuid {
                     if let Some(mut existing) = state.ai_providers.get(uuid).await {
                         existing.api_key = provider.api_key.clone();
                         existing.oauth = provider.oauth.clone();

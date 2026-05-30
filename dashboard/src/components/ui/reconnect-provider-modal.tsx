@@ -62,6 +62,11 @@ export function ReconnectProviderModal({
   onSuccess,
 }: ReconnectProviderModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  // Monotonic token to discard stale `oauthAuthorize` responses: closing the
+  // modal or switching providers while a request is in flight bumps this, so a
+  // late response can't apply its URL/step/loading state to a different (or
+  // already-closed) provider.
+  const authorizeReqRef = useRef(0);
 
   const [step, setStep] = useState<Step>('select-method');
   const [methodIndex, setMethodIndex] = useState<number | null>(null);
@@ -74,17 +79,22 @@ export function ReconnectProviderModal({
   const startAuthorize = useCallback(
     async (index: number) => {
       if (!provider) return;
+      const reqId = ++authorizeReqRef.current;
       setMethodIndex(index);
       setLoading(true);
       try {
         const response = await oauthAuthorize(provider.id, index);
+        // A newer authorize started, or the modal closed/switched providers —
+        // drop this stale response so it can't hijack the current state.
+        if (authorizeReqRef.current !== reqId) return;
         setOauthResponse(response);
         setStep('oauth-callback');
         window.open(response.url, '_blank');
       } catch (err) {
+        if (authorizeReqRef.current !== reqId) return;
         toast.error(`Failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
       } finally {
-        setLoading(false);
+        if (authorizeReqRef.current === reqId) setLoading(false);
       }
     },
     [provider]
@@ -94,6 +104,8 @@ export function ReconnectProviderModal({
   // selection step and kick off authorization immediately.
   useEffect(() => {
     if (open && provider) {
+      // Invalidate any authorize request still in flight from a previous open.
+      authorizeReqRef.current += 1;
       setStep('select-method');
       setMethodIndex(null);
       setOauthResponse(null);
@@ -107,6 +119,8 @@ export function ReconnectProviderModal({
   }, [open, provider?.id]);
 
   const handleClose = useCallback(() => {
+    // Supersede any in-flight authorize so its late response is ignored.
+    authorizeReqRef.current += 1;
     onClose();
   }, [onClose]);
 
@@ -139,7 +153,9 @@ export function ReconnectProviderModal({
     setLoading(true);
     try {
       await oauthCallback(provider.id, methodIndex, oauthCode, provider.use_for_backends);
-      toast.success('Provider reconnected');
+      // Don't celebrate yet — `onSuccess` runs a usage probe and owns the
+      // success/failure toast, so we avoid showing "reconnected" followed by a
+      // "check still fails" error for the same action.
       onSuccess(provider.id);
       onClose();
     } catch (err) {

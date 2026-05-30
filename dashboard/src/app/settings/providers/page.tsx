@@ -462,9 +462,13 @@ export default function ProvidersPage() {
             fresh?.error || fresh?.status || 'unknown error'
           )}`
         );
+      } else {
+        toast.success('Provider reconnected');
       }
     } catch {
-      // Health probe is best-effort; the reconnect itself already succeeded.
+      // Health probe is best-effort; the reconnect itself already succeeded, so
+      // still surface success rather than leaving the action without feedback.
+      toast.success('Provider reconnected');
     }
   };
 

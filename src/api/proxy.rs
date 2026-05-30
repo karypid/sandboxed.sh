@@ -1749,8 +1749,10 @@ fn anthropic_model_omits_sampling_params(model_id: &str) -> bool {
 /// must strip the now-stale thinking blocks before forwarding. This matches
 /// Anthropic's guidance for switching models mid-conversation.
 ///
-/// An assistant turn that contained *only* thinking is left untouched (we never
-/// emit an empty `content` array, which Anthropic would also reject).
+/// If stripping removes every block (a thinking-only assistant turn), we
+/// substitute a single placeholder text block: Anthropic rejects an empty
+/// `content` array, and we must not forward the stale, cross-model thinking
+/// either — so neither leaving it as-is nor emptying it is valid.
 fn strip_thinking_blocks(messages: &mut [serde_json::Value]) {
     for message in messages.iter_mut() {
         if message.get("role").and_then(|v| v.as_str()) != Some("assistant") {
@@ -1759,18 +1761,21 @@ fn strip_thinking_blocks(messages: &mut [serde_json::Value]) {
         let Some(content) = message.get_mut("content").and_then(|v| v.as_array_mut()) else {
             continue;
         };
-        let filtered: Vec<serde_json::Value> = content
-            .iter()
-            .filter(|block| {
-                !matches!(
-                    block.get("type").and_then(|v| v.as_str()),
-                    Some("thinking") | Some("redacted_thinking")
-                )
-            })
-            .cloned()
-            .collect();
-        if !filtered.is_empty() && filtered.len() != content.len() {
-            *content = filtered;
+        let before = content.len();
+        content.retain(|block| {
+            !matches!(
+                block.get("type").and_then(|v| v.as_str()),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        });
+        if content.len() == before {
+            continue; // nothing was stripped
+        }
+        if content.is_empty() {
+            content.push(serde_json::json!({
+                "type": "text",
+                "text": "(prior reasoning omitted after model change)"
+            }));
         }
     }
 }
@@ -4548,6 +4553,37 @@ mod tests {
             blocks.iter().any(|b| b["type"] == "thinking"),
             "thinking must be preserved verbatim when the model is unchanged"
         );
+    }
+
+    #[test]
+    fn anthropic_cli_proxy_strips_thinking_only_turn_on_model_change() {
+        // A thinking-only assistant turn must not survive a model switch, and
+        // must not be left with an empty content array either.
+        let body = serde_json::json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 16,
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [
+                    { "type": "thinking", "thinking": "only thinking", "signature": "sig-x" }
+                ]}
+            ]
+        });
+        let payload = rewrite_model_for_anthropic_cli_proxy(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "claude-opus-4-8",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(payload.as_ref()).unwrap();
+        let blocks = value["messages"][1]["content"].as_array().unwrap();
+        assert!(!blocks.is_empty(), "content must never be left empty");
+        assert!(
+            blocks
+                .iter()
+                .all(|b| b["type"] != "thinking" && b["type"] != "redacted_thinking"),
+            "thinking-only turns must still be stripped on model change"
+        );
+        assert_eq!(blocks[0]["type"], "text");
     }
 
     #[test]
