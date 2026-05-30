@@ -886,12 +886,13 @@ struct TelegramWebhookInfoResult {
 }
 
 fn default_hermes_model() -> String {
-    // GLM 5.1 currently returns extended reasoning in `reasoning_content`
-    // through the OpenAI-compatible proxy before it emits visible `content`.
-    // Hermes' Telegram gateway expects visible assistant text, so the assistant
-    // runtime defaults to the Smart chain, which currently starts with MiniMax
-    // and still keeps the operator-controlled routing surface.
-    "builtin/smart".to_string()
+    // Hermes' Telegram gateway renders `message.content` and treats an empty
+    // response as a provider failure. GLM-5.1 streams its answer as
+    // `reasoning_content` with empty `content`, and the proxy only fails over on
+    // pre-stream errors, so any chain that can land on GLM risks a dead
+    // "provider failed after retries" reply. Default to the dedicated assistant
+    // chain, which only routes to providers that emit visible content.
+    "builtin/assistant".to_string()
 }
 
 fn assistant_runtime_name(config: &crate::config::Config) -> &'static str {
