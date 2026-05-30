@@ -985,6 +985,12 @@ fn hermes_config_yaml(
   api_key: {api_key}
   api_mode: chat_completions
 
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 4000
+  user_char_limit: 2000
+
 terminal:
   backend: local
   cwd: /var/lib/{runtime_name}/workspace
