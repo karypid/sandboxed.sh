@@ -1334,6 +1334,7 @@ async fn adopt_hermes_assistant(
     env.push_str(&env_line("TELEGRAM_BOT_TOKEN", &channel.bot_token));
     env.push_str(&env_line("TELEGRAM_ALLOWED_USERS", &allowed_users));
     env.push_str("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES=true\n");
+    env.push_str("TELEGRAM_REQUIRE_MENTION=true\n");
     if let Some((home_channel_id, home_channel_name)) = &home_channel {
         env.push_str(&env_line(
             "TELEGRAM_HOME_CHANNEL",
