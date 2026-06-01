@@ -921,7 +921,30 @@ function QuestionToolItem({
   item: ToolItem;
   onSubmit: (toolCallId: string, answers: string[][]) => Promise<void>;
 }) {
-  const questions = useMemo(() => parseQuestionArgs(item.args), [item.args]);
+  const parsedQuestions = useMemo(
+    () => parseQuestionArgs(item.args),
+    [item.args],
+  );
+  // Fallback for empty/malformed payloads (e.g. a question tool-call whose
+  // streamed input never assembled into args): render a single free-text
+  // reply so the user can still answer and unblock the mission, instead of a
+  // dead-end "Failed to render" error.
+  const isFallback = parsedQuestions.length === 0;
+  const questions = useMemo<QuestionInfo[]>(
+    () =>
+      isFallback
+        ? [
+            {
+              question:
+                "The agent asked for your input, but the question didn't include any content. Reply below to continue.",
+              options: [],
+              multiple: false,
+              freeTextOnly: true,
+            },
+          ]
+        : parsedQuestions,
+    [isFallback, parsedQuestions],
+  );
   const [answers, setAnswers] = useState<string[][]>(() =>
     questions.map(() => []),
   );
