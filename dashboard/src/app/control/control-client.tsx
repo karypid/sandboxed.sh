@@ -921,7 +921,30 @@ function QuestionToolItem({
   item: ToolItem;
   onSubmit: (toolCallId: string, answers: string[][]) => Promise<void>;
 }) {
-  const questions = useMemo(() => parseQuestionArgs(item.args), [item.args]);
+  const parsedQuestions = useMemo(
+    () => parseQuestionArgs(item.args),
+    [item.args],
+  );
+  // Fallback for empty/malformed payloads (e.g. a question tool-call whose
+  // streamed input never assembled into args): render a single free-text
+  // reply so the user can still answer and unblock the mission, instead of a
+  // dead-end "Failed to render" error.
+  const isFallback = parsedQuestions.length === 0;
+  const questions = useMemo<QuestionInfo[]>(
+    () =>
+      isFallback
+        ? [
+            {
+              question:
+                "The agent asked for your input, but the question didn't include any content. Reply below to continue.",
+              options: [],
+              multiple: false,
+              freeTextOnly: true,
+            },
+          ]
+        : parsedQuestions,
+    [isFallback, parsedQuestions],
+  );
   const [answers, setAnswers] = useState<string[][]>(() =>
     questions.map(() => []),
   );
@@ -10526,14 +10549,14 @@ export default function ControlClient() {
                   {/* Waiting banner for interactive user-input tools */}
                   {hasPendingUserInput && (
                     <div className="flex justify-center py-4 animate-fade-in">
-                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4 bg-indigo-500/10 border border-indigo-500/20">
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4 bg-indigo-500/10 border border-indigo-500/30">
                         <div className="flex items-center gap-3">
-                          <HelpCircle className="h-5 w-5 shrink-0 text-indigo-300" />
+                          <HelpCircle className="h-5 w-5 shrink-0 text-indigo-500" />
                           <div className="text-sm">
-                            <span className="font-medium text-indigo-200">
+                            <span className="font-medium text-foreground">
                               Waiting for your response
                             </span>
-                            <p className="text-white/50">
+                            <p className="text-muted-foreground">
                               The agent is paused until you answer the prompt
                               above.
                             </p>
@@ -10542,7 +10565,7 @@ export default function ControlClient() {
                         <button
                           type="button"
                           onClick={handleShowPendingUserInput}
-                          className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30 border border-indigo-500/30 transition-colors"
+                          className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium bg-indigo-600 text-white hover:bg-indigo-700 border border-indigo-600 transition-colors"
                         >
                           <ArrowDown className="h-3.5 w-3.5" />
                           Show prompt
