@@ -2530,6 +2530,9 @@ async fn oauth_token_refresher_loop(
         ProviderType::Anthropic,
         ProviderType::OpenAI,
         ProviderType::Google,
+        // xAI/Grok OAuth (Grok Build) is routed directly to api.x.ai with the
+        // hoisted access token, so keep it refreshed like the others.
+        ProviderType::Xai,
     ];
 
     tracing::info!(
