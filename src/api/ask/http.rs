@@ -286,8 +286,10 @@ pub async fn ask_send_stream(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<super::AskStreamEvent>();
     tokio::spawn(async move {
-        run_ask_turn_streaming(&turn, &content, tx).await;
-        if is_new_thread {
+        let ok = run_ask_turn_streaming(&turn, &content, tx).await;
+        // Only title a new thread if the turn actually produced an answer
+        // (matches the synchronous path, which titles after success).
+        if ok && is_new_thread {
             let _ = title_store
                 .set_thread_title(thread_id, &derive_title(&content))
                 .await;

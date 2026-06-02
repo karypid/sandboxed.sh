@@ -205,13 +205,19 @@ pub enum AskStreamEvent {
 
 /// Streaming variant of [`run_ask_turn`]: drives the same agentic loop but emits
 /// [`AskStreamEvent`]s on `tx` as tokens, tool calls, and results arrive.
+/// Returns `true` if the turn completed successfully (a `done` event was sent),
+/// `false` if it failed (an `error` event was sent instead).
 pub async fn run_ask_turn_streaming(
     turn: &AskTurn,
     user_content: &str,
     tx: UnboundedSender<AskStreamEvent>,
-) {
-    if let Err(e) = run_ask_turn_streaming_inner(turn, user_content, &tx).await {
-        let _ = tx.send(AskStreamEvent::Error { message: e });
+) -> bool {
+    match run_ask_turn_streaming_inner(turn, user_content, &tx).await {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = tx.send(AskStreamEvent::Error { message: e });
+            false
+        }
     }
 }
 

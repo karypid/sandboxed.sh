@@ -163,11 +163,19 @@ export function AskPanel({
     genRef.current += 1;
     const myGen = genRef.current;
 
+    // Ids of every bubble this turn added, so a failed turn can roll them back
+    // (the backend may not have persisted these fragments).
+    const turnIds: string[] = [];
+    const rollbackTurn = () =>
+      setMessages((prev) => prev.filter((m) => !turnIds.includes(m.id)));
+
     const now = () => new Date().toISOString();
+    const userId = `u-${Date.now()}`;
+    turnIds.push(userId);
     setMessages((prev) => [
       ...prev,
       {
-        id: `u-${Date.now()}`,
+        id: userId,
         thread_id: threadId ?? "",
         seq: prev.length + 1,
         role: "user",
@@ -188,6 +196,7 @@ export function AskPanel({
         }
         const newId = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         streamIdRef.current = newId;
+        turnIds.push(newId);
         return [
           ...prev,
           {
@@ -211,6 +220,7 @@ export function AskPanel({
           onDelta: appendDelta,
           onToolCall: (t) => {
             streamIdRef.current = null; // close the current assistant segment
+            turnIds.push(`tc-${t.tool_call_id}`);
             setMessages((prev) => [
               ...prev,
               {
@@ -226,6 +236,7 @@ export function AskPanel({
             ]);
           },
           onToolResult: (t) => {
+            turnIds.push(`tr-${t.tool_call_id}`);
             setMessages((prev) => [
               ...prev,
               {
@@ -259,14 +270,16 @@ export function AskPanel({
           },
           onError: (msg) => {
             setError(msg);
-            // Restore the question so it isn't lost (unless the user already
-            // started a new draft).
+            // Drop this turn's in-progress bubbles and restore the question so
+            // it isn't lost (unless the user already started a new draft).
+            rollbackTurn();
             setInput((cur) => cur || content);
           },
         },
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ask failed");
+      rollbackTurn();
       setInput((cur) => cur || content);
     } finally {
       setLoading(false);

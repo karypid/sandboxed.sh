@@ -209,9 +209,22 @@ impl AskClient {
         let mut tool_accum: Vec<(String, String, String)> = Vec::new();
         let mut total_tokens: Option<u64> = None;
 
-        'outer: while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|e| format!("Ask LLM stream error: {e}"))?;
-            buf.push_str(&String::from_utf8_lossy(&bytes));
+        let mut ended = false;
+        'outer: while !ended {
+            match stream.next().await {
+                Some(chunk) => {
+                    let bytes = chunk.map_err(|e| format!("Ask LLM stream error: {e}"))?;
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                None => {
+                    // Connection closed: flush a trailing line that lacks a
+                    // newline so a final `data:` chunk isn't dropped.
+                    ended = true;
+                    if !buf.is_empty() && !buf.ends_with('\n') {
+                        buf.push('\n');
+                    }
+                }
+            }
             while let Some(nl) = buf.find('\n') {
                 let line: String = buf.drain(..=nl).collect();
                 let line = line.trim();
