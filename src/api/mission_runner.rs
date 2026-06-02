@@ -3900,6 +3900,28 @@ fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
     None
 }
 
+/// Map a mission `model_effort` to a Claude Code extended-thinking budget
+/// (`MAX_THINKING_TOKENS`).
+///
+/// `CLAUDE_CODE_EFFORT_LEVEL` alone only nudges *adaptive* reasoning: on
+/// tool-heavy turns the model frequently chooses not to think at all, so no
+/// `thinking_delta` blocks stream and the Thoughts panel stays empty (see
+/// mission 5aede562, which ran at effort=max yet recorded 0 thinking events
+/// across ~1600 tool calls). Pinning a non-zero budget forces an extended
+/// thinking block every turn, so thoughts are captured deterministically.
+///
+/// Returns 0 for unknown efforts, leaving thinking fully adaptive.
+fn claude_thinking_budget(effort: &str) -> u32 {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "max" => 32_000,
+        "xhigh" => 24_000,
+        "high" => 16_000,
+        "medium" => 8_000,
+        "low" => 4_000,
+        _ => 0,
+    }
+}
+
 /// Execute a turn using Claude Code CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
@@ -4802,10 +4824,25 @@ pub fn run_claudecode_turn<'a>(
         // Claude Code reads CLAUDE_CODE_EFFORT_LEVEL to control adaptive reasoning depth.
         if let Some(effort) = model_effort {
             env.insert("CLAUDE_CODE_EFFORT_LEVEL".to_string(), effort.to_string());
+
+            // CLAUDE_CODE_EFFORT_LEVEL only nudges adaptive reasoning, which
+            // leaves the Thoughts panel empty on tool-heavy turns. Pin an
+            // explicit extended-thinking budget so every turn emits a thinking
+            // block we can capture and stream. (The capture pipeline already
+            // handles thinking_delta — see backend/shared.rs — the CLI just
+            // wasn't emitting any.)
+            let thinking_tokens = claude_thinking_budget(effort);
+            if thinking_tokens > 0 {
+                env.insert(
+                    "MAX_THINKING_TOKENS".to_string(),
+                    thinking_tokens.to_string(),
+                );
+            }
             tracing::info!(
                 mission_id = %mission_id,
                 effort = %effort,
-                "Setting Claude Code effort level via CLAUDE_CODE_EFFORT_LEVEL"
+                max_thinking_tokens = thinking_tokens,
+                "Setting Claude Code effort level + extended-thinking budget"
             );
         }
 
@@ -5294,6 +5331,32 @@ pub fn run_claudecode_turn<'a>(
                     pty.kill();
                     reader_handle.abort();
                     break;
+                }
+                // Timer-based liveness heartbeat, gated to AwaitingToolResults.
+                //
+                // While a foreground tool runs (notably a long build), the CLI
+                // emits no stream events for minutes, so the event-gated
+                // heartbeat below never fires. The actor-level stuck-mission
+                // watchdog (control.rs, 900s) keys off broadcast events and
+                // would cancel the mission mid-tool — even though the turn-level
+                // `tool_idle_timeout` (much larger) is the correct arbiter for a
+                // running tool. Emitting a heartbeat on a timer here makes the
+                // coarse watchdog defer to `tool_idle_timeout`.
+                //
+                // Strictly gated to AwaitingToolResults so it does NOT mask a
+                // genuine hang: a fire-and-forget background job that returns
+                // immediately leaves the turn in AwaitingTerminalResult/
+                // AwaitingClaude (not this state), so those stalls remain subject
+                // to the watchdog as before.
+                _ = tokio::time::sleep_until(last_heartbeat_at + heartbeat_interval),
+                    if saw_non_init_event
+                        && matches!(turn_wait_state, ClaudeTurnWaitState::AwaitingToolResults) => {
+                    let _ = events_tx.send(AgentEvent::MissionActivity {
+                        label: "Tool running…".to_string(),
+                        tool_name: "claudecode_heartbeat".to_string(),
+                        mission_id: Some(mission_id),
+                    });
+                    last_heartbeat_at = Instant::now();
                 }
                 line_opt = line_rx.recv() => {
                     let Some(raw_line) = line_opt else {

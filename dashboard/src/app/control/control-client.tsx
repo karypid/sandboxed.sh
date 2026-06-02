@@ -259,18 +259,20 @@ export function appendUnpersistedLiveTail(
       .slice(lastHistoryUserIdx + 1)
       .some((item) => item.kind === "assistant");
 
-  const unpersistedTail = liveItems.slice(lastLiveUserIdx + 1).filter((item) => {
-    if (existingIds.has(item.id)) return false;
-    if (item.kind === "assistant") {
+  const unpersistedTail = liveItems
+    .slice(lastLiveUserIdx + 1)
+    .filter((item) => {
+      if (existingIds.has(item.id)) return false;
+      if (item.kind === "assistant") {
+        const content = item.content.trim();
+        return content.length > 0 && !existingAssistantContent.has(content);
+      }
+      if (item.kind !== "stream" || item.done) return false;
       const content = item.content.trim();
-      return content.length > 0 && !existingAssistantContent.has(content);
-    }
-    if (item.kind !== "stream" || item.done) return false;
-    const content = item.content.trim();
-    if (!content) return false;
-    if (existingAssistantContent.has(content)) return false;
-    return !historyHasAssistantAfterLastUser;
-  });
+      if (!content) return false;
+      if (existingAssistantContent.has(content)) return false;
+      return !historyHasAssistantAfterLastUser;
+    });
 
   return unpersistedTail.length > 0
     ? [...historyItems, ...unpersistedTail]
@@ -321,7 +323,9 @@ function formatMissionDocumentTitle(mission: Mission | null | undefined) {
     maxLength: MAX_DOCUMENT_MISSION_TITLE_LENGTH,
     fallback: getMissionShortName(mission.id),
   }).trim();
-  return title ? `${title} | ${DEFAULT_DOCUMENT_TITLE}` : DEFAULT_DOCUMENT_TITLE;
+  return title
+    ? `${title} | ${DEFAULT_DOCUMENT_TITLE}`
+    : DEFAULT_DOCUMENT_TITLE;
 }
 
 function readLegacyControlDraft(): string {
@@ -503,6 +507,25 @@ function formatDuration(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
   return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
+}
+
+// Wall-clock (ms) of when this item last "did something" — used to anchor the
+// inline "Agent is working" heartbeat at the most recent event so the timer
+// resets each time a new event lands (healthy agent) and climbs when nothing
+// arrives (stalled/hung). Phase items carry no time of their own.
+function itemActivityTime(item: ChatItem): number | null {
+  switch (item.kind) {
+    case "tool":
+    case "thinking":
+    case "stream":
+      return item.endTime ?? item.startTime;
+    case "user":
+    case "assistant":
+    case "system":
+      return item.timestamp;
+    default:
+      return null;
+  }
 }
 
 // Renders a live-updating duration string anchored at `startTime`. ONLY this
@@ -1204,7 +1227,6 @@ function formatTime(timestamp: number): string {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-
 function statusLabel(state: ControlRunState): {
   label: string;
   Icon: typeof Loader;
@@ -1238,7 +1260,10 @@ function missionStatusLabel(
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
     case "awaiting_user":
-      return { label: "Needs You", className: "bg-amber-500/20 text-amber-400" };
+      return {
+        label: "Needs You",
+        className: "bg-amber-500/20 text-amber-400",
+      };
     case "acknowledged":
       return {
         label: "Acknowledged",
@@ -2220,8 +2245,7 @@ const ThinkingPanel = memo(function ThinkingPanel({
     overscan: 6,
   });
   // See `chatVirtualizer` below for rationale.
-  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () =>
-    false;
+  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
   const {
     isAtBottom: isThoughtsAtBottom,
     scrollToBottom: scrollThoughtsToBottom,
@@ -2709,7 +2733,13 @@ function MissionWorkbenchPanel({
   );
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+function Row({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex items-center justify-between gap-2 py-0.5">
       <dt className="text-white/40">{label}</dt>
@@ -3760,7 +3790,9 @@ const ChatItemRow = memo(function ChatItemRow({
     // ServerShutdown turns auto-resume — render with the check icon so the
     // visual weight matches "this is being handled", not "agent died".
     const MessageStatusIcon =
-      item.success || item.terminalReason === "ServerShutdown" ? CheckCircle : XCircle;
+      item.success || item.terminalReason === "ServerShutdown"
+        ? CheckCircle
+        : XCircle;
     const displayModel = item.model
       ? item.model.includes("/")
         ? item.model.split("/").pop()
@@ -4802,7 +4834,9 @@ export default function ControlClient() {
   // `text_delta` on the assistant message). Reuse the previous reference
   // when the thinking subset is unchanged so `React.memo(ThinkingPanel)`
   // can skip the re-render.
-  const thinkingItems = useStableShallowArray(rawThinkingItems) as SidePanelItem[];
+  const thinkingItems = useStableShallowArray(
+    rawThinkingItems,
+  ) as SidePanelItem[];
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chatVirtualizer = useVirtualizer({
@@ -4869,16 +4903,43 @@ export default function ControlClient() {
     resetKey: viewingMissionId,
   });
 
-  const showAgentWorkingIndicator = useMemo(() => {
-    if (items.length === 0) return false;
-    if (items[items.length - 1]?.kind === "assistant") return false;
-    return !items.some(
+  // The inline "Agent is working" pill. Shown whenever the mission is running
+  // and nothing else inline is already animating liveness — i.e. no in-flight
+  // thinking/stream (with the side panel closed) and no phase row, both of
+  // which render their own live indicators. Unlike before, this stays visible
+  // *after* an intermediate assistant message: the agent keeps working between
+  // steps, and the corner sidebar pill alone is too easy to miss. `since`
+  // anchors the heartbeat timer at the most recent event so it resets on every
+  // new event and climbs when the run goes quiet.
+  const agentWorkingIndicator = useMemo(() => {
+    if (items.length === 0) return null;
+    const hasInlineLiveness = items.some(
       (it) =>
         ((it.kind === "thinking" || it.kind === "stream") &&
           !it.done &&
           !showThinkingPanel) ||
         it.kind === "phase",
     );
+    if (hasInlineLiveness) return null;
+    let since: number | null = null;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      // Queued user messages sit at the tail while the agent keeps inserting
+      // tool/assistant rows before them, so they are not "latest activity" —
+      // anchoring the heartbeat to a queued row's (older) timestamp makes the
+      // timer read as stalled while the mission is actively running. Skip them.
+      if (it.kind === "user" && it.queued) continue;
+      const t = itemActivityTime(it);
+      if (t != null) {
+        since = t;
+        break;
+      }
+    }
+    // No timed row to anchor on (e.g. only queued user messages): suppress the
+    // pill rather than pass 0, which LiveDuration would read as epoch ms and
+    // render as a ~decades-long elapsed time.
+    if (since == null) return null;
+    return { since };
   }, [items, showThinkingPanel]);
 
   // Auto-show thinking panel when thinking starts (only on transition to active)
@@ -9113,7 +9174,13 @@ export default function ControlClient() {
         submittingRef.current = false;
       }
     },
-    [items, isBusy, applyDesktopSessionState, missionHistoryToItems, scrollToBottom],
+    [
+      items,
+      isBusy,
+      applyDesktopSessionState,
+      missionHistoryToItems,
+      scrollToBottom,
+    ],
   );
 
   const handleStop = async () => {
@@ -9131,31 +9198,34 @@ export default function ControlClient() {
     }
   };
 
-  const syncQueueForMission = useCallback(async (missionId: string) => {
-    if (!missionId || syncingQueueRef.current) return;
-    syncingQueueRef.current = true;
-    try {
-      const queuedMessages = await getQueue();
-      const queuedForMission = queuedMessages.filter(
-        (qm) => qm.mission_id === missionId,
-      );
-      const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
+  const syncQueueForMission = useCallback(
+    async (missionId: string) => {
+      if (!missionId || syncingQueueRef.current) return;
+      syncingQueueRef.current = true;
+      try {
+        const queuedMessages = await getQueue();
+        const queuedForMission = queuedMessages.filter(
+          (qm) => qm.mission_id === missionId,
+        );
+        const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
 
-      setItems((prev) =>
-        prev.map((item) => {
-          if (item.kind !== "user") return item;
-          if (item.id.startsWith("temp-")) return item;
-          const shouldBeQueued = queuedIds.has(item.id);
-          if (item.queued === shouldBeQueued) return item;
-          return { ...item, queued: shouldBeQueued };
-        }),
-      );
-    } catch (err) {
-      console.warn("[control] failed to sync queue", err);
-    } finally {
-      syncingQueueRef.current = false;
-    }
-  }, [setItems]);
+        setItems((prev) =>
+          prev.map((item) => {
+            if (item.kind !== "user") return item;
+            if (item.id.startsWith("temp-")) return item;
+            const shouldBeQueued = queuedIds.has(item.id);
+            if (item.queued === shouldBeQueued) return item;
+            return { ...item, queued: shouldBeQueued };
+          }),
+        );
+      } catch (err) {
+        console.warn("[control] failed to sync queue", err);
+      } finally {
+        syncingQueueRef.current = false;
+      }
+    },
+    [setItems],
+  );
 
   // Reload mission history from the API. Used for visibility change,
   // periodic sync, and SSE reconnect catch-up.
@@ -9452,6 +9522,38 @@ export default function ControlClient() {
     missionLoading &&
     !!viewingMissionId &&
     activeMission?.id !== viewingMissionId;
+
+  // The inline "Agent is working" pill renders *below* the virtualized
+  // timeline, so the bottom anchor (which keys off `groupedItems` only) never
+  // scrolls to reveal it — unlike the "is thinking" indicator, which is a real
+  // timeline item. Nudge to the bottom when the pill first appears while the
+  // user is already pinned there, so it shows up the same way thinking does.
+  const agentWorkingPillVisible =
+    viewingMissionIsRunning &&
+    activeMission?.status === "active" &&
+    !!agentWorkingIndicator;
+  const prevAgentWorkingPillVisible = useRef(false);
+  const pillLatchMissionId = useRef(viewingMissionId);
+  useEffect(() => {
+    // Reset the latch synchronously when the viewed mission changes, *before*
+    // evaluating the transition. A separate mission-id effect can't do this:
+    // effects run in declaration order, so the auto-scroll below would see a
+    // stale `true` from the previous running mission (no false→true edge) and
+    // never scroll on the new timeline. Folding the reset in here guarantees
+    // the new mission's first pill appearance counts as a real edge.
+    if (pillLatchMissionId.current !== viewingMissionId) {
+      pillLatchMissionId.current = viewingMissionId;
+      prevAgentWorkingPillVisible.current = false;
+    }
+    if (
+      agentWorkingPillVisible &&
+      !prevAgentWorkingPillVisible.current &&
+      isAtBottom
+    ) {
+      scrollToBottom("smooth");
+    }
+    prevAgentWorkingPillVisible.current = agentWorkingPillVisible;
+  }, [agentWorkingPillVisible, isAtBottom, scrollToBottom, viewingMissionId]);
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
@@ -9522,12 +9624,16 @@ export default function ControlClient() {
     }
 
     const applyTitle = (mission: Mission | null) =>
-      mission?.id === activeMission.id ? { ...mission, title: nextTitle } : mission;
+      mission?.id === activeMission.id
+        ? { ...mission, title: nextTitle }
+        : mission;
 
     setSavingMissionTitle(true);
     setRecentMissions((prev) =>
       prev.map((mission) =>
-        mission.id === activeMission.id ? { ...mission, title: nextTitle } : mission,
+        mission.id === activeMission.id
+          ? { ...mission, title: nextTitle }
+          : mission,
       ),
     );
     setCurrentMission(applyTitle);
@@ -9540,10 +9646,14 @@ export default function ControlClient() {
       console.error("Failed to update mission title:", error);
       toast.error("Failed to update mission title");
       const restoreTitle = (mission: Mission | null) =>
-        mission?.id === activeMission.id ? { ...mission, title: previousTitle } : mission;
+        mission?.id === activeMission.id
+          ? { ...mission, title: previousTitle }
+          : mission;
       setRecentMissions((prev) =>
         prev.map((mission) =>
-          mission.id === activeMission.id ? { ...mission, title: previousTitle } : mission,
+          mission.id === activeMission.id
+            ? { ...mission, title: previousTitle }
+            : mission,
         ),
       );
       setCurrentMission(restoreTitle);
@@ -10520,26 +10630,26 @@ export default function ControlClient() {
                     })}
                   </div>
 
-                  {/* Show streaming indicator when running but no active thinking/phase visible inline.
-                  P2-#14: the items.some + last-index lookup live in `showAgentWorkingIndicator`
-                  memo so each NowTick render doesn't re-walk the whole items array. */}
-                  {viewingMissionIsRunning &&
-                    activeMission?.status === "active" &&
-                    showAgentWorkingIndicator && (
-                      <div className="flex justify-start gap-3 animate-fade-in">
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                          <Bot className="h-4 w-4 text-indigo-400 animate-pulse" />
-                        </div>
-                        <div className="rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                          <div className="flex items-center gap-2">
-                            <Loader className="h-4 w-4 text-indigo-400 animate-spin" />
-                            <span className="text-sm text-white/60">
-                              Agent is working...
-                            </span>
-                          </div>
-                        </div>
+                  {/* Compact "Agent is working" pill + live heartbeat timer,
+                  shown while running but no thinking/stream/phase is animating
+                  inline. P2-#14: the items.some walk lives in the
+                  `agentWorkingIndicator` memo so each NowTick render doesn't
+                  re-walk the whole items array. */}
+                  {agentWorkingPillVisible && agentWorkingIndicator && (
+                    <div className="flex justify-start animate-fade-in">
+                      <div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-3 py-1.5">
+                        <Loader className="h-3.5 w-3.5 text-indigo-400 animate-spin" />
+                        <span className="text-xs font-medium text-indigo-300">
+                          Agent is working
+                        </span>
+                        <span className="text-xs tabular-nums text-indigo-300/60">
+                          <LiveDuration
+                            startTime={agentWorkingIndicator.since}
+                          />
+                        </span>
                       </div>
-                    )}
+                    </div>
+                  )}
 
                   {/* Waiting banner for interactive user-input tools */}
                   {hasPendingUserInput && (
@@ -10706,9 +10816,7 @@ export default function ControlClient() {
                 </div>
               )}
 
-              <div
-                className="mx-auto max-w-3xl w-full space-y-2"
-              >
+              <div className="mx-auto max-w-3xl w-full space-y-2">
                 {/*
                   Slim status banner above the composer for interrupted /
                   blocked / failed missions. Lives inside the composer
@@ -10748,7 +10856,8 @@ export default function ControlClient() {
                           {statusLabel}
                         </span>
                         <span className="text-white/50 hidden sm:inline truncate">
-                          Type below to continue, or use the action on the right.
+                          Type below to continue, or use the action on the
+                          right.
                         </span>
                         <span className="ml-auto inline-flex items-center gap-1 shrink-0">
                           <button
@@ -10882,9 +10991,7 @@ export default function ControlClient() {
           </div>
 
           {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
-          {(showWorkbenchPanel ||
-            showThinkingPanel ||
-            showDesktopStream) && (
+          {(showWorkbenchPanel || showThinkingPanel || showDesktopStream) && (
             <div
               className={cn(
                 // animate-fade-in is opacity-only and cheap; we drop the
