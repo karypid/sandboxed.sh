@@ -150,4 +150,133 @@ impl AskClient {
             total_tokens,
         })
     }
+
+    /// Streaming variant of [`complete`]. Calls `on_delta` with each token
+    /// fragment of the assistant's visible content as it arrives, and returns
+    /// the fully-assembled completion (content + tool calls) at the end.
+    pub async fn complete_stream<F: FnMut(&str)>(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        mut on_delta: F,
+    ) -> Result<AskCompletion, String> {
+        use futures::StreamExt;
+
+        if self.config.api_format != ApiFormat::OpenAI {
+            return Err("Ask assistant requires an OpenAI-compatible provider".to_string());
+        }
+
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
+        let mut body = json!({
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 2048,
+            "stream": true,
+            "stream_options": { "include_usage": true },
+        });
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+            body["tool_choice"] = json!("auto");
+        }
+        if model_is_reasoning(&self.config.model) {
+            body["reasoning_effort"] = json!("low");
+        }
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .timeout(std::time::Duration::from_secs(120))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Ask LLM request error: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Ask LLM returned {status}: {text}"));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut content = String::new();
+        // Tool calls arrive as fragments keyed by index; accumulate (id,name,args).
+        let mut tool_accum: Vec<(String, String, String)> = Vec::new();
+        let mut total_tokens: Option<u64> = None;
+
+        'outer: while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| format!("Ask LLM stream error: {e}"))?;
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                let line = line.trim();
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                if data == "[DONE]" {
+                    break 'outer;
+                }
+                let Ok(json) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if let Some(t) = json["usage"]["total_tokens"].as_u64() {
+                    total_tokens = Some(t);
+                }
+                let delta = &json["choices"][0]["delta"];
+                if let Some(c) = delta["content"].as_str() {
+                    if !c.is_empty() {
+                        content.push_str(c);
+                        on_delta(c);
+                    }
+                }
+                if let Some(tcs) = delta["tool_calls"].as_array() {
+                    for tc in tcs {
+                        let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                        while tool_accum.len() <= idx {
+                            tool_accum.push((String::new(), String::new(), String::new()));
+                        }
+                        let entry = &mut tool_accum[idx];
+                        if let Some(id) = tc["id"].as_str() {
+                            if !id.is_empty() {
+                                entry.0 = id.to_string();
+                            }
+                        }
+                        if let Some(n) = tc["function"]["name"].as_str() {
+                            if !n.is_empty() {
+                                entry.1 = n.to_string();
+                            }
+                        }
+                        if let Some(a) = tc["function"]["arguments"].as_str() {
+                            entry.2.push_str(a);
+                        }
+                    }
+                }
+            }
+        }
+
+        let tool_calls = tool_accum
+            .into_iter()
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, arguments)| ToolCall {
+                id,
+                name,
+                arguments,
+            })
+            .collect();
+
+        Ok(AskCompletion {
+            content: if content.trim().is_empty() {
+                None
+            } else {
+                Some(content)
+            },
+            tool_calls,
+            total_tokens,
+        })
+    }
 }

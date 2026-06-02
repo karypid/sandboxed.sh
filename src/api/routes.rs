@@ -728,6 +728,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(crate::api::ask::http::ask_send),
         )
         .route(
+            "/api/control/missions/:id/ask/stream",
+            post(crate::api::ask::http::ask_send_stream),
+        )
+        .route(
             "/api/control/missions/:id/ask/threads",
             get(crate::api::ask::http::list_ask_threads),
         )
