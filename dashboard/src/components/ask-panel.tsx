@@ -93,11 +93,17 @@ export function AskPanel({
   // On mission change: load threads and open the most recent (if any).
   useEffect(() => {
     let cancelled = false;
-    // A mission switch supersedes any in-flight stream from the old mission.
+    // A mission switch supersedes any in-flight stream from the old mission, and
+    // we clear the old mission's view immediately rather than showing it until
+    // the refetch lands.
     genRef.current += 1;
     abortRef.current?.abort();
     setLoading(false);
     streamIdRef.current = null;
+    setThreadId(null);
+    setMessages([]);
+    setThreads([]);
+    setError(null);
     const myGen = genRef.current;
     const live = () => !cancelled && genRef.current === myGen;
     (async () => {
