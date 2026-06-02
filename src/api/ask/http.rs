@@ -301,10 +301,14 @@ pub async fn ask_send_stream(
 
     let sse = async_stream::stream! {
         while let Some(ev) = rx.recv().await {
-            let event = Event::default()
-                .event("ask")
-                .json_data(&ev)
-                .unwrap_or_else(|_| Event::default().comment("serialize error"));
+            // On the (practically impossible) serialize failure, emit a real
+            // error event so the client still receives a terminal frame rather
+            // than a payload-less comment that leaves it hanging.
+            let event = Event::default().event("ask").json_data(&ev).unwrap_or_else(|_| {
+                Event::default()
+                    .event("ask")
+                    .data(r#"{"type":"error","message":"serialize error"}"#)
+            });
             yield Ok::<Event, Infallible>(event);
         }
     };

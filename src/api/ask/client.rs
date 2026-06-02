@@ -203,7 +203,9 @@ impl AskClient {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        // Buffer raw bytes and only decode complete lines: a multibyte UTF-8
+        // char split across chunk boundaries must not be lossily decoded mid-way.
+        let mut buf: Vec<u8> = Vec::new();
         let mut content = String::new();
         // Tool calls arrive as fragments keyed by index; accumulate (id,name,args).
         let mut tool_accum: Vec<(String, String, String)> = Vec::new();
@@ -214,19 +216,22 @@ impl AskClient {
             match stream.next().await {
                 Some(chunk) => {
                     let bytes = chunk.map_err(|e| format!("Ask LLM stream error: {e}"))?;
-                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    buf.extend_from_slice(&bytes);
                 }
                 None => {
                     // Connection closed: flush a trailing line that lacks a
                     // newline so a final `data:` chunk isn't dropped.
                     ended = true;
-                    if !buf.is_empty() && !buf.ends_with('\n') {
-                        buf.push('\n');
+                    if !buf.is_empty() && buf.last() != Some(&b'\n') {
+                        buf.push(b'\n');
                     }
                 }
             }
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+                // A complete line ends at a single-byte '\n', so decoding it
+                // can't split a multibyte char.
+                let line = String::from_utf8_lossy(&line_bytes);
                 let line = line.trim();
                 let Some(data) = line.strip_prefix("data: ") else {
                     continue;
