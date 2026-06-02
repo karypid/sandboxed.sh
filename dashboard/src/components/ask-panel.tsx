@@ -186,7 +186,12 @@ export function AskPanel({
 
     // Append a streamed delta to the current assistant bubble, creating one on
     // the first fragment (so it lands after any preceding tool rows).
+    // True once a newer send / thread switch has superseded this turn; its
+    // late-arriving stream events must not mutate the current view.
+    const stale = () => genRef.current !== myGen;
+
     const appendDelta = (text: string) => {
+      if (stale()) return;
       setMessages((prev) => {
         const id = streamIdRef.current;
         if (id) {
@@ -219,6 +224,7 @@ export function AskPanel({
         {
           onDelta: appendDelta,
           onToolCall: (t) => {
+            if (stale()) return;
             streamIdRef.current = null; // close the current assistant segment
             turnIds.push(`tc-${t.tool_call_id}`);
             setMessages((prev) => [
@@ -236,6 +242,7 @@ export function AskPanel({
             ]);
           },
           onToolResult: (t) => {
+            if (stale()) return;
             turnIds.push(`tr-${t.tool_call_id}`);
             setMessages((prev) => [
               ...prev,
@@ -252,6 +259,7 @@ export function AskPanel({
             ]);
           },
           onDone: (d) => {
+            if (stale()) return;
             streamIdRef.current = null;
             setThreadId(d.thread_id);
             // Reconcile the locally-streamed bubbles with the canonical
@@ -269,6 +277,7 @@ export function AskPanel({
             })();
           },
           onError: (msg) => {
+            if (stale()) return;
             setError(msg);
             // Drop this turn's in-progress bubbles and restore the question so
             // it isn't lost (unless the user already started a new draft).

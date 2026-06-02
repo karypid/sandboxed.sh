@@ -206,6 +206,9 @@ struct AskSheet: View {
         isLoading = true
         streamId = nil
         streamGen += 1
+        let gen = streamGen
+        // Snapshot before the optimistic bubble so a failed turn can roll back.
+        let baseCount = messages.count
 
         messages.append(
             AskMessage(
@@ -226,15 +229,23 @@ struct AskSheet: View {
                 content: content,
                 threadId: threadId
             ) {
+                // A newer send / thread switch superseded this turn — stop
+                // mutating the (now different) message list.
+                if gen != streamGen { break }
                 handleStreamEvent(ev)
             }
         } catch {
             errorText = error.localizedDescription
         }
-        // Restore the question if the turn failed (thrown or via an error event)
-        // and the composer is still empty.
-        if errorText != nil && input.isEmpty {
-            input = content
+        if errorText != nil, gen == streamGen {
+            // Roll back this turn's optimistic + streamed bubbles, and restore
+            // the question if the composer is still empty.
+            if messages.count >= baseCount {
+                messages = Array(messages.prefix(baseCount))
+            }
+            if input.isEmpty {
+                input = content
+            }
         }
         isLoading = false
         streamId = nil
