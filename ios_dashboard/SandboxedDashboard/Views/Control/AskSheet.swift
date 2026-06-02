@@ -349,8 +349,8 @@ struct AskSheet: View {
                     messages = detail.messages
                 }
             }
-        case "error":
-            errorText = ev.message ?? "Ask failed"
+        // "error" events are surfaced via the throw path in askStream, so they
+        // flow through send()'s catch (gen-guarded rollback + restore).
         default:
             break
         }

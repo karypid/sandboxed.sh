@@ -599,28 +599,19 @@ final class APIService {
                         if let data = payload.data(using: .utf8),
                             let ev = try? decoder.decode(AskStreamEvent.self, from: data)
                         {
-                            if ev.type == "done" || ev.type == "error" {
-                                sawTerminal = true
+                            // Surface a stream `error` event through the throw
+                            // path so the consumer handles it like any failure.
+                            if ev.type == "error" {
+                                throw AskStreamError(message: ev.message ?? "Ask failed")
                             }
+                            if ev.type == "done" { sawTerminal = true }
                             continuation.yield(ev)
                         }
                     }
                     // A dropped/truncated SSE body that never delivered a `done`
-                    // (or `error`) is a failure, not a silent success.
+                    // is a failure, not a silent success.
                     if !sawTerminal {
-                        continuation.yield(
-                            AskStreamEvent(
-                                type: "error",
-                                content: nil,
-                                toolCallId: nil,
-                                name: nil,
-                                args: nil,
-                                result: nil,
-                                threadId: nil,
-                                answer: nil,
-                                message: "Stream ended before completion"
-                            )
-                        )
+                        throw AskStreamError(message: "Stream ended before completion")
                     }
                     continuation.finish()
                 } catch {

@@ -106,3 +106,10 @@ struct AskStreamEvent: Decodable {
         case threadId = "thread_id"
     }
 }
+
+/// Error carrying a co-pilot stream failure message (from an SSE `error` event
+/// or an abruptly-ended stream), so it surfaces through the normal throw path.
+struct AskStreamError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
