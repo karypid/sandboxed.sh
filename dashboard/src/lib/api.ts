@@ -543,6 +543,86 @@ export async function askSend(
   );
 }
 
+export interface AskStreamHandlers {
+  onDelta: (text: string) => void;
+  onToolCall: (t: { tool_call_id: string; name: string; args: string }) => void;
+  onToolResult: (t: {
+    tool_call_id: string;
+    name: string;
+    result: string;
+  }) => void;
+  onDone: (d: { thread_id: string; answer: string }) => void;
+  onError: (message: string) => void;
+}
+
+/** Streaming variant of {@link askSend}: POSTs to the SSE endpoint and invokes
+ * handlers as token/tool events arrive. */
+export async function askSendStream(
+  missionId: string,
+  content: string,
+  opts: { threadId?: string; sandbox?: boolean },
+  handlers: AskStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const body: { content: string; thread_id?: string; sandbox?: boolean } = {
+    content,
+  };
+  if (opts.threadId) body.thread_id = opts.threadId;
+  if (opts.sandbox) body.sandbox = true;
+
+  const res = await apiFetch(`/api/control/missions/${missionId}/ask/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    handlers.onError(res.ok ? "No response stream" : `Ask failed (${res.status})`);
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep: number;
+    // SSE frames are separated by a blank line.
+    while ((sep = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!dataLine) continue;
+      const payload = dataLine.slice(5).trim();
+      if (!payload) continue;
+      try {
+        const ev = JSON.parse(payload);
+        switch (ev.type) {
+          case "delta":
+            handlers.onDelta(ev.content);
+            break;
+          case "tool_call":
+            handlers.onToolCall(ev);
+            break;
+          case "tool_result":
+            handlers.onToolResult(ev);
+            break;
+          case "done":
+            handlers.onDone(ev);
+            break;
+          case "error":
+            handlers.onError(ev.message);
+            break;
+        }
+      } catch {
+        /* ignore malformed frame */
+      }
+    }
+  }
+}
+
 export async function listAskThreads(missionId: string): Promise<AskThread[]> {
   return apiGet<AskThread[]>(
     `/api/control/missions/${missionId}/ask/threads`,

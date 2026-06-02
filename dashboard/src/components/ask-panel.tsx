@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 
 import {
-  askSend,
+  askSendStream,
   listAskThreads,
   getAskThread,
   deleteAskThread,
@@ -63,6 +63,8 @@ export function AskPanel({
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Id of the assistant bubble currently being streamed into (null between segments).
+  const streamIdRef = useRef<string | null>(null);
 
   // Auto-grow the composer with input, capped (lighter than the main composer's
   // 10-line cap). Runs on every input change, including seed prefill and reset.
@@ -152,38 +154,98 @@ export function AskPanel({
     setInput("");
     setError(null);
     setLoading(true);
+    streamIdRef.current = null;
 
-    // Optimistic user bubble.
-    const tempId = `temp-${Date.now()}`;
+    const now = () => new Date().toISOString();
     setMessages((prev) => [
       ...prev,
       {
-        id: tempId,
+        id: `u-${Date.now()}`,
         thread_id: threadId ?? "",
         seq: prev.length + 1,
         role: "user",
         content,
-        created_at: new Date().toISOString(),
+        created_at: now(),
       },
     ]);
 
+    // Append a streamed delta to the current assistant bubble, creating one on
+    // the first fragment (so it lands after any preceding tool rows).
+    const appendDelta = (text: string) => {
+      setMessages((prev) => {
+        const id = streamIdRef.current;
+        if (id) {
+          return prev.map((m) =>
+            m.id === id ? { ...m, content: m.content + text } : m,
+          );
+        }
+        const newId = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        streamIdRef.current = newId;
+        return [
+          ...prev,
+          {
+            id: newId,
+            thread_id: threadId ?? "",
+            seq: prev.length + 1,
+            role: "assistant",
+            content: text,
+            created_at: now(),
+          },
+        ];
+      });
+    };
+
     try {
-      const res = await askSend(
+      await askSendStream(
         missionId,
         content,
-        threadId ?? undefined,
-        sandbox,
+        { threadId: threadId ?? undefined, sandbox },
+        {
+          onDelta: appendDelta,
+          onToolCall: (t) => {
+            streamIdRef.current = null; // close the current assistant segment
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `tc-${t.tool_call_id}`,
+                thread_id: threadId ?? "",
+                seq: prev.length + 1,
+                role: "tool_call",
+                content: t.args,
+                tool_name: t.name,
+                tool_call_id: t.tool_call_id,
+                created_at: now(),
+              },
+            ]);
+          },
+          onToolResult: (t) => {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `tr-${t.tool_call_id}`,
+                thread_id: threadId ?? "",
+                seq: prev.length + 1,
+                role: "tool_result",
+                content: t.result,
+                tool_name: t.name,
+                tool_call_id: t.tool_call_id,
+                created_at: now(),
+              },
+            ]);
+          },
+          onDone: (d) => {
+            streamIdRef.current = null;
+            setThreadId(d.thread_id);
+            void refreshThreads();
+          },
+          onError: (msg) => setError(msg),
+        },
       );
-      setThreadId(res.thread_id);
-      setMessages(res.messages);
-      void refreshThreads();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ask failed");
-      // Roll back the optimistic bubble.
-      setMessages((prev) => prev.filter((m) => m.id !== tempId));
-      setInput(content);
     } finally {
       setLoading(false);
+      streamIdRef.current = null;
     }
   }, [input, loading, missionId, threadId, sandbox, refreshThreads]);
 
