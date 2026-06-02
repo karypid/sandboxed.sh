@@ -335,7 +335,9 @@ struct AskSheet: View {
             if let tid { threadId = tid }
             let gen = streamGen
             Task {
-                if let refreshed = try? await api.listAskThreads(missionId: missionId) {
+                if let refreshed = try? await api.listAskThreads(missionId: missionId),
+                    gen == streamGen
+                {
                     threads = refreshed
                 }
                 // Reconcile the streamed bubbles with the canonical persisted

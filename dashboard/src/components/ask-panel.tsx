@@ -288,12 +288,12 @@ export function AskPanel({
             void (async () => {
               try {
                 const detail = await getAskThread(missionId, d.thread_id);
-                // Skip if a newer send / thread switch happened meanwhile.
+                // Skip if a newer send / thread switch / mission change happened.
                 if (genRef.current === myGen) setMessages(detail.messages ?? []);
               } catch {
                 /* keep the streamed bubbles on failure */
               }
-              void refreshThreads();
+              if (genRef.current === myGen) void refreshThreads();
             })();
           },
           onError: (msg) => {

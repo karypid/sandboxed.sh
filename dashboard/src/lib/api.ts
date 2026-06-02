@@ -595,7 +595,9 @@ export async function askSendStream(
       const ev = JSON.parse(payload);
       switch (ev.type) {
         case "delta":
-          handlers.onDelta(ev.content);
+          // Guard against a malformed frame missing `content` (avoid appending
+          // the string "undefined").
+          if (typeof ev.content === "string") handlers.onDelta(ev.content);
           break;
         case "tool_call":
           handlers.onToolCall(ev);
