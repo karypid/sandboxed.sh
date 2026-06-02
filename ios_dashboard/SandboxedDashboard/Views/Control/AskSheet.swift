@@ -45,6 +45,7 @@ struct AskSheet: View {
                 streamId = nil
                 threadId = nil
                 messages = []
+                threads = []
                 errorText = nil
                 await loadThreads()
             }
