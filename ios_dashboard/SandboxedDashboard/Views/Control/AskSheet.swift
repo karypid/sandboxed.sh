@@ -36,7 +36,18 @@ struct AskSheet: View {
             .navigationTitle("Ask")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
-            .task { await loadThreads() }
+            // Re-run when the mission changes while the sheet stays open: a
+            // bare `.task` would keep the old mission's threads (and let a
+            // superseded stream mutate the view). `id:` restarts it per mission.
+            .task(id: missionId) {
+                streamGen += 1
+                isLoading = false
+                streamId = nil
+                threadId = nil
+                messages = []
+                errorText = nil
+                await loadThreads()
+            }
         }
     }
 
