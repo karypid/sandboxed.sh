@@ -590,6 +590,7 @@ final class APIService {
                     }
 
                     let decoder = JSONDecoder()
+                    var sawTerminal = false
                     for try await line in bytes.lines {
                         guard line.hasPrefix("data:") else { continue }
                         let payload = line.dropFirst(5)
@@ -598,8 +599,28 @@ final class APIService {
                         if let data = payload.data(using: .utf8),
                             let ev = try? decoder.decode(AskStreamEvent.self, from: data)
                         {
+                            if ev.type == "done" || ev.type == "error" {
+                                sawTerminal = true
+                            }
                             continuation.yield(ev)
                         }
+                    }
+                    // A dropped/truncated SSE body that never delivered a `done`
+                    // (or `error`) is a failure, not a silent success.
+                    if !sawTerminal {
+                        continuation.yield(
+                            AskStreamEvent(
+                                type: "error",
+                                content: nil,
+                                toolCallId: nil,
+                                name: nil,
+                                args: nil,
+                                result: nil,
+                                threadId: nil,
+                                answer: nil,
+                                message: "Stream ended before completion"
+                            )
+                        )
                     }
                     continuation.finish()
                 } catch {

@@ -226,6 +226,11 @@ struct AskSheet: View {
         } catch {
             errorText = error.localizedDescription
         }
+        // Restore the question if the turn failed (thrown or via an error event)
+        // and the composer is still empty.
+        if errorText != nil && input.isEmpty {
+            input = content
+        }
         isLoading = false
         streamId = nil
     }

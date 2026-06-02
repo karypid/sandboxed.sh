@@ -236,7 +236,18 @@ export function AskPanel({
           onDone: (d) => {
             streamIdRef.current = null;
             setThreadId(d.thread_id);
-            void refreshThreads();
+            // Reconcile the locally-streamed bubbles with the canonical
+            // persisted messages (the backend stores tool steps + the final
+            // answer, but not pre-tool interim text).
+            void (async () => {
+              try {
+                const detail = await getAskThread(missionId, d.thread_id);
+                setMessages(detail.messages ?? []);
+              } catch {
+                /* keep the streamed bubbles on failure */
+              }
+              void refreshThreads();
+            })();
           },
           onError: (msg) => {
             setError(msg);
