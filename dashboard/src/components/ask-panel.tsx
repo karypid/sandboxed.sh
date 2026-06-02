@@ -238,11 +238,17 @@ export function AskPanel({
             setThreadId(d.thread_id);
             void refreshThreads();
           },
-          onError: (msg) => setError(msg),
+          onError: (msg) => {
+            setError(msg);
+            // Restore the question so it isn't lost (unless the user already
+            // started a new draft).
+            setInput((cur) => cur || content);
+          },
         },
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ask failed");
+      setInput((cur) => cur || content);
     } finally {
       setLoading(false);
       streamIdRef.current = null;

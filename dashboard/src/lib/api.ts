@@ -584,6 +584,39 @@ export async function askSendStream(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  let sawTerminal = false;
+
+  const handleFrame = (frame: string) => {
+    const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+    if (!dataLine) return;
+    const payload = dataLine.slice(5).trim();
+    if (!payload) return;
+    try {
+      const ev = JSON.parse(payload);
+      switch (ev.type) {
+        case "delta":
+          handlers.onDelta(ev.content);
+          break;
+        case "tool_call":
+          handlers.onToolCall(ev);
+          break;
+        case "tool_result":
+          handlers.onToolResult(ev);
+          break;
+        case "done":
+          sawTerminal = true;
+          handlers.onDone(ev);
+          break;
+        case "error":
+          sawTerminal = true;
+          handlers.onError(ev.message);
+          break;
+      }
+    } catch {
+      /* ignore malformed frame */
+    }
+  };
+
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -591,35 +624,16 @@ export async function askSendStream(
     let sep: number;
     // SSE frames are separated by a blank line.
     while ((sep = buf.indexOf("\n\n")) >= 0) {
-      const frame = buf.slice(0, sep);
+      handleFrame(buf.slice(0, sep));
       buf = buf.slice(sep + 2);
-      const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
-      if (!dataLine) continue;
-      const payload = dataLine.slice(5).trim();
-      if (!payload) continue;
-      try {
-        const ev = JSON.parse(payload);
-        switch (ev.type) {
-          case "delta":
-            handlers.onDelta(ev.content);
-            break;
-          case "tool_call":
-            handlers.onToolCall(ev);
-            break;
-          case "tool_result":
-            handlers.onToolResult(ev);
-            break;
-          case "done":
-            handlers.onDone(ev);
-            break;
-          case "error":
-            handlers.onError(ev.message);
-            break;
-        }
-      } catch {
-        /* ignore malformed frame */
-      }
     }
+  }
+  // Flush any trailing frame the server didn't terminate with a blank line
+  // (e.g. a final `done`), then validate that the stream actually completed.
+  buf += decoder.decode();
+  if (buf.trim()) handleFrame(buf);
+  if (!sawTerminal) {
+    handlers.onError("Stream ended before completion");
   }
 }
 

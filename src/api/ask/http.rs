@@ -238,19 +238,35 @@ pub async fn ask_send_stream(
             .map_err(internal)?,
     };
 
-    // Note: sandbox mode isn't supported on the streaming path yet (the worktree
-    // setup/teardown wraps the synchronous turn); streaming runs on the live tree.
     let workspace = crate::workspace::resolve_workspace(
         &state.workspaces,
         &state.config,
         Some(mission.workspace_id),
     )
     .await;
-    let work_dir = mission
+    let base_work_dir = mission
         .working_directory
         .as_ref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| workspace.path.clone());
+
+    // Optional sandbox-copy isolation (same as the synchronous path): set up a
+    // throwaway worktree, run the streamed turn in it, tear it down after.
+    let setup_exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
+    let sandbox_dir = if req.sandbox {
+        super::prepare_sandbox(&setup_exec, &base_work_dir).await
+    } else {
+        None
+    };
+    if req.sandbox && sandbox_dir.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Sandbox mode requires a git workspace (no isolated worktree could be created)"
+                .to_string(),
+        ));
+    }
+    let used_sandbox = sandbox_dir.is_some();
+    let work_dir = sandbox_dir.clone().unwrap_or_else(|| base_work_dir.clone());
 
     let turn = AskTurn {
         ask_store: Arc::clone(&ask_store),
@@ -260,12 +276,13 @@ pub async fn ask_send_stream(
         llm: AskClient::new(state.http_client.clone(), cfg),
         mission_id,
         thread_id: thread.id,
-        sandbox: false,
+        sandbox: used_sandbox,
     };
 
     let content = req.content.clone();
     let thread_id = thread.id;
     let title_store = Arc::clone(&ask_store);
+    let cleanup_base = base_work_dir.clone();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<super::AskStreamEvent>();
     tokio::spawn(async move {
@@ -274,6 +291,9 @@ pub async fn ask_send_stream(
             let _ = title_store
                 .set_thread_title(thread_id, &derive_title(&content))
                 .await;
+        }
+        if let Some(dir) = &sandbox_dir {
+            super::cleanup_sandbox(&setup_exec, &cleanup_base, dir).await;
         }
     });
 
