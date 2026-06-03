@@ -7671,13 +7671,17 @@ export default function ControlClient() {
             }
           }
         } else {
-          // Event has NO mission_id (from main session)
-          // Only show if we're viewing the current/main mission OR if currentMission
-          // hasn't been loaded yet (to handle race condition during initial load)
-          if (currentMissionId && viewingId !== currentMissionId) {
-            // We're viewing a parallel mission, skip main session events
+          // Event has NO mission_id (a main-session event). Show it only when
+          // we positively know the viewed mission IS the main/current mission.
+          // If currentMissionId isn't known yet (a load/switch race), fail
+          // CLOSED and drop it — history catch-up backfills it on the next
+          // sync — rather than risk rendering a main-session message inside an
+          // unrelated parallel mission's view (cross-mission leak).
+          if (viewingId !== currentMissionId) {
             if (event.type !== "status") {
-              filterReason = "event has no mission_id for parallel mission";
+              filterReason = currentMissionId
+                ? "event has no mission_id for parallel mission"
+                : "event has no mission_id; current mission unknown (fail-closed)";
             }
           }
         }
@@ -7770,6 +7774,15 @@ export default function ControlClient() {
           "queued",
         );
         const queued = data["queued"] === true;
+        // The mission this echo belongs to (the SSE filter above already
+        // guarantees it matches the viewed mission). Used to stamp the new
+        // row and to stop content-based reconciliation from hijacking a
+        // same-content row that was created for a *different* mission.
+        const msgMissionId = eventMissionId ?? viewingId ?? undefined;
+        const sameMission = (item: ChatItem) =>
+          item.kind !== "user" ||
+          item.missionId == null ||
+          item.missionId === msgMissionId;
         setItems((prev) => {
           // Check if already added with this ID - if so, mark as not queued (being processed)
           const existingIndex = prev.findIndex((item) => item.id === msgId);
@@ -7792,7 +7805,8 @@ export default function ControlClient() {
             (item) =>
               item.kind === "user" &&
               item.id.startsWith("temp-") &&
-              item.content === msgContent,
+              item.content === msgContent &&
+              sameMission(item),
           );
 
           if (tempIndex !== -1) {
@@ -7819,7 +7833,9 @@ export default function ControlClient() {
               (item) =>
                 item.kind === "user" &&
                 item.content === msgContent &&
-                (item.id.startsWith("history-") || item.id.startsWith("temp-")),
+                (item.id.startsWith("history-") ||
+                  item.id.startsWith("temp-")) &&
+                sameMission(item),
             );
           if (contentIndex !== -1) {
             // Convert reversed index back to forward index
@@ -7845,6 +7861,7 @@ export default function ControlClient() {
               content: msgContent,
               timestamp: Date.now(),
               queued,
+              missionId: msgMissionId,
             },
           ];
         });
@@ -9215,6 +9232,7 @@ export default function ControlClient() {
           queued: willBeQueued,
           sendStatus: "sending" as const,
           agent: agent || undefined,
+          missionId: targetMissionId ?? undefined,
         },
       ]);
       scrollToBottom("instant");
@@ -9466,6 +9484,7 @@ export default function ControlClient() {
           agent: m.agent,
           sendStatus: connected ? ("sending" as const) : ("failed" as const),
           failedReason: connected ? undefined : ("network" as const),
+          missionId: viewingMissionId,
         })),
       ];
     });

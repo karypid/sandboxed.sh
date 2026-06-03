@@ -24,6 +24,14 @@ export type ChatItem =
       failedReason?: "network" | "rejected";
       /** Locked agent for this message, preserved so a retry re-applies it. */
       agent?: string;
+      /**
+       * Mission this row was created for (client-only). Stamped on
+       * live/optimistic rows so a row created while viewing mission A can
+       * never be reconciled into, or rendered under, mission B during a
+       * switch race. Unset for server-history rows (already loaded per
+       * mission, so correct by construction).
+       */
+      missionId?: string;
     }
   | {
       kind: "assistant";
