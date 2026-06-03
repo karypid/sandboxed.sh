@@ -176,8 +176,16 @@ impl AskClient {
             "temperature": 0.3,
             "max_tokens": 2048,
             "stream": true,
-            "stream_options": { "include_usage": true },
         });
+        // `stream_options.include_usage` is an OpenAI extension Cerebras supports
+        // to emit a final usage frame. Some other OpenAI-compatible providers
+        // reject unknown fields, which would make `/ask/stream` fail even when
+        // synchronous `/ask` works, so only request it for Cerebras. The
+        // non-streaming `complete` path reads usage from the response body and
+        // never needs this field.
+        if self.config.base_url.contains("cerebras") {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");

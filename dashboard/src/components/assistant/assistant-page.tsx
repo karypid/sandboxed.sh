@@ -28,6 +28,7 @@ import {
   type CreateAssistantGatewayInput,
 } from '@/lib/api';
 import { listBackends, listWorkspaces, listBackendModelOptions, listProviders, listConfigProfiles, type Backend, type BackendModelOption, type Provider, type Workspace, type ConfigProfileSummary } from '@/lib/api';
+import { listMissionAutomations, listLibrarySkills, type Automation, type CommandSource, type TriggerType, type SkillSummary, type SkillSource } from '@/lib/api';
 import {
   MessageCircle,
   Plus,
@@ -116,7 +117,49 @@ function relTime(iso: string): string {
 const ROW = 'group border-t border-white/[0.04] first:border-t-0';
 const ROW_PAD = 'flex items-start gap-3 px-1 py-2';
 
-// A small empty-state used for both populated lists and not-yet-wired tabs.
+function humanizeDuration(seconds: number): string {
+  if (seconds <= 0) return '0s';
+  if (seconds % 86400 === 0) return `${seconds / 86400}d`;
+  if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+  if (seconds % 60 === 0) return `${seconds / 60}m`;
+  return `${seconds}s`;
+}
+
+function triggerLabel(t: TriggerType): string {
+  switch (t.type) {
+    case 'interval':
+      return `every ${humanizeDuration(t.seconds)}`;
+    case 'agent_finished':
+      return 'when agent finishes';
+    case 'webhook':
+      return 'webhook';
+    default:
+      return String((t as { type: string }).type).replace(/_/g, ' ');
+  }
+}
+
+function automationLabel(cs: CommandSource): string {
+  switch (cs.type) {
+    case 'library':
+      return cs.name;
+    case 'local_file':
+      return cs.path.split('/').pop() || cs.path;
+    case 'inline':
+      return cs.content.split('\n')[0].slice(0, 80) || 'inline command';
+    case 'native_loop':
+      return `/${cs.command}${cs.harness ? ` · ${cs.harness}` : ''}`;
+    default:
+      return 'command';
+  }
+}
+
+function skillSourceLabel(s?: SkillSource): string {
+  if (!s || s.type === 'Local') return 'local';
+  if (s.type === 'SkillsRegistry') return s.identifier || 'registry';
+  return 'local';
+}
+
+// A small empty-state used for populated lists and genuinely-empty tabs.
 function EmptyHint({ icon: Icon, children }: { icon: typeof Sparkles; children: React.ReactNode }) {
   return (
     <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
@@ -168,12 +211,19 @@ export default function AssistantPage() {
     getHermesAssistantStatus,
     { revalidateOnFocus: false, dedupingInterval: 30000 }
   );
+  const { data: librarySkills = [], isLoading: skillsLoading } = useSWR<SkillSummary[]>(
+    'library-skills',
+    listLibrarySkills,
+    { revalidateOnFocus: false, dedupingInterval: 60000 }
+  );
 
   // Chat mappings keyed by bot ID
   const [chatsByBot, setChatsByBot] = useState<Record<string, AssistantGatewayChat[]>>({});
   const [actionsByBot, setActionsByBot] = useState<Record<string, AssistantGatewayActionExecution[]>>({});
   const [scheduledByBot, setScheduledByBot] = useState<Record<string, AssistantGatewayScheduledMessage[]>>({});
   const [memoryByBot, setMemoryByBot] = useState<Record<string, AssistantGatewayMemoryEntry[]>>({});
+  const [automationsByBot, setAutomationsByBot] = useState<Record<string, Automation[]>>({});
+  const [loadingAutomations, setLoadingAutomations] = useState<Set<string>>(new Set());
   const [memorySearchByBot, setMemorySearchByBot] = useState<Record<string, AssistantGatewayMemorySearchHit[]>>({});
   const [memorySearchQueryByBot, setMemorySearchQueryByBot] = useState<Record<string, string>>({});
   const [expandedBots, setExpandedBots] = useState<Set<string>>(new Set());
@@ -269,6 +319,35 @@ export default function AssistantPage() {
     }
   };
 
+  // Tasks = scheduled automations on the missions this gateway drives. The
+  // gateway↔mission link comes from its chats, so resolve those first.
+  const loadAutomations = async (botId: string) => {
+    if (automationsByBot[botId]) return;
+    setLoadingAutomations((prev) => new Set(prev).add(botId));
+    try {
+      let chats = chatsByBot[botId];
+      if (!chats) {
+        chats = await listAssistantGatewayChats(botId);
+        setChatsByBot((prev) => ({ ...prev, [botId]: chats! }));
+      }
+      const missionIds = Array.from(new Set(chats.map((c) => c.mission_id)));
+      const lists = await Promise.all(
+        missionIds.map((id) => listMissionAutomations(id).catch(() => [] as Automation[]))
+      );
+      const seen = new Set<string>();
+      const deduped = lists.flat().filter((a) => (seen.has(a.id) ? false : (seen.add(a.id), true)));
+      setAutomationsByBot((prev) => ({ ...prev, [botId]: deduped }));
+    } catch {
+      // ignore
+    } finally {
+      setLoadingAutomations((prev) => {
+        const next = new Set(prev);
+        next.delete(botId);
+        return next;
+      });
+    }
+  };
+
   const loadScheduled = async (botId: string) => {
     if (scheduledByBot[botId]) return;
     setLoadingScheduled((prev) => new Set(prev).add(botId));
@@ -357,6 +436,7 @@ export default function AssistantPage() {
       void loadActions(botId);
       void loadScheduled(botId);
       void loadMemory(botId);
+      void loadAutomations(botId);
     }
   };
 
@@ -891,6 +971,7 @@ export default function AssistantPage() {
                   const acts = actionsByBot[bot.id] || [];
                   const sched = scheduledByBot[bot.id] || [];
                   const mem = memoryByBot[bot.id] || [];
+                  const autos = automationsByBot[bot.id] || [];
                   const searchHits = memorySearchByBot[bot.id] || [];
                   const convQuery = (conversationQueryByBot[bot.id] || '').toLowerCase();
                   const shownChats = convQuery
@@ -932,7 +1013,9 @@ export default function AssistantPage() {
                     if (id === 'conversations') return chats.length || null;
                     if (id === 'actions') return acts.length || null;
                     if (id === 'scheduled') return sched.length || null;
+                    if (id === 'tasks') return autos.length || null;
                     if (id === 'memory') return mem.length || null;
+                    if (id === 'skills') return librarySkills.length || null;
                     return null;
                   };
 
@@ -1121,11 +1204,47 @@ export default function AssistantPage() {
                           )
                         )}
 
-                        {/* TASKS (awaiting backend) */}
+                        {/* TASKS — scheduled automations on this gateway's missions */}
                         {tab === 'tasks' && (
-                          <EmptyHint icon={ListChecks}>
-                            Recurring assistant tasks (daily digests, reminders, audits) will live here once the Hermes cron API is connected.
-                          </EmptyHint>
+                          loadingAutomations.has(bot.id) ? (
+                            <div className="flex items-center gap-2 px-1 py-3 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
+                          ) : autos.length === 0 ? (
+                            <EmptyHint icon={ListChecks}>
+                              No scheduled tasks for this gateway. Automations created on its missions (daily digests, reminders, audits) appear here.
+                            </EmptyHint>
+                          ) : (
+                            <div>
+                              {autos.map((a) => {
+                                const rk = `auto:${a.id}`;
+                                const open = expandedRows.has(rk);
+                                return (
+                                  <div key={a.id} className={ROW}>
+                                    <button type="button" onClick={() => toggleRow(rk)} className={cn(ROW_PAD, 'w-full text-left hover:bg-white/[0.02] rounded')}>
+                                      <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', a.active ? 'bg-emerald-400' : 'bg-white/20')} />
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-xs text-white/70 truncate">
+                                          {automationLabel(a.command_source)}
+                                          <span className="text-white/30"> · {triggerLabel(a.trigger)}</span>
+                                          {!a.active ? <span className="text-white/30"> · paused</span> : null}
+                                        </p>
+                                        <p className="text-[10px] text-white/35 truncate">{getMissionTitle(a.mission_id)}</p>
+                                      </div>
+                                      <span className="shrink-0 font-mono text-[10px] text-white/25 tabular-nums">
+                                        {a.last_triggered_at ? relTime(a.last_triggered_at) : 'never run'}
+                                      </span>
+                                    </button>
+                                    {open && (
+                                      <div className="px-4 pb-2 -mt-0.5 space-y-1 text-[10px] text-white/30">
+                                        <p>Trigger: {triggerLabel(a.trigger)} · {a.active ? 'active' : 'paused'}</p>
+                                        <p>Mission: {getMissionTitle(a.mission_id)}</p>
+                                        <p>Created {relTime(a.created_at)}{a.last_triggered_at ? ` · last run ${relTime(a.last_triggered_at)}` : ''}</p>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )
                         )}
 
                         {/* MEMORY */}
@@ -1254,11 +1373,38 @@ export default function AssistantPage() {
                           </div>
                         )}
 
-                        {/* SKILLS (awaiting backend) */}
+                        {/* SKILLS — library skills available to the assistant */}
                         {tab === 'skills' && (
-                          <EmptyHint icon={Sparkles}>
-                            Skills the assistant builds from completed work will appear here once the Hermes skills API is connected.
-                          </EmptyHint>
+                          skillsLoading ? (
+                            <div className="flex items-center gap-2 px-1 py-3 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
+                          ) : librarySkills.length === 0 ? (
+                            <EmptyHint icon={Sparkles}>
+                              No skills in the library yet. Skills available to this assistant appear here.
+                            </EmptyHint>
+                          ) : (
+                            <div>
+                              {librarySkills.map((skill: SkillSummary) => {
+                                const rk = `skill:${skill.name}`;
+                                const open = expandedRows.has(rk);
+                                return (
+                                  <div key={skill.name} className={ROW}>
+                                    <button type="button" onClick={() => toggleRow(rk)} className={cn(ROW_PAD, 'w-full text-left hover:bg-white/[0.02] rounded')}>
+                                      <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-white/30" />
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-xs text-white/70 truncate">
+                                          {skill.name}
+                                          <span className="text-white/30"> · {skillSourceLabel(skill.source)}</span>
+                                        </p>
+                                        {skill.description && (
+                                          <p className={cn('text-[11px] text-white/40', open ? 'whitespace-pre-wrap' : 'truncate')}>{skill.description}</p>
+                                        )}
+                                      </div>
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )
                         )}
                       </div>
                     </div>

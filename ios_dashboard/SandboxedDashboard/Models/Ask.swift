@@ -37,6 +37,12 @@ struct AskMessage: Codable, Identifiable {
     let toolName: String?
     let toolCallId: String?
     let createdAt: String
+    /// Client-only delivery state for optimistic user bubbles. Excluded from
+    /// `CodingKeys`, so it's never decoded from / encoded to the backend and
+    /// defaults to `.sent` for server-sourced messages. Mirrors the main
+    /// composer's `ChatMessage.sendState` so Ask gets the same
+    /// pending/failed/tap-to-retry UX.
+    var sendState: MessageSendState = .sent
 
     enum CodingKeys: String, CodingKey {
         case id, seq, role, content
@@ -44,7 +50,8 @@ struct AskMessage: Codable, Identifiable {
         case toolName = "tool_name"
         case toolCallId = "tool_call_id"
         case createdAt = "created_at"
-        // `metadata` is intentionally omitted — arbitrary JSON we don't render.
+        // `metadata` and `sendState` are intentionally omitted — arbitrary
+        // JSON we don't render, and a client-only field, respectively.
     }
 
     var isUser: Bool { role == "user" }

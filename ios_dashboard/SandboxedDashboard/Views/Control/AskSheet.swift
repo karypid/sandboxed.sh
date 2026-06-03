@@ -62,8 +62,14 @@ struct AskSheet: View {
                         emptyState
                     }
                     ForEach(messages) { message in
-                        AskBubble(message: message, copilot: copilot, onSendToAgent: onSendToAgent)
-                            .id(message.id)
+                        AskBubble(
+                            message: message,
+                            copilot: copilot,
+                            onSendToAgent: onSendToAgent,
+                            onRetry: message.sendState.isFailed
+                                ? { Task { await retry(message) } } : nil
+                        )
+                        .id(message.id)
                     }
                     if isLoading {
                         HStack(spacing: 6) {
@@ -220,60 +226,87 @@ struct AskSheet: View {
         let content = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty, !isLoading else { return }
         input = ""
-        errorText = nil
-        isLoading = true
-        streamId = nil
-        streamGen += 1
-        let gen = streamGen
-        // Snapshot before the optimistic bubble so a failed turn can roll back.
-        let baseCount = messages.count
-
+        let userId = "u-\(UUID().uuidString)"
         messages.append(
             AskMessage(
-                id: "u-\(UUID().uuidString)",
+                id: userId,
                 threadId: threadId ?? "",
                 seq: messages.count + 1,
                 role: "user",
                 content: content,
                 toolName: nil,
                 toolCallId: nil,
-                createdAt: isoNow()
+                createdAt: isoNow(),
+                sendState: .pending
             )
         )
+        await runTurn(userMessageId: userId, content: content)
+    }
 
+    /// Re-run a co-pilot turn for a user message whose send failed. Reuses the
+    /// existing bubble (no duplicate) with the same rollback semantics.
+    private func retry(_ message: AskMessage) async {
+        guard message.isUser, message.sendState.isFailed, !isLoading else { return }
+        await runTurn(userMessageId: message.id, content: message.content)
+    }
+
+    /// Drives one streamed co-pilot turn. The user bubble is **preserved**
+    /// across failures (flipped to `.failed` with a tap-to-retry) instead of
+    /// being rolled back — mirroring the main mission composer so a dropped
+    /// message never silently vanishes. Only this turn's streamed
+    /// assistant/tool bubbles roll back on failure.
+    private func runTurn(userMessageId: String, content: String) async {
+        errorText = nil
+        isLoading = true
+        streamId = nil
+        streamGen += 1
+        let gen = streamGen
+        if let i = messages.firstIndex(where: { $0.id == userMessageId }) {
+            messages[i].sendState = .pending
+        }
+        // Roll-back boundary: keep everything up to and including the user
+        // bubble; drop streamed bubbles appended during this turn on failure.
+        let baseCount =
+            messages.firstIndex(where: { $0.id == userMessageId }).map { $0 + 1 }
+            ?? messages.count
+
+        var failure: String?
         do {
             for try await ev in api.askStream(
                 missionId: missionId,
                 content: content,
                 threadId: threadId
             ) {
-                // A newer send / thread switch superseded this turn — stop
-                // mutating the (now different) message list.
-                if gen != streamGen { break }
+                // A newer send / thread switch superseded this turn.
+                if gen != streamGen { return }
+                // First event back means the backend accepted the message.
+                if let i = messages.firstIndex(where: { $0.id == userMessageId }),
+                    messages[i].sendState.isPending
+                {
+                    messages[i].sendState = .sent
+                }
                 handleStreamEvent(ev)
             }
         } catch {
-            // Ignore errors from a superseded turn (the user switched threads
-            // or started a new send mid-stream).
-            if gen == streamGen {
-                errorText = error.localizedDescription
-            }
+            if gen == streamGen { failure = error.localizedDescription }
         }
-        if errorText != nil, gen == streamGen {
-            // Roll back this turn's optimistic + streamed bubbles, and restore
-            // the question if the composer is still empty.
-            if messages.count >= baseCount {
+
+        // Superseded — a newer turn owns the list and the loading flag now.
+        if gen != streamGen { return }
+
+        if let failure {
+            // Preserve the user bubble (failed + retry); drop streamed bubbles.
+            if messages.count > baseCount {
                 messages = Array(messages.prefix(baseCount))
             }
-            if input.isEmpty {
-                input = content
+            if let i = messages.firstIndex(where: { $0.id == userMessageId }) {
+                messages[i].sendState = .failed(reason: failure)
             }
+        } else if let i = messages.firstIndex(where: { $0.id == userMessageId }) {
+            messages[i].sendState = .sent
         }
-        // Only clear loading for the current turn — a newer send owns it now.
-        if gen == streamGen {
-            isLoading = false
-            streamId = nil
-        }
+        isLoading = false
+        streamId = nil
     }
 
     private func isoNow() -> String {
@@ -384,18 +417,62 @@ private struct AskBubble: View {
     let message: AskMessage
     let copilot: Color
     var onSendToAgent: ((String) -> Void)?
+    var onRetry: (() -> Void)? = nil
 
     var body: some View {
         if message.isUser {
             HStack {
                 Spacer(minLength: 40)
-                Text(message.content)
-                    .font(.subheadline)
-                    .foregroundStyle(Theme.textPrimary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Theme.card)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text(message.content)
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.textPrimary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            message.sendState.isFailed
+                                ? Theme.error.opacity(0.18) : Theme.card
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .stroke(
+                                    message.sendState.isFailed ? Theme.error : Color.clear,
+                                    lineWidth: 1
+                                )
+                        )
+                        // Dim + spinner while awaiting backend ack; this is the
+                        // co-pilot peer of the main composer's pending bubble.
+                        .opacity(message.sendState.isPending ? 0.55 : 1)
+                        .overlay(alignment: .bottomTrailing) {
+                            if message.sendState.isPending {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                    .padding(6)
+                            } else if message.sendState.isFailed {
+                                Image(systemName: "exclamationmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(Theme.error)
+                                    .padding(6)
+                            }
+                        }
+                        .animation(.easeOut(duration: 0.15), value: message.sendState.isPending)
+                        .animation(.easeOut(duration: 0.15), value: message.sendState.isFailed)
+                    // Inline "Not sent · Tap to retry" — preserves the message
+                    // on screen instead of dropping it on a failed turn.
+                    if message.sendState.isFailed {
+                        Button { onRetry?() } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.clockwise.circle.fill")
+                                    .font(.caption2)
+                                Text("Not sent · Tap to retry")
+                                    .font(.caption2.weight(.medium))
+                            }
+                            .foregroundStyle(Theme.error)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
             }
         } else if message.isTool {
             HStack(alignment: .top, spacing: 6) {

@@ -278,9 +278,22 @@ export function appendUnpersistedLiveTail(
       return !historyHasAssistantAfterLastUser;
     });
 
-  return unpersistedTail.length > 0
-    ? [...historyItems, ...unpersistedTail]
-    : historyItems;
+  // A failed or still-sending user row never reached the server, so rebuilding
+  // from server history would drop the bubble (and its Retry affordance) while
+  // any outbox entry lingers. Carry it over. A "sent" row already appears in
+  // history by id, so this only re-surfaces genuinely unpersisted sends.
+  const lastLiveUser = liveItems[lastLiveUserIdx];
+  const carryUnpersistedUser =
+    lastLiveUser.kind === "user" &&
+    !existingIds.has(lastLiveUser.id) &&
+    (lastLiveUser.sendStatus === "failed" ||
+      lastLiveUser.sendStatus === "sending");
+
+  const tail = carryUnpersistedUser
+    ? [lastLiveUser, ...unpersistedTail]
+    : unpersistedTail;
+
+  return tail.length > 0 ? [...historyItems, ...tail] : historyItems;
 }
 
 async function postControlMessageWithRetry(
@@ -9342,12 +9355,21 @@ export default function ControlClient() {
           if (sseAlreadyAdded) {
             return prev.filter((item) => item.id !== msg.id);
           }
+          // Mirror the main send path: the mission's first user message is
+          // never queued, even if the agent is busy. Trusting the backend
+          // `queued` flag here would show "Queued" on a retried first message
+          // when the initial send would not have.
+          const otherUserMessages = prev.filter(
+            (item) => item.kind === "user" && item.id !== msg.id,
+          );
+          const isFirstMessage = otherUserMessages.length === 0;
+          const effectiveQueued = isFirstMessage ? false : queued;
           return prev.map((item) =>
             item.id === msg.id
               ? {
                   ...item,
                   id,
-                  queued,
+                  queued: effectiveQueued,
                   sendStatus: "sent" as const,
                   failedReason: undefined,
                 }
