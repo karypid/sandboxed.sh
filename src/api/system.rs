@@ -311,7 +311,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/components/by-workspace", get(get_components_by_workspace))
         .route("/hermes-assistant/adopt", post(adopt_hermes_assistant))
         .route("/hermes-assistant/status", get(get_hermes_assistant_status))
-        .route("/hermes-assistant/skills", get(list_hermes_assistant_skills))
+        .route(
+            "/hermes-assistant/skills",
+            get(list_hermes_assistant_skills),
+        )
         .route("/hermes-assistant/stop", post(stop_hermes_assistant))
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
@@ -918,7 +921,9 @@ pub struct HermesSkillsResponse {
 
 /// Pull `name` / `description` / `version` out of a SKILL.md YAML frontmatter
 /// block (the leading `---` … `---` section).
-fn parse_skill_frontmatter(contents: &str) -> Option<(Option<String>, Option<String>, Option<String>)> {
+fn parse_skill_frontmatter(
+    contents: &str,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
     let rest = contents.strip_prefix("---")?;
     let end = rest.find("\n---")?;
     let frontmatter = &rest[..end];
@@ -978,7 +983,11 @@ async fn list_hermes_assistant_skills(
                 .and_then(|p| p.strip_prefix(&scan_root).ok())
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let category = rel.split('/').next().filter(|s| !s.is_empty()).map(|s| s.to_string());
+            let category = rel
+                .split('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             let dir_name = file
                 .parent()
                 .and_then(|p| p.file_name())
