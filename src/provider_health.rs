@@ -1108,12 +1108,32 @@ impl ModelChainStore {
             Some(c) => c,
             None => return Vec::new(),
         };
+        self.resolve_entries(
+            &chain.entries,
+            ai_providers,
+            standard_accounts,
+            health_tracker,
+        )
+        .await
+    }
 
+    /// Expand an ad-hoc list of `provider/model` entries into resolved,
+    /// health-filtered upstream attempts — the same expansion `resolve_chain`
+    /// applies to a stored chain, but without requiring a stored chain. Used
+    /// for direct `provider/model` passthrough in the proxy. Per provider, the
+    /// first healthy/configured account is emitted first (chain ordering).
+    pub async fn resolve_entries(
+        &self,
+        entries: &[ChainEntry],
+        ai_providers: &crate::ai_providers::AIProviderStore,
+        standard_accounts: &[StandardAccount],
+        health_tracker: &ProviderHealthTracker,
+    ) -> Vec<ResolvedEntry> {
         let mut resolved = Vec::new();
 
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        for entry in &chain.entries {
+        for entry in entries {
             let provider_type = match crate::ai_providers::ProviderType::from_id(&entry.provider_id)
             {
                 Some(pt) => pt,
