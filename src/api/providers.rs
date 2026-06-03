@@ -1361,7 +1361,7 @@ pub async fn list_providers(
     Json(ProvidersResponse { providers })
 }
 
-/// List model options grouped by backend (claudecode, codex, opencode).
+/// List model options grouped by backend.
 ///
 /// This is used by the frontend to power per-harness model override pickers.
 pub async fn list_backend_model_options(
@@ -1446,15 +1446,8 @@ pub async fn list_backend_model_options(
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("gemini", Some(&["google"]), false, None);
     push_options("opencode", None, true, None);
-    backends.insert(
-        "grok".to_string(),
-        vec![BackendModelOption {
-            value: "grok-build".to_string(),
-            label: "Grok Build".to_string(),
-            provider_id: Some("xai".to_string()),
-            description: Some("Default Grok Build CLI coding model".to_string()),
-        }],
-    );
+    let grok_filter: &dyn Fn(&str) -> bool = &|id: &str| is_grok_backend_model_id(id);
+    push_options("grok", Some(&["xai"]), false, Some(grok_filter));
 
     let codex_candidates: Vec<String> = backends
         .get("codex")
@@ -1714,6 +1707,10 @@ fn is_custom_grok_model_id(model_id: &str) -> bool {
     model_id.starts_with("grok-") || model_id.starts_with("composer-")
 }
 
+fn is_grok_backend_model_id(model_id: &str) -> bool {
+    is_custom_grok_model_id(model_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1765,6 +1762,25 @@ mod tests {
         assert!(is_custom_grok_model_id("grok-4.3"));
         assert!(is_custom_grok_model_id("composer-2.5"));
         assert!(!is_custom_grok_model_id("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn grok_backend_model_options_include_composer() {
+        let defaults = default_providers_config();
+        let xai = defaults
+            .providers
+            .iter()
+            .find(|provider| provider.id == "xai")
+            .expect("xai provider");
+        let option_ids: Vec<&str> = xai
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .filter(|id| is_grok_backend_model_id(id))
+            .collect();
+
+        assert!(option_ids.contains(&"grok-build-0.1"));
+        assert!(option_ids.contains(&"composer-2.5"));
     }
 
     #[test]
