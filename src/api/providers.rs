@@ -182,6 +182,30 @@ pub struct BackendModelOptionsResponse {
     pub backends: std::collections::HashMap<String, Vec<BackendModelOption>>,
 }
 
+/// One model in the full supported-model catalog, ready to drop into a
+/// model-routing chain (`value` is the provider-prefixed id, e.g. `xai/grok-4.3`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogModelOption {
+    pub provider_id: String,
+    pub provider_name: String,
+    /// Bare model id (e.g. `grok-4.3`).
+    pub id: String,
+    /// Chain-ready value (`provider_id/model_id`).
+    pub value: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether this provider is currently configured/authenticated for this account.
+    pub configured: bool,
+}
+
+/// Response for the full model catalog endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullCatalogResponse {
+    pub count: usize,
+    pub models: Vec<CatalogModelOption>,
+}
+
 /// Query parameters for backend models endpoint.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct BackendModelsQuery {
@@ -1359,6 +1383,59 @@ pub async fn list_providers(
     merge_store_provider_models(&mut providers, &store_providers, query.include_all);
 
     Json(ProvidersResponse { providers })
+}
+
+/// Full catalog of every supported model across all providers — configured or
+/// not, account-verified or public-catalog — as one flat list. Unlike
+/// `/api/providers/backend-models` (which filters/groups per harness), this is
+/// the complete "everything that is supported" view, intended for building
+/// model-routing chains. Each entry's `value` is chain-ready (`provider/model`).
+///
+/// GET /api/providers/catalog
+pub async fn list_full_model_catalog(
+    State(state): State<Arc<AppState>>,
+) -> Json<FullCatalogResponse> {
+    let working_dir = state.config.working_dir.to_string_lossy().to_string();
+    let mut config = load_providers_config(&working_dir);
+
+    // "Everything supported" => always include public-catalog (unverified)
+    // models and providers that aren't configured yet.
+    let cached = state.model_catalog.read().await;
+    merge_cached_provider_models(&mut config, &cached, true);
+    drop(cached);
+
+    let configured = get_configured_provider_ids(state.config.working_dir.as_path());
+
+    let mut providers = config.providers;
+    let store_providers = state.ai_providers.list().await;
+    merge_store_provider_models(&mut providers, &store_providers, true);
+
+    let mut models = Vec::new();
+    for provider in &providers {
+        let is_configured = configured.contains(&provider.id);
+        for model in &provider.models {
+            models.push(CatalogModelOption {
+                provider_id: provider.id.clone(),
+                provider_name: provider.name.clone(),
+                id: model.id.clone(),
+                value: format!("{}/{}", provider.id, model.id),
+                name: model.name.clone(),
+                description: model.description.clone(),
+                configured: is_configured,
+            });
+        }
+    }
+    // Stable order: provider, then model name.
+    models.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    Json(FullCatalogResponse {
+        count: models.len(),
+        models,
+    })
 }
 
 /// List model options grouped by backend.

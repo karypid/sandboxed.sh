@@ -994,6 +994,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/providers/backend-models",
             get(super::providers::list_backend_model_options),
         )
+        .route(
+            "/api/providers/catalog",
+            get(super::providers::list_full_model_catalog),
+        )
         // Library management endpoints
         .nest("/api/library", library_api::routes())
         // Workspace management endpoints
