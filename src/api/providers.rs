@@ -689,12 +689,11 @@ fn default_providers_config() -> ProvidersConfig {
                     ProviderModel {
                         id: "grok-build-0.1".to_string(),
                         name: "Grok Build".to_string(),
-                        description: Some("Default Grok Build CLI coding model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "composer-2.5".to_string(),
-                        name: "Composer 2.5".to_string(),
-                        description: Some("Composer 2.5 coding model (Grok Build CLI)".to_string()),
+                        description: Some(
+                            "Grok Build coding model (xAI's \"Composer\"-class agent model; \
+                             marketing name \"Composer 2.5\" is NOT a valid API id)"
+                                .to_string(),
+                        ),
                     },
                     ProviderModel {
                         id: "grok-4.3".to_string(),
@@ -1753,7 +1752,7 @@ pub async fn validate_model_override(
                     Ok(())
                 } else {
                     Err(format!(
-                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use format 'grok-*' or 'composer-*'",
+                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use the 'grok-*' id format (note: 'composer-*' / 'composer-2.5' is a product name, not a valid xAI API id)",
                         model_override,
                         provider
                             .models
@@ -1768,7 +1767,7 @@ pub async fn validate_model_override(
                 Ok(())
             } else {
                 Err(format!(
-                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3' or 'composer-2.5'), got '{}'",
+                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3' or 'grok-build-0.1'), got '{}'",
                     model_override
                 ))
             }
@@ -1781,7 +1780,10 @@ pub async fn validate_model_override(
 }
 
 fn is_custom_grok_model_id(model_id: &str) -> bool {
-    model_id.starts_with("grok-") || model_id.starts_with("composer-")
+    // Only `grok-*` ids are accepted by the xAI API. `composer-*` is a product
+    // name (Cursor / Grok Build "Composer 2.5") that the API rejects with
+    // "Model not found", so we don't treat it as a valid custom Grok id.
+    model_id.starts_with("grok-")
 }
 
 fn is_grok_backend_model_id(model_id: &str) -> bool {
@@ -1829,20 +1831,23 @@ mod tests {
             .find(|provider| provider.id == "xai")
             .expect("xai provider");
         // The CLI-valid coding model id (bare `grok-build` is rejected by
-        // current CLIs) plus the Composer model the Grok CLI now supports.
+        // current CLIs). `composer-2.5` is intentionally NOT here: it's a
+        // product name, not a valid xAI API id, and the API rejects it.
         assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
-        assert!(xai.models.iter().any(|model| model.id == "composer-2.5"));
+        assert!(!xai.models.iter().any(|model| model.id == "composer-2.5"));
     }
 
     #[test]
-    fn grok_custom_model_prefixes_include_composer() {
+    fn grok_custom_model_prefixes_reject_composer() {
         assert!(is_custom_grok_model_id("grok-4.3"));
-        assert!(is_custom_grok_model_id("composer-2.5"));
+        assert!(is_custom_grok_model_id("grok-build-0.1"));
+        // `composer-*` is a product name the xAI API rejects ("Model not found").
+        assert!(!is_custom_grok_model_id("composer-2.5"));
         assert!(!is_custom_grok_model_id("claude-opus-4-7"));
     }
 
     #[test]
-    fn grok_backend_model_options_include_composer() {
+    fn grok_backend_model_options_exclude_composer() {
         let defaults = default_providers_config();
         let xai = defaults
             .providers
@@ -1857,7 +1862,7 @@ mod tests {
             .collect();
 
         assert!(option_ids.contains(&"grok-build-0.1"));
-        assert!(option_ids.contains(&"composer-2.5"));
+        assert!(!option_ids.contains(&"composer-2.5"));
     }
 
     #[test]
