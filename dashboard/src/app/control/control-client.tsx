@@ -9332,8 +9332,35 @@ export default function ControlClient() {
   // client_message_id so redelivery is idempotent. Used by both the inline
   // Retry button and the automatic reconnect-flush below.
   const handleRetryUserMessage = useCallback(
-    async (msg: { id: string; content: string; agent?: string }) => {
-      const missionId = viewingMissionIdRef.current;
+    async (
+      msg: { id: string; content: string; agent?: string },
+      explicitMissionId?: string | null,
+    ) => {
+      // Bind redelivery to an explicit mission for outbox flushes — the viewing
+      // mission can change mid-flight, and posting to viewingMissionIdRef at
+      // send time would misroute a queued message to the wrong mission. Inline
+      // Retry omits it and falls back to the active view.
+      const missionId =
+        explicitMissionId !== undefined
+          ? explicitMissionId
+          : viewingMissionIdRef.current;
+      const markFailed = (reason: "network" | "rejected") => {
+        setItems((prev) =>
+          prev.map((it) =>
+            it.id === msg.id && it.kind === "user"
+              ? { ...it, sendStatus: "failed" as const, failedReason: reason }
+              : it,
+          ),
+        );
+        if (reason === "network" && missionId) {
+          addOutboxEntry(missionId, {
+            id: msg.id,
+            content: msg.content,
+            agent: msg.agent,
+            timestamp: Date.now(),
+          });
+        }
+      };
       setItems((prev) =>
         prev.map((it) =>
           it.id === msg.id && it.kind === "user"
@@ -9341,6 +9368,31 @@ export default function ControlClient() {
             : it,
         ),
       );
+      // Mirror the main send path: a mission in a resumable state must be
+      // resumed before it will accept the message, otherwise redelivery
+      // silently drops it. Only adopt the mission into the active view if the
+      // user is still looking at it, so a background flush doesn't yank them.
+      if (missionId) {
+        try {
+          let mission = await loadMission(missionId);
+          if (!mission) {
+            markFailed("rejected");
+            return;
+          }
+          if (["failed", "interrupted", "blocked"].includes(mission.status)) {
+            mission = await resumeMission(mission.id, { skipMessage: true });
+          }
+          if (viewingMissionIdRef.current === missionId) {
+            setCurrentMission(mission);
+            setViewingMission(mission);
+            setViewingMissionId(mission.id);
+            applyDesktopSessionState(mission);
+          }
+        } catch (err) {
+          markFailed(isRetriableSendError(err) ? "network" : "rejected");
+          return;
+        }
+      }
       try {
         const { id, queued } = await postControlMessageWithRetry(msg.content, {
           agent: msg.agent || undefined,
@@ -9377,25 +9429,10 @@ export default function ControlClient() {
           );
         });
       } catch (err) {
-        const reason = isRetriableSendError(err) ? "network" : "rejected";
-        setItems((prev) =>
-          prev.map((it) =>
-            it.id === msg.id && it.kind === "user"
-              ? { ...it, sendStatus: "failed" as const, failedReason: reason }
-              : it,
-          ),
-        );
-        if (reason === "network" && missionId) {
-          addOutboxEntry(missionId, {
-            id: msg.id,
-            content: msg.content,
-            agent: msg.agent,
-            timestamp: Date.now(),
-          });
-        }
+        markFailed(isRetriableSendError(err) ? "network" : "rejected");
       }
     },
-    [],
+    [applyDesktopSessionState],
   );
 
   // Auto-flush the unsent-message outbox whenever the control stream is
@@ -9434,11 +9471,16 @@ export default function ControlClient() {
               ],
         );
         try {
-          await handleRetryUserMessage({
-            id: msg.id,
-            content: msg.content,
-            agent: msg.agent,
-          });
+          // Bind to the mission this flush captured, not the live viewing ref,
+          // so a mid-flush mission switch can't misroute the message.
+          await handleRetryUserMessage(
+            {
+              id: msg.id,
+              content: msg.content,
+              agent: msg.agent,
+            },
+            viewingMissionId,
+          );
         } finally {
           flushingOutboxRef.current.delete(msg.id);
         }
