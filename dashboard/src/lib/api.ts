@@ -576,6 +576,12 @@ export async function askSendStream(
     body: JSON.stringify(body),
     signal,
   });
+  if (res.status === 404) {
+    const fallback = await askSend(missionId, content, opts.threadId, opts.sandbox);
+    handlers.onDelta(fallback.answer);
+    handlers.onDone({ thread_id: fallback.thread_id, answer: fallback.answer });
+    return;
+  }
   if (!res.ok || !res.body) {
     handlers.onError(res.ok ? "No response stream" : `Ask failed (${res.status})`);
     return;
@@ -663,30 +669,6 @@ export async function deleteAskThread(
   return apiDel(
     `/api/control/missions/${missionId}/ask/threads/${threadId}`,
     "Failed to delete Ask thread",
-  );
-}
-
-// Agent tree snapshot (for refresh resilience)
-export interface AgentTreeNode {
-  id: string;
-  node_type: string;
-  name: string;
-  description: string;
-  status: string;
-  budget_allocated: number;
-  budget_spent: number;
-  complexity?: number;
-  selected_model?: string;
-  children: AgentTreeNode[];
-}
-
-// Get tree for a specific mission (either live from memory or saved from database)
-export async function getMissionTree(
-  missionId: string,
-): Promise<AgentTreeNode | null> {
-  return apiGet(
-    `/api/control/missions/${missionId}/tree`,
-    "Failed to fetch mission tree",
   );
 }
 

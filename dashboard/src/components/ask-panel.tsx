@@ -497,7 +497,7 @@ export function AskPanel({
 
       {/* Composer — mirrors the main mission composer's treatment */}
       <div className="border-t border-[rgb(var(--foreground)/0.1)] p-2.5">
-        <div className="flex items-end gap-2 rounded-xl border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3.5 py-2.5 transition-[border-color] duration-150 ease-out focus-within:border-[rgb(var(--copilot)/0.5)]">
+        <div className="flex items-center gap-2 rounded-xl border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3.5 py-2 transition-[border-color] duration-150 ease-out focus-within:border-[rgb(var(--copilot)/0.5)]">
           <textarea
             ref={textareaRef}
             value={input}
@@ -510,7 +510,7 @@ export function AskPanel({
             }}
             rows={1}
             placeholder="Ask the co-pilot…"
-            className="min-h-[24px] flex-1 resize-none overflow-y-auto bg-transparent text-sm leading-5 text-[rgb(var(--foreground)/0.9)] placeholder:text-[rgb(var(--foreground)/0.4)] focus:outline-none"
+            className="min-h-[20px] flex-1 resize-none overflow-y-auto bg-transparent text-sm leading-5 text-[rgb(var(--foreground)/0.9)] placeholder:text-[rgb(var(--foreground)/0.4)] focus:outline-none"
           />
           <button
             type="button"

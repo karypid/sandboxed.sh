@@ -167,6 +167,18 @@ export async function searchAssistantGatewayMemory(
   );
 }
 
+export async function sendAssistantGatewayTestMessage(
+  gatewayId: string,
+  chatId: number,
+  text = "✅ Test message from the sandboxed.sh dashboard."
+): Promise<void> {
+  await apiPost(
+    "/api/control/telegram/send",
+    { channel_id: gatewayId, chat_id: chatId, text },
+    "Failed to send test message"
+  );
+}
+
 export async function adoptHermesAssistant(
   input: AdoptHermesAssistantInput
 ): Promise<AdoptHermesAssistantResult> {
