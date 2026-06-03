@@ -10681,7 +10681,7 @@ export default function ControlClient() {
             {connectionState !== "connected" && (
               <div
                 className={cn(
-                  "flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-medium",
+                  "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
                   connectionState === "reconnecting"
                     ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
                     : "border-red-500/30 bg-red-500/10 text-red-300",
@@ -10693,11 +10693,11 @@ export default function ControlClient() {
                 }
               >
                 {connectionState === "reconnecting" ? (
-                  <RefreshCw className="h-3 w-3 animate-spin" />
+                  <RefreshCw className="h-4 w-4 animate-spin" />
                 ) : (
-                  <WifiOff className="h-3 w-3" />
+                  <WifiOff className="h-4 w-4" />
                 )}
-                <span className="hidden md:inline">
+                <span className="hidden sm:inline">
                   {connectionState === "reconnecting"
                     ? "Reconnecting"
                     : "Disconnected"}
