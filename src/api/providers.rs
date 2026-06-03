@@ -751,9 +751,16 @@ fn default_providers_config() -> ProvidersConfig {
                     // Check MiniMax text model IDs here:
                     // https://platform.minimaxi.com/document/ChatCompletion%20v2
                     ProviderModel {
+                        id: "MiniMax-M3".to_string(),
+                        name: "MiniMax M3".to_string(),
+                        description: Some(
+                            "Latest MiniMax coding and agentic model with 1M context".to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "MiniMax-M2.7".to_string(),
                         name: "MiniMax M2.7".to_string(),
-                        description: Some("Most capable MiniMax model".to_string()),
+                        description: Some("Previous flagship MiniMax model".to_string()),
                     },
                     ProviderModel {
                         id: "MiniMax-M2.5".to_string(),

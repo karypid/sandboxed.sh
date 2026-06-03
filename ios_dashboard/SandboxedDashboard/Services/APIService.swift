@@ -757,9 +757,9 @@ final class APIService {
 
     // MARK: - Slash commands
 
-    /// Fetch the per-backend list of built-in slash commands. Codex 0.128.0+
-    /// surfaces `/goal <objective>` here; older binaries return an empty
-    /// `codex` array and pre-/goal builds omit the field entirely.
+    /// Fetch the per-backend list of built-in slash commands. OpenCode
+    /// surfaces `/goal <objective>` when the goal plugin is configured; Codex
+    /// 0.128.0+ exposes its native `/goal` command here as well.
     func getBuiltinCommands() async throws -> BuiltinCommandsResponse {
         try await get("/api/library/builtin-commands")
     }
