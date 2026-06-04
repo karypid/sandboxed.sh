@@ -441,13 +441,15 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
                 None
             };
 
+            // Only assume the Sway compositor for Wayland sessions —
+            // legacy x11 entries would otherwise display Sway metadata.
+            let compositor = session.compositor.clone().or_else(|| {
+                (display_server_value == "wayland").then(|| "sway-headless".to_string())
+            });
             let detail = DesktopSessionDetail {
                 display: session.display.clone(),
                 display_server: display_server_value,
-                compositor: session
-                    .compositor
-                    .clone()
-                    .or_else(|| Some("sway-headless".to_string())),
+                compositor,
                 status,
                 mission_id: session.mission_id.or(Some(mission.id)),
                 mission_title: mission.title.clone(),
@@ -655,6 +657,14 @@ pub(crate) async fn close_desktop_session(
         .join(".sandboxed-sh")
         .join("wayland")
         .join(display_num.to_string());
+    // The session file can be missing or stale, in which case the PID kill
+    // above never reached the compositor. Sway is launched with
+    // `-c <runtime_dir>/sway.config`, so matching the per-display runtime
+    // dir on the command line signals exactly this session's compositor.
+    let _ = Command::new("pkill")
+        .args(["-f", &runtime_dir.to_string_lossy()])
+        .output()
+        .await;
     let _ = tokio::fs::remove_dir_all(runtime_dir).await;
 
     Ok(())
