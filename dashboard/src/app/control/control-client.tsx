@@ -3753,6 +3753,45 @@ function CollapsedToolGroup({
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
 
+  // Keep the toggle pinned under the cursor across expand/collapse: revealed
+  // tools render *above* the toggle, so without compensation the toggle (and
+  // everything below) is pushed down and the user has to chase it. Record the
+  // toggle's viewport position before flipping, then re-align the scroller
+  // after layout (plus two rAF passes so the virtualizer's async re-measure
+  // doesn't undo the adjustment).
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const anchorTopRef = useRef<number | null>(null);
+
+  const handleToggle = () => {
+    anchorTopRef.current =
+      toggleRef.current?.getBoundingClientRect().top ?? null;
+    onToggleExpand();
+  };
+
+  useLayoutEffect(() => {
+    const anchorTop = anchorTopRef.current;
+    if (anchorTop == null) return;
+    anchorTopRef.current = null;
+    const align = () => {
+      const el = toggleRef.current;
+      if (!el) return;
+      const scroller = el.closest(".overflow-y-auto");
+      if (!scroller) return;
+      const delta = el.getBoundingClientRect().top - anchorTop;
+      if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
+    };
+    align();
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      align();
+      raf2 = requestAnimationFrame(align);
+    });
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+    };
+  }, [isExpanded]);
+
   // Helper to render appropriate tool component
   const renderTool = (tool: Extract<ChatItem, { kind: "tool" }>) => {
     if (isSubagentTool(tool.name)) {
@@ -3768,12 +3807,18 @@ function CollapsedToolGroup({
     );
   };
 
+  // The group expands *upward*: revealed tools render above the toggle, so
+  // the toggle row and the last tool keep their position relative to the
+  // conversation below and auto-scroll isn't disturbed by content growing
+  // toward the bottom. Chevrons follow: collapsed points up (reveal above),
+  // expanded points down (collapse away).
   if (isExpanded) {
-    // Show all tools with a collapse button at the top
     return (
       <div className="space-y-2">
+        {tools.slice(0, -1).map((tool) => renderTool(tool))}
         <button
-          onClick={onToggleExpand}
+          ref={toggleRef}
+          onClick={handleToggle}
           className={cn(
             "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
             "bg-white/[0.02] border border-white/[0.04]",
@@ -3781,12 +3826,12 @@ function CollapsedToolGroup({
             "transition-all duration-200 text-xs",
           )}
         >
-          <ChevronUp className="h-3 w-3" />
+          <ChevronDown className="h-3 w-3" />
           <span>
             Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
           </span>
         </button>
-        {tools.map((tool) => renderTool(tool))}
+        {renderTool(lastTool)}
       </div>
     );
   }
@@ -3795,7 +3840,8 @@ function CollapsedToolGroup({
   return (
     <div className="space-y-2">
       <button
-        onClick={onToggleExpand}
+        ref={toggleRef}
+        onClick={handleToggle}
         className={cn(
           "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
           "bg-white/[0.02] border border-white/[0.04]",
@@ -3803,7 +3849,7 @@ function CollapsedToolGroup({
           "transition-all duration-200 text-xs",
         )}
       >
-        <ChevronDown className="h-3 w-3" />
+        <ChevronUp className="h-3 w-3" />
         <span>
           Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
         </span>
