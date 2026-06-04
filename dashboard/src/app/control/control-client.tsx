@@ -118,6 +118,7 @@ import {
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
 import { GoalBar } from "@/components/goal-bar";
+import { StallBar } from "@/components/stall-bar";
 import { AsyncButton } from "@/components/ui/async-button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
@@ -11094,53 +11095,6 @@ export default function ControlClient() {
                     </div>
                   )}
 
-                  {/* Stall warning banner when agent hasn't reported activity for 60+ seconds */}
-                  {isViewingMissionStalled &&
-                    viewingMissionId &&
-                    !hasPendingUserInput && (
-                      <div className="flex justify-center py-2 animate-fade-in">
-                        <div
-                          className={cn(
-                            "inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs",
-                            isViewingMissionSeverelyStalled
-                              ? "bg-red-500/10 border-red-500/30 text-red-400"
-                              : "bg-amber-500/10 border-amber-500/30 text-amber-400",
-                          )}
-                          title={
-                            isViewingMissionSeverelyStalled
-                              ? "The agent appears to be stuck on a long-running operation. Consider stopping it."
-                              : "A tool or external operation may be taking longer than expected."
-                          }
-                        >
-                          <AlertTriangle className="h-3 w-3 shrink-0" />
-                          <span className="font-medium">
-                            {isViewingMissionSeverelyStalled
-                              ? "Likely stuck"
-                              : "Idle"}
-                          </span>
-                          <span className="text-white/50 tabular-nums">
-                            {Math.floor(viewingMissionStallSeconds)}s
-                          </span>
-                          <button
-                            onClick={() =>
-                              handleCancelMission(viewingMissionId)
-                            }
-                            className={cn(
-                              "ml-1 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-medium transition-colors",
-                              isViewingMissionSeverelyStalled
-                                ? "border-red-500/30 bg-red-500/15 text-red-400 hover:bg-red-500/25"
-                                : "border-amber-500/30 bg-amber-500/15 text-amber-400 hover:bg-amber-500/25",
-                            )}
-                          >
-                            <Square className="h-3 w-3" />
-                            {isViewingMissionSeverelyStalled
-                              ? "Force stop"
-                              : "Stop"}
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
                   {/* Continue banner for blocked missions */}
                   {activeMission?.status === "blocked" && items.length > 0 && (
                     <div className="flex justify-center py-4">
@@ -11336,6 +11290,20 @@ export default function ControlClient() {
                     />
                   );
                 })()}
+
+                {/* Stall warning bar when the agent hasn't reported activity
+                    for 60+ seconds. Lives in the composer stack with the
+                    GoalBar (same row grammar) instead of floating mid-list. */}
+                {isViewingMissionStalled &&
+                  viewingMissionId &&
+                  !hasPendingUserInput && (
+                    <StallBar
+                      seconds={viewingMissionStallSeconds}
+                      severe={isViewingMissionSeverelyStalled}
+                      onStop={() => handleCancelMission(viewingMissionId)}
+                      className="animate-fade-in"
+                    />
+                  )}
 
                 <form
                   onSubmit={(e) => e.preventDefault()}
