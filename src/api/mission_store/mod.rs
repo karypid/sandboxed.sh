@@ -1340,6 +1340,17 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Get all persisted events for a specific tool call, ordered by
+    /// sequence ASC. Used by lazy history hydration.
+    async fn get_events_for_tool_call(
+        &self,
+        mission_id: Uuid,
+        tool_call_id: &str,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let _ = (mission_id, tool_call_id);
+        Ok(vec![])
+    }
+
     /// Count events for a mission, optionally filtered by type.
     async fn count_events(
         &self,

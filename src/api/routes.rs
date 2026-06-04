@@ -683,6 +683,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::get_mission_events),
         )
         .route(
+            "/api/control/missions/:id/tool-calls/:tool_call_id",
+            get(control::get_mission_tool_call_events),
+        )
+        .route(
             "/api/control/missions/:id/snapshot",
             get(control::get_mission_snapshot),
         )

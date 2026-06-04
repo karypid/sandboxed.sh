@@ -4157,6 +4157,63 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_events_for_tool_call(
+        &self,
+        mission_id: Uuid,
+        tool_call_id: &str,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let tool_call_id = tool_call_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                     FROM mission_events
+                     WHERE mission_id = ?1 AND tool_call_id = ?2
+                     ORDER BY sequence ASC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![&mid, &tool_call_id], |row| {
+                    let content: Option<String> = row.get(8)?;
+                    let content_file: Option<String> = row.get(9)?;
+                    let full_content = SqliteMissionStore::load_content(
+                        content.as_deref(),
+                        content_file.as_deref(),
+                    );
+                    let metadata_str: String = row
+                        .get::<_, Option<String>>(10)?
+                        .unwrap_or_else(|| "{}".to_string());
+                    let mid_str: String = row.get(1)?;
+
+                    Ok(StoredEvent {
+                        id: row.get(0)?,
+                        mission_id: parse_uuid_or_nil(&mid_str),
+                        sequence: row.get(2)?,
+                        event_type: row.get(3)?,
+                        timestamp: row.get(4)?,
+                        event_id: row.get(5)?,
+                        tool_call_id: row.get(6)?,
+                        tool_name: row.get(7)?,
+                        content: full_content,
+                        metadata: serde_json::from_str(&metadata_str)
+                            .unwrap_or(serde_json::json!({})),
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(row.map_err(|e| e.to_string())?);
+            }
+            Ok(events)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {
         let conn = self.conn.clone();
         let mid = mission_id.to_string();
