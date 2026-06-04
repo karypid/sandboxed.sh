@@ -1663,16 +1663,18 @@ function SharedFilePreviewModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm pointer-events-none" />
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm pointer-events-none" />
       <div
         onClick={(e) => e.stopPropagation()}
         className={cn(
-          "relative rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl w-full max-w-4xl",
+          // Full-page reader (viewport minus padding) so the document clearly
+          // sits over the page instead of reading as a chat-width expansion.
+          "relative flex h-full w-full max-w-6xl flex-col rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl",
           "animate-in fade-in zoom-in-95 duration-200",
         )}
       >
@@ -1719,7 +1721,7 @@ function SharedFilePreviewModal({
           </div>
         </div>
 
-        <div className="max-h-[70vh] overflow-auto">
+        <div className="min-h-0 flex-1 overflow-auto">
           {loading ? (
             <div className="p-5">
               <Shimmer />
@@ -1974,15 +1976,22 @@ function SharedFileCard({ file }: { file: SharedFile }) {
         </button>
       </div>
 
-      {previewOpen && canPreview && (
-        <SharedFilePreviewModal
-          file={file}
-          resolvedUrl={resolvedUrl}
-          isApiUrl={isApiUrl}
-          onClose={() => setPreviewOpen(false)}
-          onDownload={() => void handleDownload()}
-        />
-      )}
+      {/* Portal to body: the card lives inside a virtualized row positioned
+          with transform:translateY, which would otherwise trap the modal's
+          position:fixed and render it inside the conversation. */}
+      {previewOpen &&
+        canPreview &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <SharedFilePreviewModal
+            file={file}
+            resolvedUrl={resolvedUrl}
+            isApiUrl={isApiUrl}
+            onClose={() => setPreviewOpen(false)}
+            onDownload={() => void handleDownload()}
+          />,
+          document.body,
+        )}
     </>
   );
 }
