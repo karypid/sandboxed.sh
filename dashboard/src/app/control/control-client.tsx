@@ -3491,7 +3491,7 @@ const ToolCallItem = memo(function ToolCallItem({
 }) {
   const [expanded, setExpanded] = useState(false);
   const isLazy = item.lazy === true;
-  const isDone = isLazy ? item.hasResult === true || item.endTime !== undefined : item.result !== undefined;
+  const isDone = !isLazy && item.result !== undefined;
 
   // Only running tools live-tick (via `<LiveDuration>` below). Done rows
   // freeze on a fixed string; previously every visible done tool subscribed
@@ -3587,7 +3587,8 @@ const ToolCallItem = memo(function ToolCallItem({
           "bg-white/[0.04] border border-white/[0.06]",
           "text-white/40 hover:text-white/60 hover:bg-white/[0.06]",
           "transition-all duration-200",
-          !isDone && "border-amber-500/20",
+          !isDone && !isLazy && "border-amber-500/20",
+          isLazy && "border-white/[0.06]",
           isDone && isCancelled && "border-amber-500/20",
           isDone && !isError && !isCancelled && "border-emerald-500/20",
           isDone && isError && "border-red-500/20",
@@ -3597,7 +3598,8 @@ const ToolCallItem = memo(function ToolCallItem({
           toolName={item.name}
           className={cn(
             "h-3 w-3",
-            !isDone && "animate-pulse text-amber-400",
+            !isDone && !isLazy && "animate-pulse text-amber-400",
+            isLazy && "text-white/40",
             isDone && isCancelled && "text-amber-400",
             isDone && !isError && !isCancelled && "text-emerald-400",
             isDone && isError && "text-red-400",
@@ -3610,30 +3612,34 @@ const ToolCallItem = memo(function ToolCallItem({
           </span>
         )}
         <span className="text-xs text-white/30 ml-1">
-          {isDone ? (
+          {isLazy ? (
+            item.loading ? (
+              "loading"
+            ) : (
+              "hidden"
+            )
+          ) : isDone ? (
             isCancelled ? (
               "cancelled"
             ) : (
               (doneDuration ?? "<1s")
             )
           ) : (
-            isLazy ? (
-              item.loading ? "loading" : "hidden"
-            ) : (
             <>
               <LiveDuration startTime={item.startTime} />
               ...
             </>
-            )
           )}
         </span>
-        {isDone && !isError && !isCancelled && (
+        {!isLazy && isDone && !isError && !isCancelled && (
           <CheckCircle className="h-3 w-3 text-emerald-400" />
         )}
-        {isDone && isCancelled && (
+        {!isLazy && isDone && isCancelled && (
           <XCircle className="h-3 w-3 text-amber-400" />
         )}
-        {isDone && isError && <XCircle className="h-3 w-3 text-red-400" />}
+        {!isLazy && isDone && isError && (
+          <XCircle className="h-3 w-3 text-red-400" />
+        )}
         {!isDone && !isLazy && (
           <Loader className="h-3 w-3 animate-spin text-amber-400" />
         )}
@@ -4858,6 +4864,8 @@ export default function ControlClient() {
           sinceSeq: opts.sinceSeq,
           limit: HISTORY_DELTA_PAGE_SIZE,
           includeCounts: false,
+          profile: "conversation",
+          traceTail: HISTORY_TRACE_TAIL,
         });
         const maxSequence = meta.maxSequence ?? opts.sinceSeq;
         // If the page was capped by `limit`, advance the cursor to the
@@ -4894,6 +4902,8 @@ export default function ControlClient() {
             sinceSeq: cachedTailMaxSequence,
             limit: HISTORY_DELTA_PAGE_SIZE,
             includeCounts: false,
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
           });
           // If the server's max sequence is *behind* what we cached, the
           // mission was reset or replaced server-side and our cache is
@@ -6071,7 +6081,7 @@ export default function ControlClient() {
           (item): item is Extract<ChatItem, { kind: "tool" }> =>
             item.kind === "tool" && item.toolCallId === toolCallId,
         );
-        if (!hydrated) return;
+        if (!hydrated) return false;
 
         const replaceTool = (list: ChatItem[]) =>
           list.map((item) =>
@@ -6086,11 +6096,14 @@ export default function ControlClient() {
           if (!cached) return prev;
           return { ...prev, [missionId]: replaceTool(cached) };
         });
+        return true;
       };
 
       const cached = lazyToolDetailsRef.current.get(cacheKey);
       if (cached) {
-        applyToolEvents(cached);
+        if (!applyToolEvents(cached)) {
+          toast.error("Failed to load tool details");
+        }
         return;
       }
       if (lazyToolDetailsLoadingRef.current.has(cacheKey)) {
@@ -6117,7 +6130,10 @@ export default function ControlClient() {
       try {
         const toolEvents = await getMissionToolCallEvents(missionId, toolCallId);
         lazyToolDetailsRef.current.set(cacheKey, toolEvents);
-        applyToolEvents(toolEvents);
+        if (!applyToolEvents(toolEvents)) {
+          markLoading(false);
+          toast.error("Failed to load tool details");
+        }
       } catch {
         markLoading(false);
         toast.error("Failed to load tool details");

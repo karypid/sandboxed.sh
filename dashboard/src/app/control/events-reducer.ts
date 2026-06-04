@@ -540,6 +540,9 @@ export function eventsToItemsImpl(
             ...toolItem,
             result,
             endTime: timestamp,
+            lazy: false,
+            loading: false,
+            hasResult: true,
           };
         }
         break;

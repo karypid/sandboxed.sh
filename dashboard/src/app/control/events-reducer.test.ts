@@ -129,4 +129,38 @@ describe("eventsToItemsImpl lazy tool stubs", () => {
       }),
     ]);
   });
+
+  it("hydrates a lazy tool row when a full tool_result is replayed", () => {
+    const items = eventsToItemsImpl([
+      {
+        ...storedEvent(1, "tool_stub", "", "2026-05-28T10:00:01Z", {
+          lazy: true,
+          has_result: true,
+        }),
+        tool_call_id: "tool-1",
+        tool_name: "bash",
+      },
+      {
+        ...storedEvent(
+          2,
+          "tool_result",
+          '{"success":false,"error":"boom"}',
+          "2026-05-28T10:00:02Z",
+        ),
+        tool_call_id: "tool-1",
+        tool_name: "bash",
+      },
+    ]);
+
+    expect(items).toEqual([
+      expect.objectContaining({
+        kind: "tool",
+        toolCallId: "tool-1",
+        lazy: false,
+        loading: false,
+        hasResult: true,
+        result: { success: false, error: "boom" },
+      }),
+    ]);
+  });
 });
