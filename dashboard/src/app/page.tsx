@@ -626,8 +626,10 @@ function OverviewPageContent() {
           })}
         </div>
 
-        {/* Stats grid - fixed at bottom */}
-        <div className="flex-shrink-0 grid grid-cols-4 gap-4">
+        {/* Stats grid - fixed at bottom. 2x2 below xl: the center column is
+            squeezed between the kanban and the sidebar, and four cards across
+            truncate their values well before the page's md/lg breakpoints. */}
+        <div className="grid flex-shrink-0 grid-cols-2 gap-3 xl:grid-cols-4 xl:gap-4">
           {statsLoading ? (
             <>
               <ShimmerStat />
