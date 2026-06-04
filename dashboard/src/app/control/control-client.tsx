@@ -76,6 +76,7 @@ import {
   markMissionOpened,
   getMission,
   getMissionEventsWithMeta,
+  getMissionToolCallEvents,
   getMissionSnapshot,
   searchMissionMoments,
   createMission,
@@ -3480,14 +3481,17 @@ const ToolCallItem = memo(function ToolCallItem({
   highlighted = false,
   workspaceId,
   missionId,
+  onLoadDetails,
 }: {
   item: Extract<ChatItem, { kind: "tool" }>;
   highlighted?: boolean;
   workspaceId?: string;
   missionId?: string;
+  onLoadDetails?: (toolCallId: string) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const isDone = item.result !== undefined;
+  const isLazy = item.lazy === true;
+  const isDone = isLazy ? item.hasResult === true || item.endTime !== undefined : item.result !== undefined;
 
   // Only running tools live-tick (via `<LiveDuration>` below). Done rows
   // freeze on a fixed string; previously every visible done tool subscribed
@@ -3509,6 +3513,13 @@ const ToolCallItem = memo(function ToolCallItem({
   );
   const resultStr = resultPreview?.preview ?? null;
   const [resultExpanded, setResultExpanded] = useState(false);
+  const handleToggleExpanded = useCallback(() => {
+    const nextExpanded = !expanded;
+    setExpanded(nextExpanded);
+    if (nextExpanded && isLazy && !item.loading) {
+      void onLoadDetails?.(item.toolCallId);
+    }
+  }, [expanded, isLazy, item.loading, item.toolCallId, onLoadDetails]);
 
   // Memoize cancelled detection - check if tool was cancelled due to mission ending
   const isCancelled = useMemo(() => {
@@ -3570,7 +3581,7 @@ const ToolCallItem = memo(function ToolCallItem({
     >
       {/* Compact header */}
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={handleToggleExpanded}
         className={cn(
           "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
           "bg-white/[0.04] border border-white/[0.06]",
@@ -3606,10 +3617,14 @@ const ToolCallItem = memo(function ToolCallItem({
               (doneDuration ?? "<1s")
             )
           ) : (
+            isLazy ? (
+              item.loading ? "loading" : "hidden"
+            ) : (
             <>
               <LiveDuration startTime={item.startTime} />
               ...
             </>
+            )
           )}
         </span>
         {isDone && !isError && !isCancelled && (
@@ -3619,7 +3634,12 @@ const ToolCallItem = memo(function ToolCallItem({
           <XCircle className="h-3 w-3 text-amber-400" />
         )}
         {isDone && isError && <XCircle className="h-3 w-3 text-red-400" />}
-        {!isDone && <Loader className="h-3 w-3 animate-spin text-amber-400" />}
+        {!isDone && !isLazy && (
+          <Loader className="h-3 w-3 animate-spin text-amber-400" />
+        )}
+        {isLazy && item.loading && (
+          <Loader className="h-3 w-3 animate-spin text-white/40" />
+        )}
         <ChevronDown
           className={cn(
             "h-3 w-3 transition-transform duration-200 ml-1",
@@ -3633,6 +3653,27 @@ const ToolCallItem = memo(function ToolCallItem({
       {expanded && (
         <div className="mt-2">
           <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 space-y-3">
+            {/* Arguments */}
+            {isLazy && (
+              <div className="flex items-center justify-between gap-3 rounded border border-white/[0.06] bg-white/[0.03] px-3 py-2 text-xs text-white/45">
+                <span>
+                  Details hidden
+                  {typeof item.contentBytes === "number" ||
+                  typeof item.resultBytes === "number"
+                    ? ` (${formatBytes((item.contentBytes ?? 0) + (item.resultBytes ?? 0))})`
+                    : ""}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void onLoadDetails?.(item.toolCallId)}
+                  disabled={item.loading}
+                  className="rounded bg-white/[0.06] px-2 py-1 text-[10px] font-medium text-white/70 hover:bg-white/[0.1] disabled:opacity-50"
+                >
+                  {item.loading ? "Loading" : "Load details"}
+                </button>
+              </div>
+            )}
+
             {/* Arguments */}
             {argsStr && (
               <div>
@@ -3741,14 +3782,21 @@ function CollapsedToolGroup({
   tools,
   isExpanded,
   onToggleExpand,
+  measureRow,
   workspaceId,
   missionId,
+  onLoadToolDetails,
 }: {
   tools: Extract<ChatItem, { kind: "tool" }>[];
   isExpanded: boolean;
   onToggleExpand: () => void;
+  /** Synchronously re-measure this group's virtualizer row — part of the
+      anti-flash fix: lets the layout effect below update row offsets in the
+      same pre-paint pass as the scroll adjustment. */
+  measureRow?: (el: HTMLElement) => void;
   workspaceId?: string;
   missionId?: string;
+  onLoadToolDetails?: (toolCallId: string) => Promise<void>;
 }) {
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
@@ -3772,6 +3820,12 @@ function CollapsedToolGroup({
     const anchorTop = anchorTopRef.current;
     if (anchorTop == null) return;
     anchorTopRef.current = null;
+    // Re-measure the virtualizer row *synchronously* so subsequent rows'
+    // offsets and the scroll adjustment land in the same pre-paint pass —
+    // without this the virtualizer re-measures via ResizeObserver after
+    // paint, and the intermediate frame flashes stale row offsets.
+    const rowEl = toggleRef.current?.closest("[data-index]");
+    if (rowEl instanceof HTMLElement) measureRow?.(rowEl);
     const align = () => {
       const el = toggleRef.current;
       if (!el) return;
@@ -3781,16 +3835,11 @@ function CollapsedToolGroup({
       if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
     };
     align();
-    let raf2 = 0;
-    const raf1 = requestAnimationFrame(() => {
-      align();
-      raf2 = requestAnimationFrame(align);
-    });
-    return () => {
-      cancelAnimationFrame(raf1);
-      cancelAnimationFrame(raf2);
-    };
-  }, [isExpanded]);
+    // Single post-paint safety pass; a no-op (read-only) when the
+    // synchronous path above already settled everything.
+    const raf = requestAnimationFrame(align);
+    return () => cancelAnimationFrame(raf);
+  }, [isExpanded, measureRow]);
 
   // Helper to render appropriate tool component
   const renderTool = (tool: Extract<ChatItem, { kind: "tool" }>) => {
@@ -3803,6 +3852,7 @@ function CollapsedToolGroup({
         item={tool}
         workspaceId={workspaceId}
         missionId={missionId}
+        onLoadDetails={onLoadToolDetails}
       />
     );
   };
@@ -3868,6 +3918,7 @@ type ChatItemRowProps = {
   basePath: string | undefined;
   isToolGroupExpanded: boolean;
   onToggleToolGroup: (groupId: string) => void;
+  measureRow?: (el: HTMLElement) => void;
   onResume: () => void;
   onToolResult: (
     toolCallId: string,
@@ -3880,6 +3931,7 @@ type ChatItemRowProps = {
     content: string;
     agent?: string;
   }) => void;
+  onLoadToolDetails?: (toolCallId: string) => Promise<void>;
 };
 
 /**
@@ -3897,10 +3949,12 @@ const ChatItemRow = memo(function ChatItemRow({
   basePath,
   isToolGroupExpanded,
   onToggleToolGroup,
+  measureRow,
   onResume,
   onToolResult,
   onOptimisticToolResult,
   onRetryUserMessage,
+  onLoadToolDetails,
 }: ChatItemRowProps) {
   const renderedContent =
     item.kind === "assistant" && item.sharedFiles?.length
@@ -3926,8 +3980,10 @@ const ChatItemRow = memo(function ChatItemRow({
           tools={item.tools}
           isExpanded={isToolGroupExpanded}
           onToggleExpand={() => onToggleToolGroup(item.groupId)}
+          measureRow={measureRow}
           workspaceId={workspaceId}
           missionId={missionId}
+          onLoadToolDetails={onLoadToolDetails}
         />
       </div>
     );
@@ -4270,6 +4326,7 @@ const ChatItemRow = memo(function ChatItemRow({
           highlighted={highlighted}
           workspaceId={workspaceId}
           missionId={missionId}
+          onLoadDetails={onLoadToolDetails}
         />
       );
     }
@@ -4284,6 +4341,7 @@ const ChatItemRow = memo(function ChatItemRow({
         highlighted={highlighted}
         workspaceId={workspaceId}
         missionId={missionId}
+        onLoadDetails={onLoadToolDetails}
       />
     );
   }
@@ -4777,6 +4835,8 @@ export default function ControlClient() {
    * compare is enough.
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
+  const lazyToolDetailsRef = useRef<Map<string, StoredEvent[]>>(new Map());
+  const lazyToolDetailsLoadingRef = useRef<Set<string>>(new Set());
 
   // Page size for each backwards-paginate-older fetch (the explicit
   // "Load older messages" button / scroll-up). Tuned for memory headroom on
@@ -4784,6 +4844,7 @@ export default function ControlClient() {
   const HISTORY_PAGE_SIZE = 5000;
   const HISTORY_DELTA_PAGE_SIZE = 1000;
   const HISTORY_FALLBACK_PAGE_SIZE = 1000;
+  const HISTORY_TRACE_TAIL = 10;
 
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
@@ -4896,7 +4957,10 @@ export default function ControlClient() {
 
       if (!sorted) {
         try {
-          const snapshot = await getMissionSnapshot(id);
+          const snapshot = await getMissionSnapshot(id, {
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
+          });
           sorted = snapshot.events.sort((a, b) => a.sequence - b.sequence);
           metaMaxSeq = snapshot.latest_sequence;
           metaTotal = snapshot.total_events;
@@ -4905,6 +4969,8 @@ export default function ControlClient() {
           const fallback = await getMissionEventsWithMeta(id, {
             types: HISTORY_EVENT_TYPES,
             limit: HISTORY_FALLBACK_PAGE_SIZE,
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
           });
           sorted = fallback.events.sort((a, b) => a.sequence - b.sequence);
           metaMaxSeq = fallback.meta.maxSequence;
@@ -5119,6 +5185,19 @@ export default function ControlClient() {
   // This is an instance field on the Virtualizer, not part of
   // `useVirtualizer`'s typed options — hence the direct assignment.
   chatVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+  // Anti-flash path for tool-group expansion: measure the row synchronously
+  // AND grow the sizer div in the same pre-paint pass. Without the sizer
+  // bump, scrollTop adjustments larger than the stale scrollHeight allows
+  // get clamped, painting one mis-anchored frame until the virtualizer's
+  // state flush catches up.
+  const measureRowSync = useCallback(
+    (el: HTMLElement) => {
+      chatVirtualizer.measureElement(el);
+      const sizer = el.parentElement;
+      if (sizer) sizer.style.height = `${chatVirtualizer.getTotalSize()}px`;
+    },
+    [chatVirtualizer],
+  );
   const chatAnchorKey = useMemo(
     () =>
       groupedItems
@@ -5978,6 +6057,77 @@ export default function ControlClient() {
     },
     [],
   );
+
+  const handleLoadToolDetails = useCallback(
+    async (toolCallId: string) => {
+      const missionId =
+        viewingMissionRef.current?.id ?? currentMissionRef.current?.id;
+      if (!missionId) return;
+      const cacheKey = `${missionId}::${toolCallId}`;
+
+      const applyToolEvents = (toolEvents: StoredEvent[]) => {
+        const mission = viewingMissionRef.current ?? currentMissionRef.current;
+        const hydrated = eventsToItems(toolEvents, mission).find(
+          (item): item is Extract<ChatItem, { kind: "tool" }> =>
+            item.kind === "tool" && item.toolCallId === toolCallId,
+        );
+        if (!hydrated) return;
+
+        const replaceTool = (list: ChatItem[]) =>
+          list.map((item) =>
+            item.kind === "tool" && item.toolCallId === toolCallId
+              ? { ...hydrated, lazy: false, loading: false }
+              : item,
+          );
+
+        setItems((prev) => replaceTool(prev));
+        setMissionItems((prev) => {
+          const cached = prev[missionId];
+          if (!cached) return prev;
+          return { ...prev, [missionId]: replaceTool(cached) };
+        });
+      };
+
+      const cached = lazyToolDetailsRef.current.get(cacheKey);
+      if (cached) {
+        applyToolEvents(cached);
+        return;
+      }
+      if (lazyToolDetailsLoadingRef.current.has(cacheKey)) {
+        return;
+      }
+      lazyToolDetailsLoadingRef.current.add(cacheKey);
+
+      const markLoading = (loading: boolean) => {
+        const patch = (list: ChatItem[]) =>
+          list.map((item) =>
+            item.kind === "tool" && item.toolCallId === toolCallId
+              ? { ...item, loading }
+              : item,
+          );
+        setItems((prev) => patch(prev));
+        setMissionItems((prev) => {
+          const cachedItems = prev[missionId];
+          if (!cachedItems) return prev;
+          return { ...prev, [missionId]: patch(cachedItems) };
+        });
+      };
+
+      markLoading(true);
+      try {
+        const toolEvents = await getMissionToolCallEvents(missionId, toolCallId);
+        lazyToolDetailsRef.current.set(cacheKey, toolEvents);
+        applyToolEvents(toolEvents);
+      } catch {
+        markLoading(false);
+        toast.error("Failed to load tool details");
+      } finally {
+        lazyToolDetailsLoadingRef.current.delete(cacheKey);
+      }
+    },
+    [eventsToItems, setItems, setMissionItems],
+  );
+
   const eventsWorkerRef = useRef<Worker | null | false>(null);
   const eventsWorkerSeqRef = useRef(0);
   const eventsWorkerPendingRef = useRef(
@@ -6130,6 +6280,8 @@ export default function ControlClient() {
             types: HISTORY_EVENT_TYPES,
             beforeSeq,
             limit: opts?.limit ?? HISTORY_PAGE_SIZE,
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
           });
           if (olderEvents.length === 0) {
             // Same per-mission gate as below — see comment on
@@ -10924,7 +11076,7 @@ export default function ControlClient() {
             <div
               ref={containerRef}
               data-testid="chat-scroll-container"
-              className="flex-1 overflow-y-auto px-6 pt-6 pb-2"
+              className="flex-1 overflow-y-auto px-6 pt-6 pb-2 [overflow-anchor:none]"
             >
               {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
@@ -11092,10 +11244,12 @@ export default function ControlClient() {
                             basePath={missionWorkingDirectory}
                             isToolGroupExpanded={isToolGroupExpanded}
                             onToggleToolGroup={handleToggleToolGroup}
+                            measureRow={measureRowSync}
                             onResume={stableResumeMission}
                             onToolResult={handleToolResultCommit}
                             onOptimisticToolResult={handleOptimisticToolResult}
                             onRetryUserMessage={handleRetryUserMessage}
+                            onLoadToolDetails={handleLoadToolDetails}
                           />
                         </div>
                       );
