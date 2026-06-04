@@ -15,6 +15,7 @@ import {
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { stableJsonCompare } from '@/lib/swr-config';
+import { useToast } from '@/components/toast';
 
 interface ActiveAutomationsProps {
   missions: Mission[];
@@ -98,6 +99,7 @@ export function ActiveAutomations({ missions, runningMissionIds }: ActiveAutomat
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [confirmBulk, setConfirmBulk] = useState(false);
+  const { showError } = useToast();
 
   function exitSelection() {
     setSelecting(false);
@@ -133,11 +135,22 @@ export function ActiveAutomations({ missions, runningMissionIds }: ActiveAutomat
     }
     setBulkBusy(true);
     try {
-      await Promise.all(
-        Array.from(selected).map((id) => deleteAutomation(id).catch(() => null)),
+      const ids = Array.from(selected);
+      const results = await Promise.allSettled(
+        ids.map((id) => deleteAutomation(id)),
       );
+      const failed = ids.filter((_, i) => results[i].status === 'rejected');
       mutate();
-      exitSelection();
+      if (failed.length > 0) {
+        // Keep the failed ids selected so the user can retry just those.
+        setSelected(new Set(failed));
+        setConfirmBulk(false);
+        showError(
+          `Failed to remove ${failed.length} of ${ids.length} automation${ids.length === 1 ? '' : 's'}`,
+        );
+      } else {
+        exitSelection();
+      }
     } finally {
       setBulkBusy(false);
     }
