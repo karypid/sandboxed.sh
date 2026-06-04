@@ -221,7 +221,10 @@ export async function listHermesAssistantSkills(): Promise<HermesSkillsResponse>
 export interface HermesRemoteStatus {
   installed: boolean;
   enabled: boolean;
-  has_key: boolean;
+  /** The API server answers on its loopback port (restart applies pending env). */
+  active: boolean;
+  /** Bearer token for remote connections; auto-provisioned on first read. */
+  key: string | null;
   path: string;
 }
 
@@ -234,10 +237,23 @@ export async function getHermesRemoteStatus(): Promise<HermesRemoteStatus> {
 }
 
 export interface RotateHermesRemoteKeyResult {
-  /** Shown once; not retrievable later. */
   key: string;
   path: string;
   service_restarted: boolean;
+}
+
+export interface ApplyHermesRemoteResult {
+  service_restarted: boolean;
+  active: boolean;
+}
+
+/** Restart the Hermes gateway so a freshly provisioned key takes effect. */
+export async function applyHermesRemote(): Promise<ApplyHermesRemoteResult> {
+  return apiPost<ApplyHermesRemoteResult>(
+    "/api/system/hermes-assistant/remote/apply",
+    {},
+    "Failed to apply Hermes remote settings"
+  );
 }
 
 /** Enable the Hermes API server and rotate its bearer token. */

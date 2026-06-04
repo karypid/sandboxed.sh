@@ -321,6 +321,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/hermes-assistant/remote/key",
             post(rotate_hermes_remote_key),
         )
+        .route("/hermes-assistant/remote/apply", post(apply_hermes_remote))
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
         .route("/deploy", post(deploy_sandboxed_sh))
@@ -1411,58 +1412,157 @@ fn upsert_env_lines(contents: &str, updates: &[(&str, &str)]) -> String {
     out
 }
 
+fn generate_hermes_remote_key() -> String {
+    format!("hsk_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// Upsert the API server lines (key + enable + bind) into every existing
+/// Hermes env file. Returns `false` when no env file exists (not adopted).
+async fn write_hermes_remote_env(runtime_name: &str, port: u16, key: &str) -> Result<bool, String> {
+    let port_str = port.to_string();
+    let updates: [(&str, &str); 4] = [
+        ("API_SERVER_ENABLED", "true"),
+        ("API_SERVER_KEY", key),
+        ("API_SERVER_HOST", "127.0.0.1"),
+        ("API_SERVER_PORT", &port_str),
+    ];
+    let mut touched = false;
+    for env_path in hermes_env_paths(runtime_name) {
+        let Ok(contents) = tokio::fs::read_to_string(&env_path).await else {
+            continue;
+        };
+        write_private_file(&env_path, &upsert_env_lines(&contents, &updates)).await?;
+        touched = true;
+    }
+    Ok(touched)
+}
+
+/// Probe whether the Hermes API server answers on its loopback port. Any
+/// HTTP response (including 401) counts — it proves the server is up.
+async fn hermes_api_server_active(state: &AppState, port: u16) -> bool {
+    state
+        .http_client
+        .get(format!("http://127.0.0.1:{port}/v1/models"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok()
+}
+
 #[derive(Debug, Serialize)]
 pub struct HermesRemoteStatusResponse {
     /// The Hermes gateway env exists (the runtime has been adopted).
     pub installed: bool,
     /// API server lines are present and enabled in the gateway env.
     pub enabled: bool,
-    /// An API_SERVER_KEY is configured (never returned here).
-    pub has_key: bool,
+    /// The API server is answering on its loopback port (a restart applies
+    /// pending env changes when `enabled` is true but `active` is false).
+    pub active: bool,
+    /// The bearer token for remote connections. Readable by design: this is
+    /// a single-admin system and the key already lives in the root-owned env
+    /// file — one-time display would only add friction. Auto-provisioned on
+    /// first read.
+    pub key: Option<String>,
     /// Public path prefix to combine with the dashboard's API base URL.
     pub path: &'static str,
 }
 
 /// GET /api/system/hermes-assistant/remote — remote-access status.
+///
+/// Lazily provisions a key on first read: it is written to the gateway env
+/// (so it survives restarts) but the gateway is only restarted by the
+/// explicit apply/rotate endpoints.
 async fn get_hermes_remote_status(
     State(state): State<Arc<AppState>>,
     Extension(_user): Extension<AuthUser>,
 ) -> Json<HermesRemoteStatusResponse> {
     let runtime_name = assistant_runtime_name(&state.config);
+    let port = hermes_api_server_port(&state.config);
     let [env_path, _] = hermes_env_paths(runtime_name);
     let contents = tokio::fs::read_to_string(&env_path).await.ok();
-    let (enabled, has_key) = contents
-        .as_deref()
-        .map(|c| {
-            (
-                parse_env_value(c, "API_SERVER_ENABLED")
-                    .map(|v| v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false),
-                parse_env_value(c, "API_SERVER_KEY")
-                    .map(|v| !v.trim().is_empty())
-                    .unwrap_or(false),
-            )
-        })
-        .unwrap_or((false, false));
+    let installed = contents.is_some();
+
+    let mut enabled = false;
+    let mut key: Option<String> = None;
+    if let Some(contents) = contents.as_deref() {
+        enabled = parse_env_value(contents, "API_SERVER_ENABLED")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        key = parse_env_value(contents, "API_SERVER_KEY").filter(|v| !v.trim().is_empty());
+        if key.is_none() {
+            // First read: provision a key into the env without restarting
+            // the gateway. "Apply" (or any later restart) activates it.
+            let fresh = generate_hermes_remote_key();
+            match write_hermes_remote_env(runtime_name, port, &fresh).await {
+                Ok(true) => {
+                    enabled = true;
+                    key = Some(fresh);
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!("Failed to provision Hermes remote key: {e}"),
+            }
+        }
+    }
+
+    let active = installed && hermes_api_server_active(&state, port).await;
+
     Json(HermesRemoteStatusResponse {
-        installed: contents.is_some(),
+        installed,
         enabled,
-        has_key,
+        active,
+        key,
         path: HERMES_REMOTE_PATH,
     })
 }
 
 #[derive(Debug, Serialize)]
+pub struct ApplyHermesRemoteResponse {
+    pub service_restarted: bool,
+    /// Whether the API server answered after the restart.
+    pub active: bool,
+}
+
+/// POST /api/system/hermes-assistant/remote/apply — restart the gateway so
+/// pending env changes (a freshly provisioned key) take effect.
+async fn apply_hermes_remote(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+) -> Result<Json<ApplyHermesRemoteResponse>, (StatusCode, String)> {
+    let runtime_name = assistant_runtime_name(&state.config);
+    let service_name = format!("{runtime_name}.service");
+    let port = hermes_api_server_port(&state.config);
+
+    run_host_command("systemctl", &["restart", &service_name])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Give the gateway a moment to bind before probing.
+    let mut active = false;
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        if hermes_api_server_active(&state, port).await {
+            active = true;
+            break;
+        }
+    }
+
+    Ok(Json(ApplyHermesRemoteResponse {
+        service_restarted: true,
+        active,
+    }))
+}
+
+#[derive(Debug, Serialize)]
 pub struct RotateHermesRemoteKeyResponse {
-    /// The new bearer token. Shown once; not retrievable later.
+    /// The new bearer token (also readable later via the status endpoint).
     pub key: String,
     /// Public path prefix to combine with the dashboard's API base URL.
     pub path: &'static str,
     pub service_restarted: bool,
 }
 
-/// POST /api/system/hermes-assistant/remote/key — enable the Hermes API
-/// server and rotate its bearer token. Returns the token once.
+/// POST /api/system/hermes-assistant/remote/key — rotate the bearer token
+/// and restart the gateway so it takes effect immediately.
 async fn rotate_hermes_remote_key(
     State(state): State<Arc<AppState>>,
     Extension(_user): Extension<AuthUser>,
@@ -1470,26 +1570,11 @@ async fn rotate_hermes_remote_key(
     let runtime_name = assistant_runtime_name(&state.config);
     let service_name = format!("{runtime_name}.service");
     let port = hermes_api_server_port(&state.config);
-    let key = format!("hsk_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let key = generate_hermes_remote_key();
 
-    let updates: [(&str, &str); 4] = [
-        ("API_SERVER_ENABLED", "true"),
-        ("API_SERVER_KEY", key.as_str()),
-        ("API_SERVER_HOST", "127.0.0.1"),
-        ("API_SERVER_PORT", &port.to_string()),
-    ];
-
-    let mut touched = false;
-    for env_path in hermes_env_paths(runtime_name) {
-        let Ok(contents) = tokio::fs::read_to_string(&env_path).await else {
-            continue;
-        };
-        let updated = upsert_env_lines(&contents, &updates);
-        write_private_file(&env_path, &updated)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        touched = true;
-    }
+    let touched = write_hermes_remote_env(runtime_name, port, &key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if !touched {
         return Err((
             StatusCode::FAILED_DEPENDENCY,

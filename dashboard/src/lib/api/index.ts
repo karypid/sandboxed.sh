@@ -219,6 +219,8 @@ export {
   getHermesAssistantStatus,
   type HermesRemoteStatus,
   type RotateHermesRemoteKeyResult,
+  type ApplyHermesRemoteResult,
   getHermesRemoteStatus,
   rotateHermesRemoteKey,
+  applyHermesRemote,
 } from "./assistant";

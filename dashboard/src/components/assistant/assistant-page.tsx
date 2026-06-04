@@ -57,11 +57,13 @@ import {
   Copy,
   Check,
   RefreshCw,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from '@/components/toast';
 import { listModelChains, type ModelChain } from '@/lib/api/model-routing';
-import { getHermesRemoteStatus, rotateHermesRemoteKey, type HermesRemoteStatus } from '@/lib/api/assistant';
+import { getHermesRemoteStatus, rotateHermesRemoteKey, applyHermesRemote, type HermesRemoteStatus } from '@/lib/api/assistant';
 import { getRuntimeApiBase } from '@/lib/settings';
 
 const TRIGGER_MODE_LABELS: Record<TelegramTriggerMode, string> = {
@@ -221,10 +223,16 @@ export default function AssistantPage() {
     getHermesRemoteStatus,
     { revalidateOnFocus: false, dedupingInterval: 30000 }
   );
-  const [remoteKey, setRemoteKey] = useState<string | null>(null);
   const [rotatingRemoteKey, setRotatingRemoteKey] = useState(false);
+  const [applyingRemote, setApplyingRemote] = useState(false);
+  const [remoteKeyVisible, setRemoteKeyVisible] = useState(false);
   const [copiedRemoteText, setCopiedRemoteText] = useState<string | null>(null);
   const hermesRemoteUrl = `${getRuntimeApiBase()}${hermesRemote?.path ?? '/hermes-remote'}`;
+  // Key provisioned in the env but the API server isn't answering yet —
+  // a gateway restart (Apply) brings it up.
+  const hermesRemotePending = Boolean(
+    hermesRemote?.installed && hermesRemote?.key && !hermesRemote?.active
+  );
 
   const copyRemoteText = async (text: string) => {
     try {
@@ -238,7 +246,7 @@ export default function AssistantPage() {
 
   const handleRotateRemoteKey = async () => {
     if (
-      hermesRemote?.has_key &&
+      hermesRemote?.key &&
       !confirm(
         'Generate a new remote token? The previous token stops working and the Hermes gateway restarts.'
       )
@@ -247,13 +255,25 @@ export default function AssistantPage() {
     }
     setRotatingRemoteKey(true);
     try {
-      const result = await rotateHermesRemoteKey();
-      setRemoteKey(result.key);
+      await rotateHermesRemoteKey();
       mutateHermesRemote();
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Failed to generate token');
     } finally {
       setRotatingRemoteKey(false);
+    }
+  };
+
+  const handleApplyRemote = async () => {
+    if (!confirm('Restart the Hermes gateway to activate remote access?')) return;
+    setApplyingRemote(true);
+    try {
+      await applyHermesRemote();
+      mutateHermesRemote();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Failed to apply remote settings');
+    } finally {
+      setApplyingRemote(false);
     }
   };
   const hermesSkills = hermesSkillsData?.skills ?? [];
@@ -783,33 +803,53 @@ export default function AssistantPage() {
             <div className="flex items-center gap-2">
               <Globe className="h-4 w-4 text-indigo-400" />
               <p className="text-sm font-medium text-white">Remote Access</p>
-              {hermesRemote?.enabled && hermesRemote?.has_key ? (
+              {hermesRemote?.active ? (
                 <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
-                  enabled
+                  active
+                </span>
+              ) : hermesRemotePending ? (
+                <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
+                  restart to activate
                 </span>
               ) : (
                 <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] font-medium text-white/40">
-                  no token
+                  {hermesRemote?.installed ? 'inactive' : 'runtime not adopted'}
                 </span>
               )}
             </div>
-            <button
-              onClick={handleRotateRemoteKey}
-              disabled={rotatingRemoteKey || !hermesRemote?.installed}
-              className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 transition-colors hover:bg-white/[0.04] disabled:cursor-not-allowed disabled:opacity-50"
-              title={
-                hermesRemote?.installed
-                  ? undefined
-                  : 'Adopt the Hermes runtime first'
-              }
-            >
-              {rotatingRemoteKey ? (
-                <Loader className="h-3 w-3 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3 w-3" />
+            <div className="flex items-center gap-2">
+              {hermesRemotePending && (
+                <button
+                  onClick={handleApplyRemote}
+                  disabled={applyingRemote}
+                  className="flex items-center gap-1.5 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-300 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {applyingRemote ? (
+                    <Loader className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Power className="h-3 w-3" />
+                  )}
+                  Apply (restart gateway)
+                </button>
               )}
-              {hermesRemote?.has_key ? 'Rotate token' : 'Generate token'}
-            </button>
+              <button
+                onClick={handleRotateRemoteKey}
+                disabled={rotatingRemoteKey || !hermesRemote?.installed}
+                className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 transition-colors hover:bg-white/[0.04] disabled:cursor-not-allowed disabled:opacity-50"
+                title={
+                  hermesRemote?.installed
+                    ? undefined
+                    : 'Adopt the Hermes runtime first'
+                }
+              >
+                {rotatingRemoteKey ? (
+                  <Loader className="h-3 w-3 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3 w-3" />
+                )}
+                Rotate token
+              </button>
+            </div>
           </div>
           <p className="mt-1 text-xs text-white/45">
             Connect the Hermes desktop app in proxy mode: platform I/O stays local, agent work runs here.
@@ -841,23 +881,42 @@ export default function AssistantPage() {
               </button>
             </div>
           </div>
-          {remoteKey && (
-            <div className="mt-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3">
-              <p className="mb-1 text-[10px] text-emerald-400/80">
-                Copy this token now. It won&apos;t be shown again
-              </p>
-              <div className="flex items-center gap-2">
-                <code className="flex-1 break-all font-mono text-xs text-emerald-300">{remoteKey}</code>
-                <button
-                  onClick={() => copyRemoteText(remoteKey)}
-                  className="flex-shrink-0 rounded-md p-1.5 text-emerald-400/60 transition-colors hover:bg-white/[0.04] hover:text-emerald-300"
-                >
-                  {copiedRemoteText === remoteKey ? (
-                    <Check className="h-3.5 w-3.5" />
-                  ) : (
-                    <Copy className="h-3.5 w-3.5" />
-                  )}
-                </button>
+          {hermesRemote?.key && (
+            <div className="mt-2 rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-2">
+              <div className="flex items-center justify-between">
+                <div className="min-w-0 flex-1">
+                  <span className="text-[10px] uppercase tracking-wider text-white/30">Token (GATEWAY_PROXY_KEY)</span>
+                  <p className="mt-0.5 truncate font-mono text-xs text-white/60">
+                    {remoteKeyVisible
+                      ? hermesRemote.key
+                      : `${hermesRemote.key.slice(0, 8)}${'•'.repeat(24)}`}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  <button
+                    onClick={() => setRemoteKeyVisible((v) => !v)}
+                    className="rounded-md p-1.5 text-white/20 transition-colors hover:bg-white/[0.04] hover:text-white/60"
+                    title={remoteKeyVisible ? 'Hide token' : 'Reveal token'}
+                  >
+                    {remoteKeyVisible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </button>
+                  <button
+                    onClick={() => copyRemoteText(hermesRemote.key!)}
+                    className={cn(
+                      'rounded-md p-1.5 transition-colors',
+                      copiedRemoteText === hermesRemote.key
+                        ? 'text-emerald-400'
+                        : 'text-white/20 hover:bg-white/[0.04] hover:text-white/60'
+                    )}
+                    title="Copy token"
+                  >
+                    {copiedRemoteText === hermesRemote.key ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                  </button>
+                </div>
               </div>
             </div>
           )}
