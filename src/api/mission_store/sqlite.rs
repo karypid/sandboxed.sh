@@ -4214,6 +4214,45 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_recent_tool_call_ids(
+        &self,
+        mission_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let limit = limit as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT tool_call_id
+                     FROM mission_events
+                     WHERE mission_id = ?1
+                       AND tool_call_id IS NOT NULL
+                       AND event_type IN ('tool_call', 'tool_result')
+                     GROUP BY tool_call_id
+                     ORDER BY MAX(sequence) DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![&mid, limit], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.map_err(|e| e.to_string())?);
+            }
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {
         let conn = self.conn.clone();
         let mid = mission_id.to_string();

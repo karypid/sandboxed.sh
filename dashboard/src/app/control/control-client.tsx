@@ -9916,11 +9916,35 @@ export default function ControlClient() {
             const deltaItems = eventsToItems(deltaEvents, mission);
             setItems((prev) => {
               const existingIds = new Set(prev.map((it) => it.id));
+              const deltaItemsById = new Map(
+                deltaItems.map((item) => [item.id, item]),
+              );
+              let changed = false;
+              const updated = prev.map((item) => {
+                const incoming = deltaItemsById.get(item.id);
+                if (
+                  item.kind === "tool" &&
+                  incoming?.kind === "tool" &&
+                  incoming.lazy === true
+                ) {
+                  changed = true;
+                  return {
+                    ...item,
+                    lazy: true,
+                    loading: false,
+                    hasResult: incoming.hasResult,
+                    contentBytes: incoming.contentBytes,
+                    resultBytes: incoming.resultBytes,
+                    endTime: incoming.endTime ?? item.endTime,
+                  };
+                }
+                return item;
+              });
               const additions = deltaItems.filter(
                 (it) => !existingIds.has(it.id),
               );
-              if (additions.length === 0) return prev;
-              const merged = [...prev, ...additions];
+              if (!changed && additions.length === 0) return prev;
+              const merged = [...updated, ...additions];
               adjustVisibleItemsLimit(merged);
               updateMissionItems(missionId, merged);
               return merged;

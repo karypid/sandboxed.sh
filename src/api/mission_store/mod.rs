@@ -1351,6 +1351,18 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Get the most recent distinct tool call ids for a mission, ordered by
+    /// their latest event sequence descending. Used to keep conversation
+    /// profile trace tails stable across paged event responses.
+    async fn get_recent_tool_call_ids(
+        &self,
+        mission_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        let _ = (mission_id, limit);
+        Ok(vec![])
+    }
+
     /// Count events for a mission, optionally filtered by type.
     async fn count_events(
         &self,

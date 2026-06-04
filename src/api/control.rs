@@ -4807,7 +4807,7 @@ fn conversation_profile_enabled(profile: Option<&str>) -> bool {
 
 fn project_conversation_events(
     events: Vec<mission_store::StoredEvent>,
-    trace_tail: usize,
+    keep_full_tool_call_ids: &HashSet<String>,
 ) -> Vec<mission_store::StoredEvent> {
     if events.is_empty() {
         return events;
@@ -4843,17 +4843,6 @@ fn project_conversation_events(
         }
     }
 
-    let mut tool_tail: Vec<(String, i64)> = pairs
-        .iter()
-        .map(|(tool_call_id, pair)| (tool_call_id.clone(), pair.latest_sequence))
-        .collect();
-    tool_tail.sort_by_key(|(_, sequence)| std::cmp::Reverse(*sequence));
-    let keep_full: HashSet<String> = tool_tail
-        .into_iter()
-        .take(trace_tail)
-        .map(|(tool_call_id, _)| tool_call_id)
-        .collect();
-
     let mut projected = Vec::with_capacity(events.len());
     for mut event in events {
         if !matches!(event.event_type.as_str(), "tool_call" | "tool_result") {
@@ -4864,7 +4853,7 @@ fn project_conversation_events(
             projected.push(event);
             continue;
         };
-        if keep_full.contains(&tool_call_id) {
+        if keep_full_tool_call_ids.contains(&tool_call_id) {
             projected.push(event);
             continue;
         }
@@ -4960,10 +4949,17 @@ pub async fn get_mission_events(
         EventSummary::unchanged(events)
     };
     if conversation_profile_enabled(query.profile.as_deref()) {
-        summary.events = project_conversation_events(
-            summary.events,
-            query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
-        );
+        let keep_full_tool_call_ids: HashSet<String> = control
+            .mission_store
+            .get_recent_tool_call_ids(
+                mission_id,
+                query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .collect();
+        summary.events = project_conversation_events(summary.events, &keep_full_tool_call_ids);
         summary.summarized_count = summary.events.len();
     }
 
@@ -5240,10 +5236,17 @@ pub async fn get_mission_snapshot(
         EventSummary::unchanged(events)
     };
     if conversation_profile_enabled(query.profile.as_deref()) {
-        summary.events = project_conversation_events(
-            summary.events,
-            query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
-        );
+        let keep_full_tool_call_ids: HashSet<String> = control
+            .mission_store
+            .get_recent_tool_call_ids(
+                mission_id,
+                query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .collect();
+        summary.events = project_conversation_events(summary.events, &keep_full_tool_call_ids);
         summary.summarized_count = summary.events.len();
     }
     let event_counts = control
@@ -15182,7 +15185,8 @@ mod tests {
             stored_test_event(mission_id, 6, "assistant_message", None, "done"),
         ];
 
-        let projected = project_conversation_events(events, 1);
+        let keep_full_tool_call_ids = HashSet::from(["tool-2".to_string()]);
+        let projected = project_conversation_events(events, &keep_full_tool_call_ids);
 
         assert_eq!(
             projected
@@ -15209,6 +15213,30 @@ mod tests {
         assert_eq!(
             stub.metadata["call_content_bytes"],
             serde_json::json!("{\"cmd\":\"old\"}".len())
+        );
+    }
+
+    #[test]
+    fn conversation_projection_uses_global_keep_full_set() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![
+            stored_test_event(mission_id, 20, "tool_call", Some("older-page-newest"), "{}"),
+            stored_test_event(
+                mission_id,
+                21,
+                "tool_result",
+                Some("older-page-newest"),
+                "{\"ok\":true}",
+            ),
+        ];
+
+        let projected = project_conversation_events(events, &HashSet::new());
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].event_type, "tool_stub");
+        assert_eq!(
+            projected[0].tool_call_id.as_deref(),
+            Some("older-page-newest")
         );
     }
 
