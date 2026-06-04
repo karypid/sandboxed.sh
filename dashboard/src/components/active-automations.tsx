@@ -379,7 +379,9 @@ function AutomationRow({
               {mission.status}
             </span>
           )}
-          <span className="flex-shrink-0 text-[rgb(var(--foreground)/0.25)]">·</span>
+          {(stale || mission) && (
+            <span className="flex-shrink-0 text-[rgb(var(--foreground)/0.25)]">·</span>
+          )}
           <span className="whitespace-nowrap" title={automation.created_at}>
             {ageLabel(automation.created_at)}
           </span>
