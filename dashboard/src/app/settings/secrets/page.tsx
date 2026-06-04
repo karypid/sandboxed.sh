@@ -463,7 +463,7 @@ export default function SecretsPage() {
             </p>
           </div>
         ) : (
-          <form onSubmit={handleChangePassword} className="space-y-4 max-w-md">
+          <form onSubmit={handleChangePassword} className="space-y-4">
             {!hasExistingPassword && (
               <div className="rounded-lg bg-blue-500/5 border border-blue-500/10 p-3">
                 <p className="flex items-center gap-2 text-xs text-blue-400">
@@ -474,78 +474,87 @@ export default function SecretsPage() {
               </div>
             )}
 
-            {requireCurrentPassword && (
+            <div
+              className={cn(
+                'grid gap-4',
+                requireCurrentPassword ? 'sm:grid-cols-3' : 'sm:grid-cols-2'
+              )}
+            >
+              {requireCurrentPassword && (
+                <div>
+                  <label className="block text-xs font-medium text-white/60 mb-1.5">
+                    Current Password
+                  </label>
+                  <input
+                    type="password"
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    className="w-full rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-sm text-white placeholder-white/30 focus:border-white/20 focus:outline-none focus:ring-1 focus:ring-white/20"
+                    placeholder="Current password"
+                    required
+                  />
+                </div>
+              )}
+
               <div>
-                <label className="block text-sm font-medium text-white/70 mb-1.5">
-                  Current Password
+                <label className="block text-xs font-medium text-white/60 mb-1.5">
+                  New Password
                 </label>
                 <input
                   type="password"
-                  value={currentPassword}
-                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
                   className="w-full rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-sm text-white placeholder-white/30 focus:border-white/20 focus:outline-none focus:ring-1 focus:ring-white/20"
-                  placeholder="Enter current password"
+                  placeholder="At least 8 characters"
+                  minLength={8}
                   required
                 />
               </div>
-            )}
 
-            <div>
-              <label className="block text-sm font-medium text-white/70 mb-1.5">
-                New Password
-              </label>
-              <input
-                type="password"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                className="w-full rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-sm text-white placeholder-white/30 focus:border-white/20 focus:outline-none focus:ring-1 focus:ring-white/20"
-                placeholder="At least 8 characters"
-                minLength={8}
-                required
-              />
+              <div>
+                <label className="block text-xs font-medium text-white/60 mb-1.5">
+                  Confirm New Password
+                </label>
+                <input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  className="w-full rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-sm text-white placeholder-white/30 focus:border-white/20 focus:outline-none focus:ring-1 focus:ring-white/20"
+                  placeholder="Repeat new password"
+                  minLength={8}
+                  required
+                />
+                {confirmPassword && newPassword !== confirmPassword && (
+                  <p className="mt-1 text-xs text-red-400">Passwords do not match</p>
+                )}
+              </div>
             </div>
 
-            <div>
-              <label className="block text-sm font-medium text-white/70 mb-1.5">
-                Confirm New Password
-              </label>
-              <input
-                type="password"
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                className="w-full rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-sm text-white placeholder-white/30 focus:border-white/20 focus:outline-none focus:ring-1 focus:ring-white/20"
-                placeholder="Confirm new password"
-                minLength={8}
-                required
-              />
-              {confirmPassword && newPassword !== confirmPassword && (
-                <p className="mt-1 text-xs text-red-400">Passwords do not match</p>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="submit"
+                disabled={savingPassword || !newPassword || newPassword !== confirmPassword || newPassword.length < 8}
+                className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {savingPassword ? (
+                  <>
+                    <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Lock className="h-4 w-4" />
+                    {hasExistingPassword ? 'Update Password' : 'Set Password'}
+                  </>
+                )}
+              </button>
+
+              {authStatus?.password_source === 'environment' && (
+                <p className="text-xs text-white/30">
+                  Setting a dashboard password will take priority over the <code className="rounded bg-white/[0.06] px-1 py-0.5 font-mono">DASHBOARD_PASSWORD</code> environment variable.
+                </p>
               )}
             </div>
-
-            <button
-              type="submit"
-              disabled={savingPassword || !newPassword || newPassword !== confirmPassword || newPassword.length < 8}
-              className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {savingPassword ? (
-                <>
-                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Lock className="h-4 w-4" />
-                  {hasExistingPassword ? 'Update Password' : 'Set Password'}
-                </>
-              )}
-            </button>
-
-            {authStatus?.password_source === 'environment' && (
-              <p className="text-xs text-white/30">
-                Setting a dashboard password will take priority over the <code className="rounded bg-white/[0.06] px-1 py-0.5 font-mono">DASHBOARD_PASSWORD</code> environment variable.
-              </p>
-            )}
           </form>
         )}
       </div>
