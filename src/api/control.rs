@@ -4847,7 +4847,7 @@ fn project_conversation_events(
         .iter()
         .map(|(tool_call_id, pair)| (tool_call_id.clone(), pair.latest_sequence))
         .collect();
-    tool_tail.sort_by(|a, b| b.1.cmp(&a.1));
+    tool_tail.sort_by_key(|(_, sequence)| std::cmp::Reverse(*sequence));
     let keep_full: HashSet<String> = tool_tail
         .into_iter()
         .take(trace_tail)
