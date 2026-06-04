@@ -610,6 +610,23 @@ CREATE TABLE IF NOT EXISTS telegram_channels (
 CREATE INDEX IF NOT EXISTS idx_telegram_channels_mission ON telegram_channels(mission_id);
 CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_channels_bot_token ON telegram_channels(bot_token);
+
+-- Token usage from the OpenAI-compatible /v1 router (external clients:
+-- assistant gateways, IDEs with proxy keys, ...). Mission usage lives in
+-- mission_events metadata; both sources are merged by the usage summary.
+CREATE TABLE IF NOT EXISTS proxy_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_cents INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_proxy_usage_timestamp ON proxy_usage(timestamp);
+CREATE INDEX IF NOT EXISTS idx_proxy_usage_model ON proxy_usage(model);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -4790,6 +4807,159 @@ impl MissionStore for SqliteMissionStore {
             entry.cost_cents = entry.cost_cents.saturating_add(cost_cents);
         }
         Ok(by_hour.into_values().collect())
+    }
+
+    async fn record_proxy_usage(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_cents: u64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO proxy_usage (timestamp, model, input_tokens, output_tokens, cost_cents)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                chrono::Utc::now().to_rfc3339(),
+                model,
+                input_tokens as i64,
+                output_tokens as i64,
+                cost_cents as i64,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn get_proxy_usage_by_model(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<ModelUsageStats>, String> {
+        let conn = self.conn.lock().await;
+        // Models are normalized and costs finalized at write time, so plain
+        // SQL aggregation is enough (unlike mission_events, which re-derives
+        // both from stored metadata on read).
+        let base_query = r#"
+            SELECT
+                model,
+                COUNT(*) AS requests,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(cache_creation_tokens) AS cache_creation_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens,
+                SUM(cost_cents) AS cost_cents
+            FROM proxy_usage
+        "#;
+        let sql = match since {
+            Some(_) => format!("{base_query} WHERE timestamp >= ?1 GROUP BY model"),
+            None => format!("{base_query} GROUP BY model"),
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let since_owned = since.map(|s| s.to_string());
+        let params: Vec<&dyn rusqlite::ToSql> = match since_owned.as_ref() {
+            Some(s) => vec![s],
+            None => vec![],
+        };
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(ModelUsageStats {
+                    model: row.get(0)?,
+                    requests: row.get::<_, i64>(1)?.max(0) as u64,
+                    input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                    cache_creation_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                    cost_cents: row.get::<_, i64>(6)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get_proxy_usage_by_day(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<DailyUsageStats>, String> {
+        let conn = self.conn.lock().await;
+        let base_query = r#"
+            SELECT
+                substr(timestamp, 1, 10) AS day,
+                COUNT(*) AS requests,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens,
+                SUM(cost_cents) AS cost_cents
+            FROM proxy_usage
+        "#;
+        let sql = match since {
+            Some(_) => format!("{base_query} WHERE timestamp >= ?1 GROUP BY day ORDER BY day ASC"),
+            None => format!("{base_query} GROUP BY day ORDER BY day ASC"),
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let since_owned = since.map(|s| s.to_string());
+        let params: Vec<&dyn rusqlite::ToSql> = match since_owned.as_ref() {
+            Some(s) => vec![s],
+            None => vec![],
+        };
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(DailyUsageStats {
+                    day: row.get(0)?,
+                    requests: row.get::<_, i64>(1)?.max(0) as u64,
+                    input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    cost_cents: row.get::<_, i64>(5)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get_proxy_usage_by_hour(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<HourlyUsageStats>, String> {
+        let conn = self.conn.lock().await;
+        let base_query = r#"
+            SELECT
+                substr(timestamp, 1, 13) AS hour,
+                COUNT(*) AS requests,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens,
+                SUM(cost_cents) AS cost_cents
+            FROM proxy_usage
+        "#;
+        let sql = match since {
+            Some(_) => {
+                format!("{base_query} WHERE timestamp >= ?1 GROUP BY hour ORDER BY hour ASC")
+            }
+            None => format!("{base_query} GROUP BY hour ORDER BY hour ASC"),
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let since_owned = since.map(|s| s.to_string());
+        let params: Vec<&dyn rusqlite::ToSql> = match since_owned.as_ref() {
+            Some(s) => vec![s],
+            None => vec![],
+        };
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(HourlyUsageStats {
+                    hour: row.get(0)?,
+                    requests: row.get::<_, i64>(1)?.max(0) as u64,
+                    input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    cost_cents: row.get::<_, i64>(5)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     async fn create_automation(&self, automation: Automation) -> Result<Automation, String> {
@@ -12740,5 +12910,60 @@ mod tests {
             ids.contains(&preserved_active_id),
             "active harness_loop row represents an in-progress loop and must survive"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_usage_records_and_aggregates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+
+        store
+            .record_proxy_usage("gpt-oss-120b", 1_000, 200, 3)
+            .await
+            .expect("record 1");
+        store
+            .record_proxy_usage("gpt-oss-120b", 500, 100, 2)
+            .await
+            .expect("record 2");
+        store
+            .record_proxy_usage("zai-glm-4.7", 50, 10, 1)
+            .await
+            .expect("record 3");
+
+        let by_model = store
+            .get_proxy_usage_by_model(None)
+            .await
+            .expect("by model");
+        assert_eq!(by_model.len(), 2);
+        let gpt = by_model
+            .iter()
+            .find(|m| m.model == "gpt-oss-120b")
+            .expect("gpt row");
+        assert_eq!(gpt.requests, 2);
+        assert_eq!(gpt.input_tokens, 1_500);
+        assert_eq!(gpt.output_tokens, 300);
+        assert_eq!(gpt.cost_cents, 5);
+
+        // All three rows were written "now", so they share one day/hour bucket.
+        let by_day = store.get_proxy_usage_by_day(None).await.expect("by day");
+        assert_eq!(by_day.len(), 1);
+        assert_eq!(by_day[0].requests, 3);
+        assert_eq!(by_day[0].input_tokens, 1_550);
+        assert_eq!(by_day[0].cost_cents, 6);
+
+        let by_hour = store.get_proxy_usage_by_hour(None).await.expect("by hour");
+        assert_eq!(by_hour.len(), 1);
+        assert_eq!(by_hour[0].requests, 3);
+        assert_eq!(by_hour[0].hour.len(), "2026-06-04T10".len());
+
+        // A `since` in the future excludes everything.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let filtered = store
+            .get_proxy_usage_by_model(Some(&future))
+            .await
+            .expect("filtered");
+        assert!(filtered.is_empty());
     }
 }

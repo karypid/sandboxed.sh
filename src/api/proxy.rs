@@ -386,6 +386,53 @@ fn parse_direct_model_entry(model: &str) -> Option<crate::provider_health::Chain
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Usage accounting
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Persist one routed /v1 request's token usage into the single-tenant user's
+/// mission store so the providers usage page counts router traffic alongside
+/// mission usage. Cost is a list-price estimate from the upstream model id.
+async fn record_proxy_usage(
+    state: &Arc<super::routes::AppState>,
+    model_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) {
+    let model = crate::cost::normalized_model(model_id);
+    let usage = crate::cost::TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    };
+    let cost_cents = crate::cost::cost_cents_from_usage(&model, &usage);
+    let user = super::auth::implicit_single_tenant_user(&state.config);
+    let control_state = state.control.get_or_spawn(&user).await;
+    if let Err(error) = control_state
+        .mission_store
+        .record_proxy_usage(&model, input_tokens, output_tokens, cost_cents)
+        .await
+    {
+        tracing::warn!(%error, model = %model, "Failed to record proxy usage");
+    }
+}
+
+/// Build the usage callback handed to [`track_stream_health`]: streaming
+/// responses only learn their token counts when the final SSE event arrives,
+/// inside the stream wrapper, where neither `state` nor the model are in
+/// scope.
+fn proxy_usage_sink(
+    state: Arc<super::routes::AppState>,
+    model_id: String,
+) -> Box<dyn FnOnce(u64, u64) + Send> {
+    Box::new(move |input_tokens, output_tokens| {
+        tokio::spawn(async move {
+            record_proxy_usage(&state, &model_id, input_tokens, output_tokens).await;
+        });
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Handler
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -873,6 +920,7 @@ async fn chat_completions(
                     account_id,
                     None,
                     entry.subscription_key.clone(),
+                    Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
                 );
 
                 let success_provider = entry.provider_id.clone();
@@ -1053,6 +1101,7 @@ async fn chat_completions(
                     .health_tracker
                     .record_token_usage(entry.account_id, input, output)
                     .await;
+                record_proxy_usage(&state, &entry.model_id, input, output).await;
             }
             let success_provider = entry.provider_id.clone();
             for evt in &mut pending_fallback_events {
@@ -1111,6 +1160,7 @@ async fn chat_completions(
                     account_id,
                     None,
                     entry.subscription_key.clone(),
+                    Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
                 );
 
                 let success_provider = entry.provider_id.clone();
@@ -1280,6 +1330,7 @@ async fn chat_completions(
                     .health_tracker
                     .record_token_usage(entry.account_id, input, output)
                     .await;
+                record_proxy_usage(&state, &entry.model_id, input, output).await;
             }
             let success_provider = entry.provider_id.clone();
             for evt in &mut pending_fallback_events {
@@ -1592,6 +1643,7 @@ async fn chat_completions(
                 account_id,
                 rate_limit_snapshot,
                 entry.subscription_key.clone(),
+                Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
             );
 
             return (status, response_headers, Body::from_stream(tracked_stream)).into_response();
@@ -1679,6 +1731,7 @@ async fn chat_completions(
                                     .health_tracker
                                     .record_token_usage(entry.account_id, input, output)
                                     .await;
+                                record_proxy_usage(&state, &entry.model_id, input, output).await;
                             }
                         }
                     }
@@ -2579,6 +2632,7 @@ fn track_stream_health(
     account_id: uuid::Uuid,
     rate_limit_snapshot: Option<crate::provider_health::RateLimitSnapshot>,
     subscription_key: Option<crate::provider_health::SubscriptionKey>,
+    usage_sink: Option<Box<dyn FnOnce(u64, u64) + Send>>,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut stream = std::pin::pin!(inner);
@@ -2657,6 +2711,9 @@ fn track_stream_health(
                 .await;
             if input_tokens > 0 || output_tokens > 0 {
                 health_tracker.record_token_usage(account_id, input_tokens, output_tokens).await;
+                if let Some(sink) = usage_sink {
+                    sink(input_tokens, output_tokens);
+                }
             }
             if let Some(snapshot) = rate_limit_snapshot {
                 health_tracker.record_rate_limits(account_id, snapshot).await;
@@ -4835,7 +4892,7 @@ mod tests {
             yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from("never sent"));
         };
 
-        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None);
+        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None, None);
         let mut tracked = std::pin::pin!(tracked);
 
         // First chunk should pass through immediately.
@@ -4874,7 +4931,7 @@ mod tests {
             }
         };
 
-        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None);
+        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None, None);
         let mut tracked = std::pin::pin!(tracked);
         let mut count = 0;
         while let Some(item) = tracked.next().await {

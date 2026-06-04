@@ -1429,6 +1429,43 @@ pub trait MissionStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Record one OpenAI-compatible /v1 router request's token usage.
+    /// `model` should already be normalized (see `crate::cost::normalized_model`).
+    async fn record_proxy_usage(
+        &self,
+        _model: &str,
+        _input_tokens: u64,
+        _output_tokens: u64,
+        _cost_cents: u64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Aggregate /v1 router usage per model. Merged with mission usage by the
+    /// usage summary endpoint.
+    async fn get_proxy_usage_by_model(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<ModelUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate /v1 router usage per UTC day.
+    async fn get_proxy_usage_by_day(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<DailyUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate /v1 router usage per UTC hour (`YYYY-MM-DDTHH`).
+    async fn get_proxy_usage_by_hour(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<HourlyUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
     // === Automation methods (default no-op for backward compatibility) ===
 
     /// Create an automation for a mission.
