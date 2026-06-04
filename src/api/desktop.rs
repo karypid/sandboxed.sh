@@ -563,11 +563,16 @@ async fn is_wayland_session_running(display: &str, working_dir: &std::path::Path
             }
         }
     }
-    let runtime_dir = working_dir
+    // No (valid) session file: fall back to probing the compositor socket.
+    // A bare existence check would report ghost sessions after Sway exits
+    // without cleanup, so actually connect — a stale socket file with no
+    // listener refuses the connection.
+    let socket = working_dir
         .join(".sandboxed-sh")
         .join("wayland")
-        .join(display_num.to_string());
-    runtime_dir.join("wayland-1").exists()
+        .join(display_num.to_string())
+        .join("wayland-1");
+    tokio::net::UnixStream::connect(&socket).await.is_ok()
 }
 
 /// Check if Xvfb is running on a specific display. Legacy-session fallback.

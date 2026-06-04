@@ -182,6 +182,26 @@ fn run_with_wayland(
     Ok((stdout, stderr, exit_code))
 }
 
+/// wlrctl `pointer move` applies *relative* displacements. Emulate absolute
+/// positioning by first clamping the cursor to the top-left output corner
+/// with a large negative move, then offsetting by the target coordinates.
+fn wlrctl_move_absolute(env: &WaylandEnv, x: i64, y: i64) -> Result<(), String> {
+    let (_, stderr, exit_code) =
+        run_with_wayland(env, "wlrctl", &["pointer", "move", "-20000", "-20000"])?;
+    if exit_code != 0 {
+        return Err(format!("wlrctl pointer move failed: {}", stderr));
+    }
+    let (_, stderr, exit_code) = run_with_wayland(
+        env,
+        "wlrctl",
+        &["pointer", "move", &x.to_string(), &y.to_string()],
+    )?;
+    if exit_code != 0 {
+        return Err(format!("wlrctl pointer move failed: {}", stderr));
+    }
+    Ok(())
+}
+
 fn write_sway_config(path: &std::path::Path, resolution: &str) -> Result<(), String> {
     let config = format!(
         r#"output * resolution {resolution}
@@ -672,14 +692,13 @@ fn tool_click(args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_i64())
         .ok_or("Missing 'y' argument")?;
 
+    // wlrctl `pointer click` takes button names, not numeric ids.
     let button = match args
         .get("button")
         .and_then(|v| v.as_str())
         .unwrap_or("left")
     {
-        "left" => "1",
-        "middle" => "2",
-        "right" => "3",
+        name @ ("left" | "middle" | "right") => name,
         other => return Err(format!("Invalid button: {}", other)),
     };
 
@@ -692,14 +711,7 @@ fn tool_click(args: &Value) -> Result<String, String> {
     let wayland_env = wayland_env_for_display(display_id)?;
 
     // Move to position first
-    let x_str = x.to_string();
-    let y_str = y.to_string();
-    let (_, stderr, exit_code) =
-        run_with_wayland(&wayland_env, "wlrctl", &["pointer", "move", &x_str, &y_str])?;
-
-    if exit_code != 0 {
-        return Err(format!("wlrctl pointer move failed: {}", stderr));
-    }
+    wlrctl_move_absolute(&wayland_env, x, y)?;
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
@@ -741,15 +753,8 @@ fn tool_mouse_move(args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_i64())
         .ok_or("Missing 'y' argument")?;
 
-    let x_str = x.to_string();
-    let y_str = y.to_string();
     let wayland_env = wayland_env_for_display(display_id)?;
-    let (_, stderr, exit_code) =
-        run_with_wayland(&wayland_env, "wlrctl", &["pointer", "move", &x_str, &y_str])?;
-
-    if exit_code != 0 {
-        return Err(format!("wlrctl pointer move failed: {}", stderr));
-    }
+    wlrctl_move_absolute(&wayland_env, x, y)?;
 
     Ok(format!("{{\"success\": true, \"x\": {}, \"y\": {}}}", x, y))
 }
@@ -776,22 +781,16 @@ fn tool_scroll(args: &Value) -> Result<String, String> {
         args.get("x").and_then(|v| v.as_i64()),
         args.get("y").and_then(|v| v.as_i64()),
     ) {
-        let x_str = x.to_string();
-        let y_str = y.to_string();
-        let (_, stderr, exit_code) =
-            run_with_wayland(&wayland_env, "wlrctl", &["pointer", "move", &x_str, &y_str])?;
-
-        if exit_code != 0 {
-            return Err(format!("wlrctl pointer move failed: {}", stderr));
-        }
-
+        wlrctl_move_absolute(&wayland_env, x, y)?;
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
+    // wlrctl syntax is `pointer scroll <dy> <dx>` (numeric deltas); the
+    // "vertical"/"horizontal" keywords are not part of its CLI.
     let (_, stderr, exit_code) = run_with_wayland(
         &wayland_env,
         "wlrctl",
-        &["pointer", "scroll", "vertical", &amount.to_string()],
+        &["pointer", "scroll", &amount.to_string(), "0"],
     )?;
     if exit_code != 0 {
         return Err(format!("wlrctl scroll failed: {}", stderr));

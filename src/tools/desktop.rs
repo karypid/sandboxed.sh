@@ -111,6 +111,28 @@ async fn run_with_wayland(
     Ok((stdout, stderr, exit_code))
 }
 
+/// wlrctl `pointer move` applies *relative* displacements. Emulate absolute
+/// positioning by first clamping the cursor to the top-left output corner
+/// with a large negative move, then offsetting by the target coordinates.
+async fn wlrctl_move_absolute(env: &WaylandEnv, x: i64, y: i64) -> anyhow::Result<()> {
+    let (_, stderr, exit_code) =
+        run_with_wayland(env, "wlrctl", &["pointer", "move", "-20000", "-20000"], 10).await?;
+    if exit_code != 0 {
+        return Err(anyhow::anyhow!("wlrctl pointer move failed: {}", stderr));
+    }
+    let (_, stderr, exit_code) = run_with_wayland(
+        env,
+        "wlrctl",
+        &["pointer", "move", &x.to_string(), &y.to_string()],
+        10,
+    )
+    .await?;
+    if exit_code != 0 {
+        return Err(anyhow::anyhow!("wlrctl pointer move failed: {}", stderr));
+    }
+    Ok(())
+}
+
 fn write_sway_config(path: &Path, resolution: &str) -> anyhow::Result<()> {
     let config = format!(
         r#"output * resolution {resolution}
@@ -809,10 +831,9 @@ impl Tool for Click {
             .as_i64()
             .ok_or_else(|| anyhow::anyhow!("Missing 'y' argument"))?;
 
+        // wlrctl `pointer click` takes button names, not numeric ids.
         let button = match args["button"].as_str().unwrap_or("left") {
-            "left" => "1",
-            "middle" => "2",
-            "right" => "3",
+            name @ ("left" | "middle" | "right") => name,
             other => return Err(anyhow::anyhow!("Invalid button: {}", other)),
         };
 
@@ -822,17 +843,7 @@ impl Tool for Click {
         tracing::info!(display = %display_id, x = x, y = y, button = button, "Clicking");
 
         let wayland_env = wayland_env_for_display(display_id, _working_dir)?;
-        let (_, stderr, exit_code) = run_with_wayland(
-            &wayland_env,
-            "wlrctl",
-            &["pointer", "move", &x.to_string(), &y.to_string()],
-            10,
-        )
-        .await?;
-
-        if exit_code != 0 {
-            return Err(anyhow::anyhow!("wlrctl pointer move failed: {}", stderr));
-        }
+        wlrctl_move_absolute(&wayland_env, x, y).await?;
         for _ in 0..repeat.parse::<usize>().unwrap_or(1) {
             let (_, stderr, exit_code) =
                 run_with_wayland(&wayland_env, "wlrctl", &["pointer", "click", button], 10).await?;
@@ -1115,17 +1126,7 @@ impl Tool for MouseMove {
         tracing::info!(display = %display_id, x = x, y = y, "Moving mouse");
 
         let wayland_env = wayland_env_for_display(display_id, _working_dir)?;
-        let (_, stderr, exit_code) = run_with_wayland(
-            &wayland_env,
-            "wlrctl",
-            &["pointer", "move", &x.to_string(), &y.to_string()],
-            10,
-        )
-        .await?;
-
-        if exit_code != 0 {
-            return Err(anyhow::anyhow!("wlrctl pointer move failed: {}", stderr));
-        }
+        wlrctl_move_absolute(&wayland_env, x, y).await?;
 
         Ok(format!("{{\"success\": true, \"x\": {}, \"y\": {}}}", x, y))
     }
@@ -1182,27 +1183,18 @@ impl Tool for Scroll {
 
         // Move to position if specified
         if let (Some(x), Some(y)) = (args["x"].as_i64(), args["y"].as_i64()) {
-            let (_, stderr, exit_code) = run_with_wayland(
-                &wayland_env,
-                "wlrctl",
-                &["pointer", "move", &x.to_string(), &y.to_string()],
-                10,
-            )
-            .await?;
-
-            if exit_code != 0 {
-                return Err(anyhow::anyhow!("wlrctl pointer move failed: {}", stderr));
-            }
-
+            wlrctl_move_absolute(&wayland_env, x, y).await?;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         tracing::info!(display = %display_id, amount = amount, "Scrolling");
 
+        // wlrctl syntax is `pointer scroll <dy> <dx>` (numeric deltas); the
+        // "vertical"/"horizontal" keywords are not part of its CLI.
         let (_, stderr, exit_code) = run_with_wayland(
             &wayland_env,
             "wlrctl",
-            &["pointer", "scroll", "vertical", &amount.to_string()],
+            &["pointer", "scroll", &amount.to_string(), "0"],
             10,
         )
         .await?;

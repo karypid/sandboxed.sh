@@ -434,10 +434,29 @@ fn command_with_wayland_env(program: &str, env: &WaylandSessionEnv) -> Command {
     cmd
 }
 
+/// wlrctl `pointer click` only accepts button names (left/right/middle/...),
+/// numeric ids make it die with "Unknown button".
+fn wlrctl_button_name(button: u8) -> &'static str {
+    match button {
+        2 => "middle",
+        3 => "right",
+        _ => "left",
+    }
+}
+
+/// wlrctl `pointer move` applies *relative* displacements. Emulate absolute
+/// positioning by first clamping the cursor to the top-left output corner
+/// with a large negative move, then offsetting by the target coordinates.
 async fn run_wlrctl_mouse_move(env: &WaylandSessionEnv, x: i32, y: i32) -> anyhow::Result<()> {
+    run_wlrctl(env, &["pointer", "move", "-20000", "-20000"]).await?;
     run_wlrctl(env, &["pointer", "move", &x.to_string(), &y.to_string()]).await
 }
 
+/// wlrctl has no press/release primitives (only `pointer click`), so true
+/// drags cannot be synthesized. Degrade gracefully: button-down moves the
+/// cursor to the press point, button-up moves to the release point and
+/// emits a click there. Hold-to-click keeps working; drags collapse into a
+/// click at the release position instead of erroring.
 async fn run_wlrctl_mouse_button(
     env: &WaylandSessionEnv,
     x: i32,
@@ -446,8 +465,10 @@ async fn run_wlrctl_mouse_button(
     is_down: bool,
 ) -> anyhow::Result<()> {
     run_wlrctl_mouse_move(env, x, y).await?;
-    let action = if is_down { "down" } else { "up" };
-    run_wlrctl(env, &["pointer", "button", &button.to_string(), action]).await
+    if is_down {
+        return Ok(());
+    }
+    run_wlrctl(env, &["pointer", "click", wlrctl_button_name(button)]).await
 }
 
 async fn run_wlrctl_click(
@@ -460,7 +481,7 @@ async fn run_wlrctl_click(
     let repeat = if double_click { 2 } else { 1 };
     run_wlrctl_mouse_move(env, x, y).await?;
     for idx in 0..repeat {
-        run_wlrctl(env, &["pointer", "click", &button.to_string()]).await?;
+        run_wlrctl(env, &["pointer", "click", wlrctl_button_name(button)]).await?;
         if idx + 1 < repeat {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
@@ -482,23 +503,18 @@ async fn run_wlrctl_scroll_steps(
         run_wlrctl_mouse_move(env, x, y).await?;
     }
 
-    if steps_y != 0 {
-        run_wlrctl(
-            env,
-            &["pointer", "scroll", "vertical", &steps_y.to_string()],
-        )
-        .await?;
-    }
-
-    if steps_x != 0 {
-        run_wlrctl(
-            env,
-            &["pointer", "scroll", "horizontal", &steps_x.to_string()],
-        )
-        .await?;
-    }
-
-    Ok(())
+    // wlrctl syntax is `pointer scroll <dy> <dx>` (numeric deltas); the
+    // "vertical"/"horizontal" keywords are not part of its CLI.
+    run_wlrctl(
+        env,
+        &[
+            "pointer",
+            "scroll",
+            &steps_y.to_string(),
+            &steps_x.to_string(),
+        ],
+    )
+    .await
 }
 
 async fn run_wtype_type(
