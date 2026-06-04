@@ -292,7 +292,11 @@ async fn cleanup_stopped_sessions(State(state): State<Arc<AppState>>) -> Json<Op
                 continue;
             }
 
-            let display_server = session.display_server.as_deref().unwrap_or("wayland");
+            // Sessions created since the Wayland migration always record
+            // display_server explicitly; a missing field means a legacy
+            // Xvfb session, so default to x11 or the liveness check would
+            // look for a Wayland socket that never existed and prune it.
+            let display_server = session.display_server.as_deref().unwrap_or("x11");
             if is_desktop_session_running(
                 &session.display,
                 display_server,
@@ -386,10 +390,11 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
     // Collect sessions from missions
     for mission in missions {
         for session in &mission.desktop_sessions {
+            // Missing field ⇒ legacy Xvfb session (see prune loop above).
             let display_server_value = session
                 .display_server
                 .clone()
-                .unwrap_or_else(|| "wayland".to_string());
+                .unwrap_or_else(|| "x11".to_string());
             let process_running = is_desktop_session_running(
                 &session.display,
                 &display_server_value,
