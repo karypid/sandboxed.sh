@@ -2045,30 +2045,17 @@ function ThinkingGroupItem({
   );
 
   const hasActiveItem = items.some((item) => !item.done);
-  const [expanded, setExpanded] = useState(hasActiveItem);
-  const hasAutoCollapsedRef = useRef(false);
+  // Collapsed by default, including while active: the transcript shows one
+  // compact pill ("Thinking for 12s") that matches the tool-call rows'
+  // height, instead of auto-expanding into a tall content card. Live
+  // reasoning is one click away here or in the Thinking side panel.
+  const [expanded, setExpanded] = useState(false);
 
   // Get the earliest start time and latest end time
   const startTime = Math.min(...items.map((item) => item.startTime));
   const endTime = items.every((item) => item.done && item.endTime)
     ? Math.max(...items.map((item) => item.endTime || item.startTime))
     : undefined;
-
-  // Auto-collapse when all thinking is done
-  useEffect(() => {
-    if (!hasActiveItem && expanded && !hasAutoCollapsedRef.current) {
-      const duration = Math.floor((Date.now() - startTime) / 1000);
-      if (duration > 30) {
-        hasAutoCollapsedRef.current = true;
-        return;
-      }
-      const timer = setTimeout(() => {
-        setExpanded(false);
-        hasAutoCollapsedRef.current = true;
-      }, 1500);
-      return () => clearTimeout(timer);
-    }
-  }, [hasActiveItem, expanded, startTime]);
 
   // Only the active branch ticks once per second via `<LiveDuration>`.
   // When the group is fully done, we render a fixed string and never
@@ -2078,8 +2065,11 @@ function ThinkingGroupItem({
       ? formatDuration(Math.floor((endTime - startTime) / 1000))
       : null;
 
-  // If no non-empty items, don't render anything
-  if (nonEmptyItems.length === 0) {
+  // Nothing to show only when there is no content AND nothing in flight.
+  // An active group with still-empty content keeps its liveness pill —
+  // previously it rendered nothing, which also suppressed the "Agent is
+  // working" pill and left a dead gap in the transcript.
+  if (nonEmptyItems.length === 0 && !hasActiveItem) {
     return null;
   }
 
