@@ -217,4 +217,8 @@ export {
   searchAssistantGatewayMemory,
   adoptHermesAssistant,
   getHermesAssistantStatus,
+  type HermesRemoteStatus,
+  type RotateHermesRemoteKeyResult,
+  getHermesRemoteStatus,
+  rotateHermesRemoteKey,
 } from "./assistant";

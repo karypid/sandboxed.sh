@@ -615,6 +615,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         // WebSocket system monitoring uses subprotocol-based auth
         .route("/api/monitoring/ws", get(monitoring::monitoring_ws))
+        // Hermes remote access: pass-through to the host Hermes API server so
+        // a desktop Hermes can connect via GATEWAY_PROXY_URL/GATEWAY_PROXY_KEY.
+        // Auth is the API_SERVER_KEY bearer token enforced by Hermes itself.
+        .route(
+            "/hermes-remote/*path",
+            axum::routing::any(system_api::hermes_remote_proxy)
+                .layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+        )
         // OpenAI-compatible proxy endpoint (bearer token auth via SANDBOXED_PROXY_SECRET).
         // LLM payloads with tool outputs and long contexts can exceed the default 2MB
         // body limit, so set a generous 50MB limit for proxy routes.

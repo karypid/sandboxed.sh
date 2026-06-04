@@ -217,3 +217,34 @@ export async function listHermesAssistantSkills(): Promise<HermesSkillsResponse>
     "Failed to fetch Hermes assistant skills"
   );
 }
+
+export interface HermesRemoteStatus {
+  installed: boolean;
+  enabled: boolean;
+  has_key: boolean;
+  path: string;
+}
+
+/** Remote-access status for the Hermes API server (desktop proxy mode). */
+export async function getHermesRemoteStatus(): Promise<HermesRemoteStatus> {
+  return apiGet<HermesRemoteStatus>(
+    "/api/system/hermes-assistant/remote",
+    "Failed to fetch Hermes remote status"
+  );
+}
+
+export interface RotateHermesRemoteKeyResult {
+  /** Shown once; not retrievable later. */
+  key: string;
+  path: string;
+  service_restarted: boolean;
+}
+
+/** Enable the Hermes API server and rotate its bearer token. */
+export async function rotateHermesRemoteKey(): Promise<RotateHermesRemoteKeyResult> {
+  return apiPost<RotateHermesRemoteKeyResult>(
+    "/api/system/hermes-assistant/remote/key",
+    {},
+    "Failed to generate Hermes remote token"
+  );
+}

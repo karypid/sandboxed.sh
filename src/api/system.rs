@@ -316,6 +316,11 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(list_hermes_assistant_skills),
         )
         .route("/hermes-assistant/stop", post(stop_hermes_assistant))
+        .route("/hermes-assistant/remote", get(get_hermes_remote_status))
+        .route(
+            "/hermes-assistant/remote/key",
+            post(rotate_hermes_remote_key),
+        )
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
         .route("/deploy", post(deploy_sandboxed_sh))
@@ -1355,6 +1360,232 @@ async fn rollback_legacy_gateway(
 /// Name prefix for proxy keys provisioned for the Hermes gateway.
 const HERMES_PROXY_KEY_PREFIX: &str = "Hermes Assistant";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Hermes remote access (desktop-app proxy mode)
+//
+// Hermes' split setup: a local/desktop Hermes handles platform I/O and
+// delegates agent work to a remote Hermes API server by setting
+// `GATEWAY_PROXY_URL` + `GATEWAY_PROXY_KEY`. The remote side is the host
+// gateway's OpenAI-compatible API server (`API_SERVER_*` env), which binds
+// 127.0.0.1 and is re-exposed publicly through `/hermes-remote/*` below.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Public path prefix under which the Hermes API server is re-exposed.
+pub const HERMES_REMOTE_PATH: &str = "/hermes-remote";
+
+/// Loopback port for the Hermes API server. Dev gets its own port so both
+/// runtimes can run on one host.
+fn hermes_api_server_port(config: &crate::config::Config) -> u16 {
+    if assistant_runtime_name(config).ends_with("-dev") {
+        8643
+    } else {
+        8642
+    }
+}
+
+fn hermes_env_paths(runtime_name: &str) -> [String; 2] {
+    [
+        format!("/etc/sandboxed-sh/{runtime_name}.env"),
+        format!("/var/lib/{runtime_name}/.env"),
+    ]
+}
+
+/// Replace-or-append `KEY='value'` lines in an env file body.
+fn upsert_env_lines(contents: &str, updates: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for line in contents.lines() {
+        let key = line
+            .trim()
+            .split_once('=')
+            .map(|(k, _)| k.trim())
+            .unwrap_or("");
+        if updates.iter().any(|(k, _)| *k == key) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    for (key, value) in updates {
+        out.push_str(&env_line(key, value));
+    }
+    out
+}
+
+#[derive(Debug, Serialize)]
+pub struct HermesRemoteStatusResponse {
+    /// The Hermes gateway env exists (the runtime has been adopted).
+    pub installed: bool,
+    /// API server lines are present and enabled in the gateway env.
+    pub enabled: bool,
+    /// An API_SERVER_KEY is configured (never returned here).
+    pub has_key: bool,
+    /// Public path prefix to combine with the dashboard's API base URL.
+    pub path: &'static str,
+}
+
+/// GET /api/system/hermes-assistant/remote — remote-access status.
+async fn get_hermes_remote_status(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+) -> Json<HermesRemoteStatusResponse> {
+    let runtime_name = assistant_runtime_name(&state.config);
+    let [env_path, _] = hermes_env_paths(runtime_name);
+    let contents = tokio::fs::read_to_string(&env_path).await.ok();
+    let (enabled, has_key) = contents
+        .as_deref()
+        .map(|c| {
+            (
+                parse_env_value(c, "API_SERVER_ENABLED")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+                parse_env_value(c, "API_SERVER_KEY")
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false),
+            )
+        })
+        .unwrap_or((false, false));
+    Json(HermesRemoteStatusResponse {
+        installed: contents.is_some(),
+        enabled,
+        has_key,
+        path: HERMES_REMOTE_PATH,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateHermesRemoteKeyResponse {
+    /// The new bearer token. Shown once; not retrievable later.
+    pub key: String,
+    /// Public path prefix to combine with the dashboard's API base URL.
+    pub path: &'static str,
+    pub service_restarted: bool,
+}
+
+/// POST /api/system/hermes-assistant/remote/key — enable the Hermes API
+/// server and rotate its bearer token. Returns the token once.
+async fn rotate_hermes_remote_key(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthUser>,
+) -> Result<Json<RotateHermesRemoteKeyResponse>, (StatusCode, String)> {
+    let runtime_name = assistant_runtime_name(&state.config);
+    let service_name = format!("{runtime_name}.service");
+    let port = hermes_api_server_port(&state.config);
+    let key = format!("hsk_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+
+    let updates: [(&str, &str); 4] = [
+        ("API_SERVER_ENABLED", "true"),
+        ("API_SERVER_KEY", key.as_str()),
+        ("API_SERVER_HOST", "127.0.0.1"),
+        ("API_SERVER_PORT", &port.to_string()),
+    ];
+
+    let mut touched = false;
+    for env_path in hermes_env_paths(runtime_name) {
+        let Ok(contents) = tokio::fs::read_to_string(&env_path).await else {
+            continue;
+        };
+        let updated = upsert_env_lines(&contents, &updates);
+        write_private_file(&env_path, &updated)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        touched = true;
+    }
+    if !touched {
+        return Err((
+            StatusCode::FAILED_DEPENDENCY,
+            "Hermes gateway env not found — adopt the assistant runtime first".to_string(),
+        ));
+    }
+
+    let service_restarted = run_host_command("systemctl", &["restart", &service_name])
+        .await
+        .map(|_| true)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to restart {service_name} after key rotation: {e}");
+            false
+        });
+
+    Ok(Json(RotateHermesRemoteKeyResponse {
+        key,
+        path: HERMES_REMOTE_PATH,
+        service_restarted,
+    }))
+}
+
+/// Public pass-through for the Hermes API server (`/hermes-remote/*`).
+///
+/// No dashboard JWT here by design: the desktop app authenticates with the
+/// `API_SERVER_KEY` bearer token, which the Hermes API server itself enforces
+/// (it refuses to start without one).
+pub async fn hermes_remote_proxy(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let port = hermes_api_server_port(&state.config);
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let suffix = path_and_query
+        .strip_prefix(HERMES_REMOTE_PATH)
+        .unwrap_or("");
+    let target = format!(
+        "http://127.0.0.1:{port}{}",
+        if suffix.is_empty() { "/" } else { suffix }
+    );
+
+    let method = req.method().clone();
+    let mut headers = req.headers().clone();
+    for hop in [
+        axum::http::header::HOST,
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::header::CONNECTION,
+        axum::http::header::TRANSFER_ENCODING,
+    ] {
+        headers.remove(hop);
+    }
+
+    let body = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response(),
+    };
+
+    match state
+        .http_client
+        .request(method, &target)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(upstream) => {
+            let status = upstream.status();
+            let mut response_headers = upstream.headers().clone();
+            for hop in [
+                axum::http::header::CONTENT_LENGTH,
+                axum::http::header::CONNECTION,
+                axum::http::header::TRANSFER_ENCODING,
+            ] {
+                response_headers.remove(hop);
+            }
+            (
+                status,
+                response_headers,
+                axum::body::Body::from_stream(upstream.bytes_stream()),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("Hermes API server unreachable: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Get the proxy API key for the Hermes gateway, reusing the key already
 /// wired into the gateway env when it is still registered; otherwise mint a
 /// fresh one. Either way, revoke any other "Hermes Assistant" keys so
@@ -1519,6 +1750,23 @@ async fn adopt_hermes_assistant(
         env.push_str("GATEWAY_ALLOW_ALL_USERS=true\n");
     }
     env.push_str("HERMES_ASSISTANT_MCP_COMMAND=/usr/local/bin/assistant-mcp\n");
+
+    // Preserve remote access (desktop proxy mode) across adoptions: keep the
+    // existing API_SERVER_KEY so connected desktop apps don't break.
+    let existing_env = tokio::fs::read_to_string(&env_path)
+        .await
+        .unwrap_or_default();
+    if let Some(api_server_key) =
+        parse_env_value(&existing_env, "API_SERVER_KEY").filter(|v| !v.trim().is_empty())
+    {
+        env.push_str(&env_line("API_SERVER_ENABLED", "true"));
+        env.push_str(&env_line("API_SERVER_KEY", &api_server_key));
+        env.push_str(&env_line("API_SERVER_HOST", "127.0.0.1"));
+        env.push_str(&env_line(
+            "API_SERVER_PORT",
+            &hermes_api_server_port(&state.config).to_string(),
+        ));
+    }
 
     write_private_file(&env_path, &env)
         .await
