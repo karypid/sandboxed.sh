@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(:root[data-theme="dark"] *));
+
 /* Terminal font (JetBrainsMono Nerd Font Mono) */
 @font-face {
   font-family: "JetBrainsMono Nerd Font Mono";

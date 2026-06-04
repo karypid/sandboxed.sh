@@ -155,7 +155,7 @@ import {
   Code,
   FolderOpen,
   Trash2,
-  Monitor,
+  AppWindow,
   HelpCircle,
   PanelRightClose,
   PanelRight,
@@ -5157,6 +5157,18 @@ export default function ControlClient() {
     hasDesktopSessionRef.current = hasDesktopSession;
   }, [hasDesktopSession]);
 
+  const selectedDesktopSession = useMemo(
+    () =>
+      desktopSessions.find((session) => session.display === desktopDisplayId) ??
+      null,
+    [desktopDisplayId, desktopSessions],
+  );
+  const selectedDesktopBackend = (
+    selectedDesktopSession?.display_server ?? "wayland"
+  ).toLowerCase();
+  const selectedStreamLabel =
+    selectedDesktopBackend === "wayland" ? "App Surface" : "Legacy Surface";
+
   useEffect(() => {
     // Only auto-show when transitioning from no active thinking to active thinking
     if (
@@ -6688,21 +6700,29 @@ export default function ControlClient() {
         const activeMission =
           viewingMissionRef.current ?? currentMissionRef.current;
         const activeMissionId = activeMission?.id;
+        const activeMissionIsRunning =
+          !!activeMissionId &&
+          runningMissionsRef.current.some(
+            (mission) =>
+              mission.mission_id === activeMissionId &&
+              mission.state !== "finished",
+          );
 
         // Only auto-open for sessions belonging to the current mission.
         // When expecting a desktop session (ToolCall detected but no ToolResult yet),
         // also include unattributed sessions (mission_id is null) since the backend
-        // background task may not have attributed them yet.
+        // background task may not have attributed them yet. A running mission can
+        // also adopt unattributed sessions discovered by the dev backend's Xvfb scan.
         const expecting = expectingDesktopSessionRef.current;
         const currentMissionSessions = activeMissionId
           ? runningSessions.filter(
               (s) =>
                 s.mission_id === activeMissionId ||
-                (expecting && !s.mission_id),
+                ((expecting || activeMissionIsRunning) && !s.mission_id),
             )
           : expecting
             ? runningSessions.filter((s) => !s.mission_id)
-            : [];
+            : runningSessions.filter((s) => !s.mission_id);
         const hasCurrentMissionSession = currentMissionSessions.length > 0;
 
         // Auto-select first active session from current mission if current display isn't running anywhere
@@ -10517,9 +10537,9 @@ export default function ControlClient() {
               )}
             </button>
 
-            {/* Desktop stream toggle with display selector - only shown when a desktop session is active */}
+            {/* Stream toggle with display selector - only shown when a streamable session is active */}
             {hasDesktopSession && (
-              <div className="relative flex items-center">
+              <div className="relative flex items-center" data-testid="app-stream-toggle">
                 <button
                   onClick={() => setShowDesktopStream(!showDesktopStream)}
                   className={cn(
@@ -10530,12 +10550,12 @@ export default function ControlClient() {
                   )}
                   title={
                     showDesktopStream
-                      ? "Hide desktop stream"
-                      : "Show desktop stream"
+                      ? `Hide ${selectedStreamLabel.toLowerCase()}`
+                      : `Show ${selectedStreamLabel.toLowerCase()}`
                   }
                 >
-                  <Monitor className="h-4 w-4" />
-                  <span className="hidden lg:inline">Desktop</span>
+                  <AppWindow className="h-4 w-4" />
+                  <span className="hidden lg:inline">{selectedStreamLabel}</span>
                   {showDesktopStream ? (
                     <PanelRightClose className="h-4 w-4" />
                   ) : (
@@ -10551,7 +10571,7 @@ export default function ControlClient() {
                         ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
                         : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
                     )}
-                    title="Select display"
+                    title="Select app surface"
                   >
                     <span className="text-sm font-mono">
                       {desktopDisplayId}
@@ -10559,7 +10579,15 @@ export default function ControlClient() {
                     <ChevronDown className="h-3.5 w-3.5" />
                   </button>
                   {showDisplaySelector && (
-                    <div className="absolute right-0 top-full mt-1 z-50 min-w-[280px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                    <div className="absolute right-0 top-full mt-1 z-50 min-w-[320px] overflow-hidden rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                      <div className="border-b border-white/[0.06] px-3 py-2">
+                        <div className="text-xs font-medium text-white/75">
+                          App surfaces
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-white/35">
+                          One interactive window stream per running app.
+                        </div>
+                      </div>
                       {/* Show sessions from API if available, otherwise show hardcoded list */}
                       {desktopSessions.length > 0 ? (
                         <>
@@ -10599,16 +10627,27 @@ export default function ControlClient() {
                                   }
                                 />
 
-                                {/* Display ID */}
-                                <span
-                                  className={cn(
-                                    "font-mono",
-                                    desktopDisplayId === session.display
-                                      ? "text-emerald-400"
-                                      : "text-white/70",
-                                  )}
-                                >
-                                  {session.display}
+                                <span className="flex min-w-0 flex-1 flex-col">
+                                  <span
+                                    className={cn(
+                                      "truncate leading-tight",
+                                      desktopDisplayId === session.display
+                                        ? "text-emerald-400"
+                                        : "text-white/70",
+                                    )}
+                                  >
+                                    {session.mission_title || session.display}
+                                  </span>
+                                  <span className="truncate text-[11px] leading-tight text-white/35">
+                                    <span className="font-mono">
+                                      {session.display}
+                                    </span>
+                                    {" - "}
+                                    {(session.display_server ?? "wayland").toUpperCase()}
+                                    {session.compositor
+                                      ? ` / ${session.compositor.toUpperCase()}`
+                                      : ""}
+                                  </span>
                                 </span>
 
                                 {/* Status label */}
@@ -10752,13 +10791,16 @@ export default function ControlClient() {
                               setShowDisplaySelector(false);
                             }}
                             className={cn(
-                              "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
+                              "flex w-full items-center px-3 py-2 text-sm transition-colors hover:bg-white/[0.04]",
                               desktopDisplayId === display
                                 ? "text-emerald-400"
                                 : "text-white/70",
                             )}
                           >
-                            {display}
+                            <span className="font-mono">{display}</span>
+                            <span className="ml-2 text-[11px] text-white/35">
+                              App surface ready
+                            </span>
                             {desktopDisplayId === display && (
                               <CheckCircle className="ml-auto h-3.5 w-3.5" />
                             )}
@@ -11371,13 +11413,16 @@ export default function ControlClient() {
           {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
           {(showWorkbenchPanel || showThinkingPanel || showDesktopStream) && (
             <div
+              data-testid="right-side-panel"
               className={cn(
                 // animate-fade-in is opacity-only and cheap; we drop the
                 // `transition-all duration-300` that was animating width on
                 // mount (the width change is what caused the chat-side reflow
                 // freeze when toggling the Workers panel).
                 "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
-                showDesktopStream ? "flex-1 max-w-md" : "w-80",
+                showDesktopStream
+                  ? "basis-auto w-[clamp(400px,44vw,820px)] h-[min(720px,calc(100vh-7rem))] min-h-[420px] min-w-[360px] max-h-[calc(100vh-7rem)] max-w-[820px] resize overflow-hidden"
+                  : "w-80",
               )}
             >
               {showWorkbenchPanel && (
@@ -11435,7 +11480,7 @@ export default function ControlClient() {
                 />
               )}
 
-              {/* Desktop Stream Panel */}
+              {/* App Stream Panel */}
               {showDesktopStream && (
                 <div
                   className={cn(
@@ -11445,6 +11490,8 @@ export default function ControlClient() {
                 >
                   <DesktopStream
                     displayId={desktopDisplayId}
+                    displayServer={selectedDesktopSession?.display_server}
+                    compositor={selectedDesktopSession?.compositor}
                     className="h-full"
                     onClose={() => setShowDesktopStream(false)}
                   />
