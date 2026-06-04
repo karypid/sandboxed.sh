@@ -3811,7 +3811,8 @@ function CollapsedToolGroup({
   // the toggle row and the last tool keep their position relative to the
   // conversation below and auto-scroll isn't disturbed by content growing
   // toward the bottom. Chevrons follow: collapsed points up (reveal above),
-  // expanded points down (collapse away).
+  // expanded points right (neutral "fold away", not a direction the
+  // content grows in).
   if (isExpanded) {
     return (
       <div className="space-y-2">
@@ -3826,7 +3827,7 @@ function CollapsedToolGroup({
             "transition-all duration-200 text-xs",
           )}
         >
-          <ChevronDown className="h-3 w-3" />
+          <ChevronRight className="h-3 w-3" />
           <span>
             Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
           </span>
