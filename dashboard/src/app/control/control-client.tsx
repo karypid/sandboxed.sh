@@ -7075,35 +7075,50 @@ export default function ControlClient() {
   // goal state first (Codex: thread/goal/clear), then we flip any goal-loop
   // automation row inactive and clear the local goal info so the bar
   // disappears immediately.
-  const handleExitGoal = useCallback(async (missionId: string) => {
-    try {
-      const automations = await listMissionAutomations(missionId).catch(
-        () => [],
-      );
-      const goalRow = automations.find(
-        (a) => a.active && a.command_source?.type === "native_loop",
-      );
-      await cancelMission(missionId);
-      if (goalRow) {
-        try {
-          await updateAutomation(goalRow.id, { active: false });
-        } catch {
-          // The observer flips it inactive when the harness emits the
-          // aborted GoalStatus; local failure here is non-fatal.
+  const handleExitGoal = useCallback(
+    async (missionId: string, running: boolean) => {
+      try {
+        const automations = await listMissionAutomations(missionId).catch(
+          () => [],
+        );
+        const goalRow = automations.find(
+          (a) => a.active && a.command_source?.type === "native_loop",
+        );
+        if (running) {
+          // Mid-turn: cancellation lets native harnesses clear their goal
+          // state first (Codex: thread/goal/clear), then interrupts the turn.
+          await cancelMission(missionId);
         }
+        // Idle (or belt-and-braces while running): deactivate the loop row so
+        // the next agent_finished hook doesn't re-fire the continuation. No
+        // cancelMission here when idle — an idle mission shouldn't get marked
+        // interrupted just because the user ended its goal loop.
+        if (goalRow) {
+          try {
+            await updateAutomation(goalRow.id, { active: false });
+          } catch {
+            // The observer flips it inactive when the harness emits the
+            // aborted GoalStatus; local failure here is non-fatal.
+          }
+        }
+        setGoalInfoByMission((prev) => {
+          const next = { ...prev };
+          delete next[missionId];
+          return next;
+        });
+        toast.success(
+          running
+            ? "Goal loop stopped; current turn interrupted"
+            : "Goal loop ended",
+        );
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Failed to exit goal loop",
+        );
       }
-      setGoalInfoByMission((prev) => {
-        const next = { ...prev };
-        delete next[missionId];
-        return next;
-      });
-      toast.success("Goal loop stop requested");
-    } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Failed to exit goal loop",
-      );
-    }
-  }, []);
+    },
+    [],
+  );
 
   // Handle cancelling a parallel mission
   const handleCancelMission = async (missionId: string) => {
@@ -11575,9 +11590,10 @@ export default function ControlClient() {
                     <GoalBar
                       objective={goal.objective}
                       statusLabel={statusLabel}
+                      running={isBusy}
                       onExit={
                         activeMissionId
-                          ? () => handleExitGoal(activeMissionId)
+                          ? (running) => handleExitGoal(activeMissionId, running)
                           : undefined
                       }
                     />

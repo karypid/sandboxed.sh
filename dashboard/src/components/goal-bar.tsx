@@ -9,8 +9,13 @@ interface GoalBarProps {
   objective: string;
   /** Short status chip, e.g. "iter 2", "paused". */
   statusLabel: string;
-  /** Stop the goal loop (clears harness goal state + interrupts the turn). */
-  onExit?: () => Promise<void> | void;
+  /** Whether the agent is currently mid-turn. Decides exit semantics: a
+      running turn must be interrupted ("Stop goal"), an idle loop just gets
+      deactivated ("End goal") without touching mission status. */
+  running?: boolean;
+  /** Stop/end the goal loop. The handler receives the running flag so it can
+      pick the matching backend path. */
+  onExit?: (running: boolean) => Promise<void> | void;
   className?: string;
 }
 
@@ -23,22 +28,36 @@ const EXPANDABLE_AT = 72;
  * Goal-mode bar shown above the composer. Compact single line by default so it
  * never pushes the composer down; click to reveal the full wrapped objective.
  * Mirrors the QueueStrip pattern (indigo palette, chevron affordance).
+ *
+ * The expanded footer exposes a quiet exit affordance with an inline two-step
+ * confirm (no browser dialogs): ghost at rest, explicit and red only once the
+ * user has signalled intent. Copy adapts to whether a turn is in flight.
  */
-export function GoalBar({ objective, statusLabel, onExit, className }: GoalBarProps) {
+export function GoalBar({
+  objective,
+  statusLabel,
+  running = false,
+  onExit,
+  className,
+}: GoalBarProps) {
   const [expanded, setExpanded] = useState(false);
+  const [confirmingExit, setConfirmingExit] = useState(false);
   const [exiting, setExiting] = useState(false);
 
-  const handleExit = async (e: React.MouseEvent) => {
+  const collapse = () => {
+    setExpanded(false);
+    setConfirmingExit(false);
+  };
+
+  const handleExitConfirmed = async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (!onExit || exiting) return;
-    if (!confirm('Exit the goal loop? The current turn is interrupted and the loop stops.')) {
-      return;
-    }
     setExiting(true);
     try {
-      await onExit();
+      await onExit(running);
     } finally {
       setExiting(false);
+      setConfirmingExit(false);
     }
   };
 
@@ -86,7 +105,7 @@ export function GoalBar({ objective, statusLabel, onExit, className }: GoalBarPr
       >
         <button
           type="button"
-          onClick={() => setExpanded(false)}
+          onClick={collapse}
           className="flex w-full items-center gap-2 px-2.5 py-1.5 text-xs hover:bg-indigo-500/[0.06] transition-colors"
           title="Collapse goal"
         >
@@ -98,21 +117,58 @@ export function GoalBar({ objective, statusLabel, onExit, className }: GoalBarPr
           {objective}
         </p>
         {onExit && (
-          <div className="flex justify-end border-t border-indigo-500/15 px-2.5 py-1.5">
-            <button
-              type="button"
-              onClick={handleExit}
-              disabled={exiting}
-              className="inline-flex items-center gap-1 rounded border border-red-500/30 bg-red-500/15 px-2 py-0.5 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/25 disabled:cursor-not-allowed disabled:opacity-50"
-              title="Stop the goal loop and interrupt the current turn"
-            >
-              {exiting ? (
+          <div className="flex min-h-[30px] items-center justify-between gap-2 border-t border-indigo-500/15 px-2.5 py-1.5">
+            {exiting ? (
+              <span className="ml-auto inline-flex items-center gap-1.5 text-[11px] text-white/50">
                 <Loader className="h-3 w-3 animate-spin" />
-              ) : (
+                {running ? 'Stopping the loop and interrupting the turn' : 'Ending the loop'}
+              </span>
+            ) : confirmingExit ? (
+              <>
+                <span className="min-w-0 truncate text-[11px] text-white/45">
+                  {running
+                    ? 'Stops the loop and interrupts the current turn.'
+                    : 'Ends the loop. The mission stays as it is.'}
+                </span>
+                <span className="flex shrink-0 items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleExitConfirmed}
+                    className="inline-flex items-center gap-1 rounded border border-red-500/30 bg-red-500/15 px-2 py-0.5 text-[11px] font-medium text-red-400 transition-colors hover:bg-red-500/25 active:scale-[0.98]"
+                  >
+                    <Square className="h-3 w-3" />
+                    {running ? 'Stop goal' : 'End goal'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setConfirmingExit(false);
+                    }}
+                    className="rounded px-1.5 py-0.5 text-[11px] text-white/40 transition-colors hover:bg-white/[0.06] hover:text-white/70"
+                  >
+                    Keep going
+                  </button>
+                </span>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setConfirmingExit(true);
+                }}
+                className="ml-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-white/40 transition-colors hover:bg-red-500/10 hover:text-red-300 active:scale-[0.98]"
+                title={
+                  running
+                    ? 'Stop the goal loop (interrupts the current turn)'
+                    : 'End the goal loop'
+                }
+              >
                 <Square className="h-3 w-3" />
-              )}
-              Exit goal
-            </button>
+                Exit goal
+              </button>
+            )}
           </div>
         )}
       </div>
