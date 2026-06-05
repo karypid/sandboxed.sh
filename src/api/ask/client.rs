@@ -356,10 +356,10 @@ impl AskClient {
             tool_calls = parse_text_tool_calls(&content);
         }
 
-        if tools.is_empty() || tool_calls.is_empty() {
-            if !content.is_empty() && !tools.is_empty() {
-                on_delta(&content);
-            }
+        // Tools were offered but the model answered in plain text: stream the
+        // content as a delta so the UI shows it immediately.
+        if tool_calls.is_empty() && !tools.is_empty() && !content.is_empty() {
+            on_delta(&content);
         }
 
         Ok(AskCompletion {

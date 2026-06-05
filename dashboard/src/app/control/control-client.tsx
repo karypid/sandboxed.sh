@@ -5418,6 +5418,9 @@ export default function ControlClient() {
 
   // Treat "waiting_for_tool" as not busy for message input (user should respond immediately)
   const isBusy = viewingRunState === "running";
+  // …but a tool-wait turn is still in flight: goal exit must take the
+  // cancelMission path so the blocked turn gets interrupted too.
+  const isTurnInFlight = viewingRunState !== "idle";
   const canSubmitComposer = canSubmitInput || input.trim().length > 0;
 
   // Goal-mode state, keyed by mission id. Updated from `goal_iteration` /
@@ -7094,9 +7097,16 @@ export default function ControlClient() {
         if (goalRow) {
           try {
             await updateAutomation(goalRow.id, { active: false });
-          } catch {
-            // The observer flips it inactive when the harness emits the
-            // aborted GoalStatus; local failure here is non-fatal.
+          } catch (err) {
+            // While running, the observer flips it inactive when the harness
+            // emits the aborted GoalStatus, so a local failure is non-fatal.
+            // While idle there is no turn in flight to emit that status: the
+            // loop would stay live, so keep the bar and surface the error.
+            if (!running) {
+              throw err instanceof Error
+                ? err
+                : new Error("Failed to deactivate the goal loop");
+            }
           }
         }
         setGoalInfoByMission((prev) => {
@@ -11554,7 +11564,7 @@ export default function ControlClient() {
                     <GoalBar
                       objective={goal.objective}
                       statusLabel={statusLabel}
-                      running={isBusy}
+                      running={isTurnInFlight}
                       onExit={
                         activeMissionId
                           ? (running) => handleExitGoal(activeMissionId, running)
