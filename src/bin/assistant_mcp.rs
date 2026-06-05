@@ -5,6 +5,7 @@
 //! durable-job capabilities.
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header};
@@ -94,6 +95,27 @@ struct MissionEventsParams {
     view: Option<String>,
     #[serde(default)]
     since_seq: Option<i64>,
+    /// Page backwards: return the newest `limit` events with sequence below
+    /// this value (ascending order). Takes precedence over `since_seq`.
+    #[serde(default)]
+    before_seq: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MissionSharedFilesParams {
+    mission_id: String,
+    #[serde(default = "default_event_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadSharedFileParams {
+    mission_id: String,
+    url: String,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    output_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +167,89 @@ fn default_limit() -> usize {
 
 fn default_event_limit() -> usize {
     40
+}
+
+fn default_artifact_dir() -> PathBuf {
+    std::env::var("HERMES_ASSISTANT_ARTIFACT_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/hermes-assistant-artifacts"))
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let clean = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .trim_start_matches('.')
+        .to_string();
+    if clean.is_empty() {
+        "artifact".to_string()
+    } else {
+        clean.chars().take(180).collect()
+    }
+}
+
+fn output_dir_for_shared_file(
+    mission_id: &Uuid,
+    requested: Option<String>,
+) -> Result<PathBuf, String> {
+    let base = requested
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_artifact_dir);
+    if !base.is_absolute() {
+        return Err("output_dir must be an absolute path".to_string());
+    }
+    // Reject `..` components: `starts_with` is lexical, so `/tmp/../etc` would
+    // pass the prefix check below while resolving outside the real /tmp tree.
+    if base
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("output_dir must not contain '..' components".to_string());
+    }
+    if !base.starts_with(Path::new("/tmp")) {
+        return Err(
+            "output_dir must be under /tmp so Paloma's email attachment policy can allow it"
+                .to_string(),
+        );
+    }
+    Ok(base.join(mission_id.to_string()))
+}
+
+fn shared_file_name_from_url(url: &str) -> Option<String> {
+    let marker = "path=";
+    let encoded = url.split(marker).nth(1)?.split('&').next()?;
+    let decoded = urlencoding::decode(encoded).ok()?;
+    Path::new(decoded.as_ref())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToString::to_string)
+}
+
+fn shared_file_download_path(url: &str) -> Result<String, String> {
+    if url.starts_with("/api/fs/download?") {
+        return Ok(url.to_string());
+    }
+    let parsed =
+        reqwest::Url::parse(url).map_err(|error| format!("Invalid shared file URL: {error}"))?;
+    if parsed.path() != "/api/fs/download" {
+        return Err("Only /api/fs/download shared file URLs can be downloaded".to_string());
+    }
+    let query = parsed
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    Ok(format!("{}{}", parsed.path(), query))
 }
 
 fn mint_service_jwt(secret: &str) -> Option<String> {
@@ -226,6 +331,21 @@ impl AssistantMcp {
             .map_err(|error| format!("HTTP request failed: {error}"))
     }
 
+    async fn api_get_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        let response = self.api_get(path).await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Failed to download shared file: {}",
+                response.status()
+            ));
+        }
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| format!("Failed to read shared file bytes: {error}"))
+    }
+
     async fn api_post(&self, path: &str, body: Value) -> Result<reqwest::Response, String> {
         let mut req = self
             .client
@@ -281,7 +401,34 @@ impl AssistantMcp {
                         "mission_id": {"type": "string"},
                         "limit": {"type": "integer", "description": "Maximum events to return, default 40."},
                         "view": {"type": "string", "enum": ["transcript", "trace", "history", "all"]},
-                        "since_seq": {"type": "integer", "description": "Return events with sequence greater than this value."}
+                        "since_seq": {"type": "integer", "description": "Return events with sequence greater than this value."},
+                        "before_seq": {"type": "integer", "description": "Page backwards: return the newest events with sequence below this value (takes precedence over since_seq)."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "list_mission_shared_files".to_string(),
+                description: "List files and screenshots shared by assistant messages in a sandboxed.sh mission.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id"],
+                    "properties": {
+                        "mission_id": {"type": "string"},
+                        "limit": {"type": "integer", "description": "Maximum mission events to scan, default 40."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "download_shared_file".to_string(),
+                description: "Download a mission shared file URL to a local /tmp artifact path suitable for email attachments.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id", "url"],
+                    "properties": {
+                        "mission_id": {"type": "string"},
+                        "url": {"type": "string", "description": "A shared_files[].url value returned by list_mission_shared_files or get_mission_events."},
+                        "filename": {"type": "string", "description": "Optional output filename override."},
+                        "output_dir": {"type": "string", "description": "Optional absolute directory under /tmp. Defaults to /tmp/hermes-assistant-artifacts."}
                     }
                 }),
             },
@@ -425,7 +572,9 @@ impl AssistantMcp {
         let mut path = format!(
             "/api/control/missions/{id}/events?limit={limit}&view={view}&include_counts=false"
         );
-        if let Some(since_seq) = params.since_seq {
+        if let Some(before_seq) = params.before_seq {
+            path.push_str(&format!("&before_seq={before_seq}"));
+        } else if let Some(since_seq) = params.since_seq {
             path.push_str(&format!("&since_seq={since_seq}"));
         }
         let response = self.api_get(&path).await?;
@@ -439,6 +588,77 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse mission events: {error}"))
+    }
+
+    async fn list_mission_shared_files(
+        &self,
+        params: MissionSharedFilesParams,
+    ) -> Result<Value, String> {
+        let mission_id = parse_uuid(&params.mission_id)?;
+        // Page backwards from the end of the transcript: shared files are
+        // "current attachments", so we must scan the NEWEST `limit` events —
+        // the default (no cursor) pagination returns the oldest rows and would
+        // silently drop recent attachments on long missions.
+        let events = self
+            .get_mission_events(MissionEventsParams {
+                mission_id: mission_id.to_string(),
+                limit: params.limit.clamp(1, 200),
+                view: Some("transcript".to_string()),
+                since_seq: None,
+                before_seq: Some(i64::MAX),
+            })
+            .await?;
+        let mut files = Vec::new();
+        for event in events.as_array().into_iter().flatten() {
+            let Some(shared_files) = event
+                .get("metadata")
+                .and_then(|metadata| metadata.get("shared_files"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for file in shared_files {
+                let mut item = file.clone();
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("mission_id".to_string(), json!(mission_id.to_string()));
+                    if let Some(sequence) = event.get("sequence").cloned() {
+                        object.insert("event_sequence".to_string(), sequence);
+                    }
+                    if let Some(timestamp) = event.get("timestamp").cloned() {
+                        object.insert("event_timestamp".to_string(), timestamp);
+                    }
+                }
+                files.push(item);
+            }
+        }
+        Ok(json!({ "mission_id": mission_id.to_string(), "shared_files": files }))
+    }
+
+    async fn download_shared_file(
+        &self,
+        params: DownloadSharedFileParams,
+    ) -> Result<Value, String> {
+        let mission_id = parse_uuid(&params.mission_id)?;
+        let path = shared_file_download_path(&params.url)?;
+        let filename = params
+            .filename
+            .or_else(|| shared_file_name_from_url(&params.url))
+            .unwrap_or_else(|| "artifact".to_string());
+        let filename = sanitize_filename(&filename);
+        let output_dir = output_dir_for_shared_file(&mission_id, params.output_dir)?;
+        tokio::fs::create_dir_all(&output_dir)
+            .await
+            .map_err(|error| format!("Failed to create artifact directory: {error}"))?;
+        let output_path = output_dir.join(filename);
+        let bytes = self.api_get_bytes(&path).await?;
+        tokio::fs::write(&output_path, &bytes)
+            .await
+            .map_err(|error| format!("Failed to write shared file: {error}"))?;
+        Ok(json!({
+            "mission_id": mission_id.to_string(),
+            "path": output_path.to_string_lossy(),
+            "bytes": bytes.len(),
+        }))
     }
 
     async fn start_mission(&self, params: StartMissionParams) -> Result<Value, String> {
@@ -574,6 +794,16 @@ impl AssistantMcp {
                 let params: MissionEventsParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.get_mission_events(params).await
+            }
+            "list_mission_shared_files" => {
+                let params: MissionSharedFilesParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.list_mission_shared_files(params).await
+            }
+            "download_shared_file" => {
+                let params: DownloadSharedFileParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.download_shared_file(params).await
             }
             "start_mission" => {
                 let params: StartMissionParams = serde_json::from_value(arguments)
@@ -853,6 +1083,30 @@ mod tests {
 
         assert_eq!(workspace_id.as_deref(), Some("assistant-workspace"));
         clear_env();
+    }
+
+    #[test]
+    fn output_dir_accepts_paths_under_tmp() {
+        let mission_id = Uuid::nil();
+        let dir = output_dir_for_shared_file(&mission_id, Some("/tmp/artifacts".to_string()))
+            .expect("plain /tmp path is allowed");
+        assert!(dir.starts_with("/tmp/artifacts"));
+    }
+
+    #[test]
+    fn output_dir_rejects_parent_traversal_and_non_tmp_paths() {
+        let mission_id = Uuid::nil();
+        // `/tmp/../etc` passes a lexical starts_with("/tmp") but resolves
+        // outside the real /tmp tree — must be rejected.
+        assert!(output_dir_for_shared_file(&mission_id, Some("/tmp/../etc".to_string())).is_err());
+        assert!(
+            output_dir_for_shared_file(&mission_id, Some("/tmp/a/../../etc".to_string())).is_err()
+        );
+        // Sibling prefixes and plainly foreign roots are rejected too.
+        assert!(output_dir_for_shared_file(&mission_id, Some("/tmpdir/x".to_string())).is_err());
+        assert!(output_dir_for_shared_file(&mission_id, Some("/var/tmp".to_string())).is_err());
+        // Relative paths are rejected.
+        assert!(output_dir_for_shared_file(&mission_id, Some("tmp/x".to_string())).is_err());
     }
 }
 
