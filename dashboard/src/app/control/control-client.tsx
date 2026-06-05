@@ -93,6 +93,8 @@ import {
   getRunningMissions,
   isNetworkError,
   cancelMission,
+  listMissionAutomations,
+  updateAutomation,
   deleteMission,
   autoGenerateMissionTitle,
   listWorkspaces,
@@ -7068,6 +7070,41 @@ export default function ControlClient() {
       });
   }, []);
 
+  // Exit a /goal loop from the GoalBar: mirrors the automations dialog's
+  // stop-native-loop path — cancellation lets native harnesses clear their
+  // goal state first (Codex: thread/goal/clear), then we flip any goal-loop
+  // automation row inactive and clear the local goal info so the bar
+  // disappears immediately.
+  const handleExitGoal = useCallback(async (missionId: string) => {
+    try {
+      const automations = await listMissionAutomations(missionId).catch(
+        () => [],
+      );
+      const goalRow = automations.find(
+        (a) => a.active && a.command_source?.type === "native_loop",
+      );
+      await cancelMission(missionId);
+      if (goalRow) {
+        try {
+          await updateAutomation(goalRow.id, { active: false });
+        } catch {
+          // The observer flips it inactive when the harness emits the
+          // aborted GoalStatus; local failure here is non-fatal.
+        }
+      }
+      setGoalInfoByMission((prev) => {
+        const next = { ...prev };
+        delete next[missionId];
+        return next;
+      });
+      toast.success("Goal loop stop requested");
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to exit goal loop",
+      );
+    }
+  }, []);
+
   // Handle cancelling a parallel mission
   const handleCancelMission = async (missionId: string) => {
     try {
@@ -11538,6 +11575,11 @@ export default function ControlClient() {
                     <GoalBar
                       objective={goal.objective}
                       statusLabel={statusLabel}
+                      onExit={
+                        activeMissionId
+                          ? () => handleExitGoal(activeMissionId)
+                          : undefined
+                      }
                     />
                   );
                 })()}
