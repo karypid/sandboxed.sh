@@ -8834,7 +8834,15 @@ export default function ControlClient() {
         setItems((prev) =>
           prev.map((it) =>
             it.kind === "tool" && it.toolCallId === toolCallId
-              ? { ...it, result: data["result"], endTime }
+              ? // The live result fully hydrates the row, so a conversation
+                // stub must drop its lazy/loading UI state here too.
+                {
+                  ...it,
+                  result: data["result"],
+                  endTime,
+                  lazy: false,
+                  loading: false,
+                }
               : it,
           ),
         );
