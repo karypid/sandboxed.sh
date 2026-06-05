@@ -95,6 +95,10 @@ struct MissionEventsParams {
     view: Option<String>,
     #[serde(default)]
     since_seq: Option<i64>,
+    /// Page backwards: return the newest `limit` events with sequence below
+    /// this value (ascending order). Takes precedence over `since_seq`.
+    #[serde(default)]
+    before_seq: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +208,14 @@ fn output_dir_for_shared_file(
         .unwrap_or_else(default_artifact_dir);
     if !base.is_absolute() {
         return Err("output_dir must be an absolute path".to_string());
+    }
+    // Reject `..` components: `starts_with` is lexical, so `/tmp/../etc` would
+    // pass the prefix check below while resolving outside the real /tmp tree.
+    if base
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("output_dir must not contain '..' components".to_string());
     }
     if !base.starts_with(Path::new("/tmp")) {
         return Err(
@@ -389,7 +401,8 @@ impl AssistantMcp {
                         "mission_id": {"type": "string"},
                         "limit": {"type": "integer", "description": "Maximum events to return, default 40."},
                         "view": {"type": "string", "enum": ["transcript", "trace", "history", "all"]},
-                        "since_seq": {"type": "integer", "description": "Return events with sequence greater than this value."}
+                        "since_seq": {"type": "integer", "description": "Return events with sequence greater than this value."},
+                        "before_seq": {"type": "integer", "description": "Page backwards: return the newest events with sequence below this value (takes precedence over since_seq)."}
                     }
                 }),
             },
@@ -559,7 +572,9 @@ impl AssistantMcp {
         let mut path = format!(
             "/api/control/missions/{id}/events?limit={limit}&view={view}&include_counts=false"
         );
-        if let Some(since_seq) = params.since_seq {
+        if let Some(before_seq) = params.before_seq {
+            path.push_str(&format!("&before_seq={before_seq}"));
+        } else if let Some(since_seq) = params.since_seq {
             path.push_str(&format!("&since_seq={since_seq}"));
         }
         let response = self.api_get(&path).await?;
@@ -580,12 +595,17 @@ impl AssistantMcp {
         params: MissionSharedFilesParams,
     ) -> Result<Value, String> {
         let mission_id = parse_uuid(&params.mission_id)?;
+        // Page backwards from the end of the transcript: shared files are
+        // "current attachments", so we must scan the NEWEST `limit` events —
+        // the default (no cursor) pagination returns the oldest rows and would
+        // silently drop recent attachments on long missions.
         let events = self
             .get_mission_events(MissionEventsParams {
                 mission_id: mission_id.to_string(),
                 limit: params.limit.clamp(1, 200),
                 view: Some("transcript".to_string()),
                 since_seq: None,
+                before_seq: Some(i64::MAX),
             })
             .await?;
         let mut files = Vec::new();
@@ -1063,6 +1083,30 @@ mod tests {
 
         assert_eq!(workspace_id.as_deref(), Some("assistant-workspace"));
         clear_env();
+    }
+
+    #[test]
+    fn output_dir_accepts_paths_under_tmp() {
+        let mission_id = Uuid::nil();
+        let dir = output_dir_for_shared_file(&mission_id, Some("/tmp/artifacts".to_string()))
+            .expect("plain /tmp path is allowed");
+        assert!(dir.starts_with("/tmp/artifacts"));
+    }
+
+    #[test]
+    fn output_dir_rejects_parent_traversal_and_non_tmp_paths() {
+        let mission_id = Uuid::nil();
+        // `/tmp/../etc` passes a lexical starts_with("/tmp") but resolves
+        // outside the real /tmp tree — must be rejected.
+        assert!(output_dir_for_shared_file(&mission_id, Some("/tmp/../etc".to_string())).is_err());
+        assert!(
+            output_dir_for_shared_file(&mission_id, Some("/tmp/a/../../etc".to_string())).is_err()
+        );
+        // Sibling prefixes and plainly foreign roots are rejected too.
+        assert!(output_dir_for_shared_file(&mission_id, Some("/tmpdir/x".to_string())).is_err());
+        assert!(output_dir_for_shared_file(&mission_id, Some("/var/tmp".to_string())).is_err());
+        // Relative paths are rejected.
+        assert!(output_dir_for_shared_file(&mission_id, Some("tmp/x".to_string())).is_err());
     }
 }
 
