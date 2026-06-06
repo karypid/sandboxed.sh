@@ -28,6 +28,7 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/chains/:id", put(update_chain))
         .route("/chains/:id", delete(delete_chain))
         .route("/chains/:id/resolve", get(resolve_chain))
+        .route("/chains/:id/test", post(test_chain))
         // Health tracking
         .route("/health", get(list_health))
         .route("/health/:account_id", get(get_account_health))
@@ -315,6 +316,53 @@ async fn resolve_chain(
             })
             .collect(),
     ))
+}
+
+/// POST /api/model-routing/chains/:id/test - Send a 1-token test request
+/// through a chain.
+///
+/// Runs behind the dashboard JWT (unlike `/v1/chat/completions`, which
+/// requires a proxy bearer), so the debug panel can exercise a chain without
+/// holding a proxy key.
+async fn test_chain(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if state.chain_store.get(&id).await.is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("Chain '{}' not found", id)));
+    }
+
+    let body = serde_json::json!({
+        "model": id,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    });
+    let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body).expect("test body serializes"));
+    let response = super::proxy::chat_completions_inner(
+        state.clone(),
+        axum::http::HeaderMap::new(),
+        body_bytes,
+    )
+    .await;
+
+    let status = response.status();
+    let collected = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read test response: {}", e),
+            )
+        })?;
+    let payload: serde_json::Value = serde_json::from_slice(&collected).unwrap_or_else(
+        |_| serde_json::json!({ "raw": String::from_utf8_lossy(&collected).to_string() }),
+    );
+
+    Ok(Json(serde_json::json!({
+        "ok": status.is_success(),
+        "status": status.as_u16(),
+        "response": payload,
+    })))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

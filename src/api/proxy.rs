@@ -445,7 +445,16 @@ async fn chat_completions(
     if let Err(resp) = verify_proxy_auth(&headers, &state).await {
         return resp;
     }
+    chat_completions_inner(state, headers, body).await
+}
 
+/// Chain-routed chat completion without proxy auth.  Callers must enforce
+/// their own authentication (e.g. the JWT-protected chain test endpoint).
+pub(crate) async fn chat_completions_inner(
+    state: Arc<super::routes::AppState>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
     // 1. Parse the request to extract the model name
     let req: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,

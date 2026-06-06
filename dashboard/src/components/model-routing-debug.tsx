@@ -10,10 +10,10 @@ import {
   listAccountHealth,
   clearAccountCooldown,
   listFallbackEvents,
+  testModelChain,
   ModelChain,
   ResolvedEntry,
 } from '@/lib/api/model-routing';
-import { apiPost } from '@/lib/api/core';
 
 function fmtAgo(iso: string): string {
   const secs = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
@@ -40,17 +40,16 @@ function ChainRow({ chain }: { chain: ModelChain }) {
     setTesting(true);
     setTestResult(null);
     try {
-      const res = await apiPost<{ choices?: { message: { content: string } }[] }>(
-        `/v1/chat/completions`,
-        {
-          model: chain.id,
-          messages: [{ role: 'user', content: 'ping' }],
-          max_tokens: 1,
-        },
-        'Test request failed'
-      );
-      const msg = res.choices?.[0]?.message.content ?? '(no content)';
-      setTestResult(`✅ ${msg.slice(0, 80)}`);
+      // Goes through the JWT-authed test endpoint — the dashboard does not
+      // hold a proxy bearer for /v1/chat/completions.
+      const res = await testModelChain(chain.id);
+      if (res.ok) {
+        const msg = res.response.choices?.[0]?.message.content ?? '(no content)';
+        setTestResult(`✅ ${(msg ?? '(no content)').slice(0, 80)}`);
+      } else {
+        const err = res.response.error?.message ?? `HTTP ${res.status}`;
+        setTestResult(`❌ ${err.slice(0, 160)}`);
+      }
       mutateResolved();
     } catch (e) {
       setTestResult(`❌ ${(e as Error).message}`);
