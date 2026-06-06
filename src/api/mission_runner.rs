@@ -11354,7 +11354,11 @@ pub async fn run_opencode_turn(
                                     tool_call_steps = tool_call_step_count,
                                     "OpenCode JSON step_finish event"
                                 );
-                                if reason == "stop" {
+                                // Match the shared SSE parser: an empty reason
+                                // also marks the final step (some providers omit
+                                // it); otherwise completion waits on idle
+                                // timeouts or process exit.
+                                if reason == "stop" || reason.is_empty() {
                                     let _ = sse_complete_tx.send(true);
                                 } else {
                                     // Track consecutive tool-call steps to detect runaway loops

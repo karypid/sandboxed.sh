@@ -28,7 +28,7 @@ function ChainRow({ chain }: { chain: ModelChain }) {
     () => resolveModelChain(chain.id),
     { revalidateOnFocus: false }
   );
-  const { data: health } = useSWR('routing-health', listAccountHealth, {
+  const { data: health, mutate: mutateHealth } = useSWR('routing-health', listAccountHealth, {
     refreshInterval: 5000,
   });
   const [testing, setTesting] = useState(false);
@@ -90,7 +90,9 @@ function ChainRow({ chain }: { chain: ModelChain }) {
           const h = r ? healthByAccount.get(r.account_id) : undefined;
           const skipped = !r;
           const inCooldown = h?.cooldown_remaining_secs != null;
-          const ok = r && !inCooldown;
+          const noCredentials = r != null && !r.has_credentials;
+          const degraded = h?.is_degraded === true;
+          const ok = r != null && r.has_credentials && !inCooldown && !degraded;
           return (
             <div
               key={idx}
@@ -109,6 +111,18 @@ function ChainRow({ chain }: { chain: ModelChain }) {
                     unresolved
                   </span>
                 )}
+                {noCredentials && (
+                  <span className="flex items-center gap-1 text-amber-400">
+                    <AlertCircle className="h-3 w-3" />
+                    no credentials
+                  </span>
+                )}
+                {degraded && !inCooldown && (
+                  <span className="flex items-center gap-1 text-amber-400">
+                    <AlertCircle className="h-3 w-3" />
+                    degraded
+                  </span>
+                )}
                 {inCooldown && (
                   <>
                     <span className="text-red-400">
@@ -118,6 +132,7 @@ function ChainRow({ chain }: { chain: ModelChain }) {
                       onClick={async () => {
                         try {
                           await clearAccountCooldown(r!.account_id);
+                          await mutateHealth();
                           toast.success('Cooldown cleared');
                         } catch (e) {
                           toast.error((e as Error).message);
