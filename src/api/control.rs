@@ -8429,9 +8429,11 @@ async fn maybe_finalize_terminal_mission(
                 );
             }
 
+            // Interrupted is allowed through: the promotion check above already
+            // filtered it down to successful turns only.
             if !matches!(
                 mission.status,
-                MissionStatus::Active | MissionStatus::Pending
+                MissionStatus::Active | MissionStatus::Pending | MissionStatus::Interrupted
             ) {
                 tracing::debug!(
                     mission_id = %mission_id,
