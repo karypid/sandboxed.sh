@@ -88,16 +88,19 @@ function ChainRow({ chain }: { chain: ModelChain }) {
           );
           // /resolve omits accounts in cooldown, so fall back to matching
           // health by provider — otherwise cooled-down entries read as
-          // "unresolved" with no way to clear the cooldown.
-          const cooledFallback = !r
-            ? (health ?? []).find(
+          // "unresolved" with no way to clear the cooldown.  With several
+          // accounts on the same provider we can't attribute the cooldown to
+          // one of them, so "clear" targets every cooled account explicitly.
+          const cooledMatches = !r
+            ? (health ?? []).filter(
                 (x) =>
                   x.provider_id === entry.provider_id &&
                   x.cooldown_remaining_secs != null
               )
-            : undefined;
+            : [];
+          const cooledFallback = cooledMatches[0];
           const h = r ? healthByAccount.get(r.account_id) : cooledFallback;
-          const accountId = r?.account_id ?? cooledFallback?.account_id;
+          const clearTargets = r ? (h ? [h.account_id] : []) : cooledMatches.map((x) => x.account_id);
           const skipped = !r && !cooledFallback;
           const inCooldown = h?.cooldown_remaining_secs != null;
           const noCredentials = r != null && !r.has_credentials;
@@ -133,24 +136,34 @@ function ChainRow({ chain }: { chain: ModelChain }) {
                     degraded
                   </span>
                 )}
-                {inCooldown && accountId && (
+                {inCooldown && clearTargets.length > 0 && (
                   <>
                     <span className="text-red-400">
                       cooldown {Math.round(h!.cooldown_remaining_secs!)}s
+                      {cooledMatches.length > 1 && ` (${cooledMatches.length} accounts)`}
                     </span>
                     <button
                       onClick={async () => {
                         try {
-                          await clearAccountCooldown(accountId);
+                          await Promise.all(clearTargets.map((id) => clearAccountCooldown(id)));
                           await mutateHealth();
-                          toast.success('Cooldown cleared');
+                          toast.success(
+                            clearTargets.length > 1
+                              ? `Cleared ${clearTargets.length} cooldowns`
+                              : 'Cooldown cleared'
+                          );
                         } catch (e) {
                           toast.error((e as Error).message);
                         }
                       }}
+                      title={
+                        cooledMatches.length > 1
+                          ? `Clears all ${cooledMatches.length} cooled ${entry.provider_id} accounts`
+                          : undefined
+                      }
                       className="rounded bg-white/5 px-1.5 py-0.5 text-white/70 hover:bg-white/10"
                     >
-                      clear
+                      {cooledMatches.length > 1 ? 'clear all' : 'clear'}
                     </button>
                   </>
                 )}
