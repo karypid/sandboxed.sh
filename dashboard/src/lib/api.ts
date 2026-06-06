@@ -3156,9 +3156,11 @@ export async function getBackend(id: string): Promise<Backend> {
 // List agents for a specific backend
 export async function listBackendAgents(
   backendId: string,
+  profile?: string | null,
 ): Promise<BackendAgent[]> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
   return apiGet(
-    `/api/backends/${encodeURIComponent(backendId)}/agents`,
+    `/api/backends/${encodeURIComponent(backendId)}/agents${query}`,
     "Failed to list backend agents",
   );
 }

@@ -125,6 +125,24 @@ export async function resolveModelChain(id: string): Promise<ResolvedEntry[]> {
   );
 }
 
+export interface ChainTestResult {
+  ok: boolean;
+  status: number;
+  response: {
+    choices?: { message: { content: string | null } }[];
+    error?: { message?: string };
+    [key: string]: unknown;
+  };
+}
+
+export async function testModelChain(id: string): Promise<ChainTestResult> {
+  return apiPost(
+    `/api/model-routing/chains/${encodeURIComponent(id)}/test`,
+    undefined,
+    "Failed to test model chain"
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Health Tracking
 // ---------------------------------------------------------------------------

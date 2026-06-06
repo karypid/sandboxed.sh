@@ -176,10 +176,22 @@ export function NewMissionDialog({
     return backends?.filter((b) => isBackendAvailable(backendConfigs[b.id])) || [];
   }, [backends, backendConfigs]);
 
-  // SWR: fetch agents for each enabled backend
+  const workspaceProfile = useMemo(() => {
+    const targetWorkspace = newMissionWorkspace
+      ? workspaces.find((workspace) => workspace.id === newMissionWorkspace)
+      : workspaces.find((workspace) => workspace.id === '00000000-0000-0000-0000-000000000000')
+        || workspaces.find((workspace) => workspace.workspace_type === 'host');
+    return targetWorkspace?.config_profile || null;
+  }, [newMissionWorkspace, workspaces]);
+
+  // SWR: fetch agents for each enabled backend.  OpenCode agents are
+  // profile-aware: native `.opencode/agents/*.md` files live under the
+  // selected workspace's library config profile.
   const { data: opencodeAgents, mutate: mutateOpencodeAgents } = useSWR<BackendAgent[]>(
-    open && enabledBackends.some(b => b.id === 'opencode') ? 'backend-opencode-agents' : null,
-    () => listBackendAgents('opencode'),
+    open && enabledBackends.some(b => b.id === 'opencode')
+      ? `backend-opencode-agents:${workspaceProfile ?? 'default'}`
+      : null,
+    () => listBackendAgents('opencode', workspaceProfile),
     { revalidateOnFocus: true, dedupingInterval: 5000 }
   );
   const { data: claudecodeAgents, mutate: mutateClaudecodeAgents } = useSWR<BackendAgent[]>(
@@ -219,14 +231,6 @@ export function NewMissionDialog({
     getClaudeCodeConfig,
     { revalidateOnFocus: false, dedupingInterval: 30000 }
   );
-
-  const workspaceProfile = useMemo(() => {
-    const targetWorkspace = newMissionWorkspace
-      ? workspaces.find((workspace) => workspace.id === newMissionWorkspace)
-      : workspaces.find((workspace) => workspace.id === '00000000-0000-0000-0000-000000000000')
-        || workspaces.find((workspace) => workspace.workspace_type === 'host');
-    return targetWorkspace?.config_profile || null;
-  }, [newMissionWorkspace, workspaces]);
 
   // Combine all agents from enabled backends
   const allAgents = useMemo((): CombinedAgent[] => {
