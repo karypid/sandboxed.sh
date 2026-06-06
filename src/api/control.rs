@@ -8400,13 +8400,33 @@ async fn maybe_finalize_terminal_mission(
     match mission_store.get_mission(mission_id).await {
         Ok(Some(mission)) => {
             if mission.status == MissionStatus::Interrupted {
-                tracing::debug!(
+                // A turn that *succeeds* after the interruption marker was set
+                // (deploy restart mid-turn, then the drained turn completes)
+                // supersedes it: there is a fresh assistant answer, and leaving
+                // the mission "interrupted" makes the dashboard offer a resume
+                // that the still-registered runner rejects with "already
+                // running". Failure-shaped reasons keep the interrupted status
+                // (it is the more accurate cause).
+                let successful_turn = matches!(
+                    new_status,
+                    MissionStatus::AwaitingUser | MissionStatus::Completed
+                );
+                if !successful_turn {
+                    tracing::debug!(
+                        mission_id = %mission_id,
+                        reason = ?reason,
+                        context = log_context,
+                        "Skipping mission finalization because mission is already interrupted"
+                    );
+                    return;
+                }
+                tracing::info!(
                     mission_id = %mission_id,
                     reason = ?reason,
+                    new_status = ?new_status,
                     context = log_context,
-                    "Skipping mission finalization because mission is already interrupted"
+                    "Promoting interrupted mission: turn completed successfully after interruption"
                 );
-                return;
             }
 
             if !matches!(
