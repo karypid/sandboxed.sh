@@ -83,6 +83,10 @@ pub struct AskTurn {
     /// Proxy API key store, for answering "is the key the operator issued
     /// actually being used?" with `last_used_at` facts.
     pub proxy_keys: SharedProxyApiKeyStore,
+    /// Command channel into the user's control session, for the steering tools
+    /// (`stop_agent` / `send_to_agent`). Same channel the dashboard's Stop
+    /// button and composer use.
+    pub control_cmd_tx: tokio::sync::mpsc::Sender<crate::api::control::ControlCommand>,
 }
 
 /// Run one Ask turn: persist the operator message, drive the tool loop, persist
@@ -489,6 +493,14 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
          name and never repeat the value. Use list_workspace_env and \
          proxy_key_status to answer \"is the key set / is it being used?\" with \
          facts instead of guesses.\n\n\
+         Steering authority: you can stop the working agent (stop_agent) and send \
+         it steering messages (send_to_agent) — the same controls the operator has. \
+         These are interventions, not observations: use them when the operator asks \
+         you to stop/steer/redirect the agent, or when it is burning resources in a \
+         clearly harmful loop. Otherwise, propose the steering message and let the \
+         operator decide. When you do steer, make the message self-contained and \
+         bounded (what to stop, what to do instead, when to stop doing it) — the \
+         working agent has no access to this conversation.\n\n\
          Be concise and concrete. Cite event sequence numbers or file paths when \
          relevant. When you identify a blocker the operator could fix through \
          configuration (missing env var, unused key), propose the concrete fix — \
@@ -571,6 +583,35 @@ fn tool_definitions() -> Vec<Value> {
                 "name": "proxy_key_status",
                 "description": "List the gateway's proxy API keys (name, prefix, created_at, last_used_at). Use to answer whether a key the operator issued is valid/actually being used.",
                 "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "stop_agent",
+                "description": "Interrupt the working agent's current turn (same as the operator's Stop button). The mission becomes interrupted/awaiting until resumed or steered. Use only when the operator asked you to stop it, or when it is clearly stuck in a harmful loop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": { "type": "string", "description": "One-line reason, recorded for the operator." }
+                    },
+                    "required": ["reason"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "send_to_agent",
+                "description": "Send a steering message to the working agent, exactly as if the operator typed it in the mission composer. If the agent is mid-turn the message is queued and picked up at the next turn boundary — set interrupt=true to cancel the current turn first so it takes effect immediately. If the agent is idle this STARTS a new turn. Use only when the operator asked you to steer/redirect the agent.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string", "description": "The steering instructions for the working agent. Be specific: what to stop doing, what to do instead, and any bounds." },
+                        "interrupt": { "type": "boolean", "description": "Cancel the agent's current turn before delivering, so the steer applies now instead of after the turn ends. Default false." }
+                    },
+                    "required": ["message"]
+                }
             }
         }),
     ]
@@ -724,6 +765,76 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                 None => "Error: workspace not found".to_string(),
             }
         }
+        "stop_agent" => {
+            let reason = args["reason"].as_str().unwrap_or("").trim().to_string();
+            if reason.is_empty() {
+                return "Error: a reason is required".to_string();
+            }
+            match cancel_working_agent(turn).await {
+                Ok(()) => format!(
+                    "Interrupted the working agent's current turn (reason: {reason}). The \
+                     mission will settle as interrupted/awaiting; use send_to_agent to \
+                     redirect it, or the operator can resume it from the dashboard."
+                ),
+                Err(e) => format!("Error stopping the agent: {e}"),
+            }
+        }
+        "send_to_agent" => {
+            let message = args["message"].as_str().unwrap_or("").trim().to_string();
+            if message.is_empty() {
+                return "Error: message is empty".to_string();
+            }
+            let interrupt = args["interrupt"].as_bool().unwrap_or(false);
+            if interrupt {
+                if let Err(e) = cancel_working_agent(turn).await {
+                    // A failed cancel usually means nothing was running — the
+                    // steer below still applies, so report and continue.
+                    tracing::info!(
+                        mission_id = %turn.mission_id,
+                        "[Ask] interrupt before steer found nothing to cancel: {e}"
+                    );
+                }
+            }
+            let content = format_steer_message(&message);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let send = turn
+                .control_cmd_tx
+                .send(crate::api::control::ControlCommand::UserMessage {
+                    id: Uuid::new_v4(),
+                    content,
+                    agent: None,
+                    target_mission_id: Some(turn.mission_id),
+                    respond: tx,
+                })
+                .await;
+            if send.is_err() {
+                return "Error: the control session is unavailable".to_string();
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+                Ok(Ok(queued)) if queued => {
+                    if interrupt {
+                        "Steering message delivered after interrupting the current turn — \
+                         the agent will act on it as soon as the cancellation settles."
+                            .to_string()
+                    } else {
+                        "Steering message queued — the working agent is mid-turn and will \
+                         act on it at the next turn boundary. Pass interrupt=true if it \
+                         must take effect immediately."
+                            .to_string()
+                    }
+                }
+                Ok(Ok(_)) => "Steering message delivered — the agent was idle, so this \
+                              starts a new turn now."
+                    .to_string(),
+                Ok(Err(_)) | Err(_) => {
+                    // The control loop accepted the command but never confirmed —
+                    // the message is most likely in flight; don't claim failure.
+                    "Steering message submitted (no queue confirmation received). \
+                     Check read_history shortly to confirm the agent saw it."
+                        .to_string()
+                }
+            }
+        }
         "proxy_key_status" => {
             let keys = turn.proxy_keys.list().await;
             if keys.is_empty() {
@@ -748,6 +859,32 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
         }
         other => format!("Error: unknown tool '{other}'"),
     }
+}
+
+/// Cancel the working agent's current turn through the control session — the
+/// same `CancelMission` path the dashboard's Stop button uses.
+async fn cancel_working_agent(turn: &AskTurn) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    turn.control_cmd_tx
+        .send(crate::api::control::ControlCommand::CancelMission {
+            mission_id: turn.mission_id,
+            min_idle: None,
+            respond: tx,
+        })
+        .await
+        .map_err(|_| "the control session is unavailable".to_string())?;
+    match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("the control session dropped the request".to_string()),
+        Err(_) => Err("timed out waiting for the cancellation to be acknowledged".to_string()),
+    }
+}
+
+/// Wrap a Copilot steering message so the working agent (and the mission
+/// transcript) can tell it came through the co-pilot acting on the operator's
+/// behalf, not from the operator typing directly.
+fn format_steer_message(message: &str) -> String {
+    format!("[Steering from the operator via the Copilot]\n{message}")
 }
 
 /// Mask an env var value for display: short prefix + length, never the value.
@@ -1105,6 +1242,13 @@ mod tests {
         assert!(!message_mentions_secret("what is the mission status?"));
         assert!(!message_mentions_secret("the sk-learn library"));
         assert!(!message_mentions_secret("commit 381a865f is on master"));
+    }
+
+    #[test]
+    fn steer_messages_carry_a_copilot_attribution() {
+        let msg = format_steer_message("Stop rewriting orchestrator-state.json.");
+        assert!(msg.starts_with("[Steering from the operator via the Copilot]"));
+        assert!(msg.ends_with("Stop rewriting orchestrator-state.json."));
     }
 
     #[test]
