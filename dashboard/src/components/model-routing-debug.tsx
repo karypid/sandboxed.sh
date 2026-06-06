@@ -146,7 +146,9 @@ function ChainRow({ chain }: { chain: ModelChain }) {
                       onClick={async () => {
                         try {
                           await Promise.all(clearTargets.map((id) => clearAccountCooldown(id)));
-                          await mutateHealth();
+                          // /resolve omits cooled accounts, so refresh it too —
+                          // otherwise the entry keeps reading "unresolved".
+                          await Promise.all([mutateHealth(), mutateResolved()]);
                           toast.success(
                             clearTargets.length > 1
                               ? `Cleared ${clearTargets.length} cooldowns`
