@@ -3008,6 +3008,23 @@ impl AgentEvent {
     }
 }
 
+/// Outcome of a [`ControlCommand::UserMessage`], acknowledged on its
+/// `respond` channel. Distinguishes "delivered, a turn is starting" from
+/// "dropped" — both used to be `false`, which made drops invisible to
+/// callers that need delivery guarantees (e.g. the Copilot's steering tool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserMessageAck {
+    /// The target is busy mid-turn; the message was queued and will be
+    /// picked up at the next turn boundary.
+    Queued,
+    /// The message was delivered and a turn is starting now.
+    Delivered,
+    /// The message was dropped (parallel cap reached, mission load failure,
+    /// rejected goal kickoff, …). An `AgentEvent::Error` with details was
+    /// emitted on the event stream.
+    Dropped,
+}
+
 /// Internal control commands (queued and processed by the actor).
 #[derive(Debug)]
 pub enum ControlCommand {
@@ -3018,8 +3035,8 @@ pub enum ControlCommand {
         agent: Option<String>,
         /// Target mission ID - if provided and differs from running mission, start in parallel
         target_mission_id: Option<Uuid>,
-        /// Respond with whether the message was queued (true = waiting to be processed)
-        respond: oneshot::Sender<bool>,
+        /// Respond with the delivery outcome (queued / delivered / dropped).
+        respond: oneshot::Sender<UserMessageAck>,
     },
     ToolResult {
         tool_call_id: String,
@@ -3551,7 +3568,10 @@ pub async fn post_message(
         .await
         .map_err(session_unavailable)?;
     let queued = match queued_rx.await {
-        Ok(value) => value,
+        // The wire response keeps its historical bool shape: `queued` is true
+        // only when the message is waiting for the next turn boundary.
+        // Dropped messages surface as an `AgentEvent::Error` on the stream.
+        Ok(ack) => ack == UserMessageAck::Queued,
         Err(_) => {
             let status = control.status.read().await;
             status.state != ControlRunState::Idle
@@ -9035,7 +9055,11 @@ async fn control_actor_loop(
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, respond } => {
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
-                            let _ = respond.send(status_snapshot.state != ControlRunState::Idle);
+                            let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
+                                UserMessageAck::Queued
+                            } else {
+                                UserMessageAck::Delivered
+                            });
                             continue;
                         }
 
@@ -9102,7 +9126,7 @@ async fn control_actor_loop(
                                     mission_id: goal_target_mission,
                                     resumable: true,
                                 });
-                                let _ = respond.send(false);
+                                let _ = respond.send(UserMessageAck::Dropped);
                                 continue;
                             }
                         }
@@ -9147,7 +9171,7 @@ async fn control_actor_loop(
                                             secrets.clone(),
                                         );
                                     }
-                                    let _ = respond.send(was_running);
+                                    let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                                     continue;
                                 }
                             }
@@ -9180,7 +9204,7 @@ async fn control_actor_loop(
                                         mission_id: Some(tid),
                                         resumable: true,
                                     });
-                                    let _ = respond.send(false);
+                                    let _ = respond.send(UserMessageAck::Dropped);
                                     continue;
                                 } else {
                                     // Load mission and start in parallel
@@ -9252,7 +9276,7 @@ async fn control_actor_loop(
                                             );
                                             tracing::info!("Auto-started mission {} in parallel", tid);
                                             parallel_runners.insert(tid, runner);
-                                            let _ = respond.send(false);
+                                            let _ = respond.send(UserMessageAck::Delivered);
                                             continue;
                                         }
                                         Err(e) => {
@@ -9269,7 +9293,7 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 resumable: true,
                                             });
-                                            let _ = respond.send(false);
+                                            let _ = respond.send(UserMessageAck::Dropped);
                                             continue;
                                         }
                                     }
@@ -9587,7 +9611,7 @@ async fn control_actor_loop(
                                 set_and_emit_status(&status, &events_tx, ControlRunState::Idle, 0, None).await;
                             }
                         }
-                        let _ = respond.send(was_running);
+                        let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                     }
                     ControlCommand::ToolResult { tool_call_id, name, result } => {
                         // Deliver to the tool hub. resolve() caches the result if
