@@ -810,8 +810,9 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
             if send.is_err() {
                 return "Error: the control session is unavailable".to_string();
             }
+            use crate::api::control::UserMessageAck;
             match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
-                Ok(Ok(queued)) if queued => {
+                Ok(Ok(UserMessageAck::Queued)) => {
                     if interrupt {
                         "Steering message delivered after interrupting the current turn — \
                          the agent will act on it as soon as the cancellation settles."
@@ -823,13 +824,20 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                             .to_string()
                     }
                 }
-                Ok(Ok(_)) => "Steering message delivered — the agent was idle, so this \
-                              starts a new turn now."
-                    .to_string(),
+                Ok(Ok(UserMessageAck::Delivered)) => {
+                    "Steering message delivered — a turn is starting on it now.".to_string()
+                }
+                Ok(Ok(UserMessageAck::Dropped)) => {
+                    "Error: the steering message was DROPPED — it never reached the \
+                     working agent (parallel mission cap, mission load failure, or a \
+                     rejected goal kickoff). Check read_history for the error event, \
+                     resolve the cause, then retry."
+                        .to_string()
+                }
                 Ok(Err(_)) | Err(_) => {
                     // The control loop accepted the command but never confirmed —
                     // the message is most likely in flight; don't claim failure.
-                    "Steering message submitted (no queue confirmation received). \
+                    "Steering message submitted (no delivery confirmation received). \
                      Check read_history shortly to confirm the agent saw it."
                         .to_string()
                 }
