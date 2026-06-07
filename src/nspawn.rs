@@ -540,6 +540,44 @@ async fn unmount_if_present(root: &Path, target: &str) -> NspawnResult<()> {
     Ok(())
 }
 
+/// Build the `systemd-nspawn` command for a one-shot container execution,
+/// wrapped in a capped transient scope under `missions.slice` when
+/// `MISSION_MEMORY_MAX` is configured (config env override → process env).
+///
+/// One-shot executions (workspace init scripts, template builds) can compile
+/// arbitrarily large projects; without this wrapper they run in the API
+/// service's cgroup and can throttle the whole service — same failure mode
+/// as the mission boot/attach paths in `workspace_exec.rs`.
+fn scope_wrapped_nspawn_command(path: &Path, env: &HashMap<String, String>) -> Command {
+    let caps = crate::workspace_exec::mission_memory_caps_from_env(env);
+    let dir_token: String = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let unit = format!(
+        "sandboxed-exec-{}-{}",
+        dir_token,
+        uuid::Uuid::new_v4().simple()
+    );
+    if let Some(scope_args) = caps.scope_run_args(&unit) {
+        let mut c = Command::new("systemd-run");
+        c.args(&scope_args);
+        c.arg("systemd-nspawn");
+        c
+    } else {
+        Command::new("systemd-nspawn")
+    }
+}
+
 /// Execute a command inside a container using systemd-nspawn.
 pub async fn execute_in_container(
     path: &Path,
@@ -550,7 +588,7 @@ pub async fn execute_in_container(
         return Err(NspawnError::NspawnExecution("Empty command".to_string()));
     }
 
-    let mut cmd = tokio::process::Command::new("systemd-nspawn");
+    let mut cmd = scope_wrapped_nspawn_command(path, &config.env);
     cmd.arg("-D").arg(path);
     cmd.arg("--quiet");
     // Disable timezone bind-mount (minbase containers lack /usr/share/zoneinfo)
@@ -643,7 +681,7 @@ pub async fn execute_in_container_streaming(
         return Err(NspawnError::NspawnExecution("Empty command".to_string()));
     }
 
-    let mut cmd = Command::new("systemd-nspawn");
+    let mut cmd = scope_wrapped_nspawn_command(path, &config.env);
     cmd.arg("-D").arg(path);
     cmd.arg("--quiet");
     cmd.arg("--timezone=off");
