@@ -69,6 +69,36 @@ fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
         .any(|entry| entry == expected.as_bytes())
 }
 
+/// Stable container identity for a workspace, derived from its path. Every
+/// transient scope a workspace spawns (mission boot, per-exec attach, and the
+/// one-shot nspawn wrapper in `nspawn.rs`) embeds this token, so scope
+/// discovery (`list_workspace_scope_units`) can match them all by substring.
+/// Keep all scope-naming sites in sync with this — a divergent token makes a
+/// scope invisible to live stats, retune, and the OOM watchdog.
+pub fn machine_name_for_path(path: &Path) -> Option<String> {
+    let base = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+    let sanitized: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    let suffix = format!("{:08x}", hasher.finish() as u32);
+
+    Some(format!("sandboxed-{}-{}", sanitized, suffix))
+}
+
 /// Build a valid transient systemd scope unit name for a mission container.
 /// systemd unit names allow `[A-Za-z0-9:._-]`; replace anything else with `_`.
 fn mission_scope_unit(machine_name: &str) -> String {
@@ -618,29 +648,7 @@ impl WorkspaceExec {
     }
 
     fn machine_name(&self) -> Option<String> {
-        let base = self
-            .workspace
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())?;
-        let sanitized: String = base
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-
-        let mut hasher = DefaultHasher::new();
-        self.workspace.path.hash(&mut hasher);
-        let suffix = format!("{:08x}", hasher.finish() as u32);
-
-        Some(format!("sandboxed-{}-{}", sanitized, suffix))
+        machine_name_for_path(&self.workspace.path)
     }
 
     /// Memory caps for this workspace's mission scopes (workspace env

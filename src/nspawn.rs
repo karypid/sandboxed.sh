@@ -550,24 +550,13 @@ async fn unmount_if_present(root: &Path, target: &str) -> NspawnResult<()> {
 /// as the mission boot/attach paths in `workspace_exec.rs`.
 fn scope_wrapped_nspawn_command(path: &Path, env: &HashMap<String, String>) -> Command {
     let caps = crate::workspace_exec::mission_memory_caps_from_env(env);
-    let dir_token: String = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let unit = format!(
-        "sandboxed-exec-{}-{}",
-        dir_token,
-        uuid::Uuid::new_v4().simple()
-    );
+    // Embed the same machine-name token the mission boot/attach scopes use so
+    // this one-shot scope is discoverable by `list_workspace_scope_units`
+    // (live stats, retune, OOM watchdog). A divergent token would make the
+    // scope get caps yet stay invisible to the workspace memory plumbing.
+    let token =
+        crate::workspace_exec::machine_name_for_path(path).unwrap_or_else(|| "unknown".to_string());
+    let unit = format!("sandboxed-exec-{}-{}", token, uuid::Uuid::new_v4().simple());
     if let Some(scope_args) = caps.scope_run_args(&unit) {
         let mut c = Command::new("systemd-run");
         c.args(&scope_args);

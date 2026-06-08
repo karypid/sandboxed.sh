@@ -1689,11 +1689,15 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
                     memory_peak = Some(memory_peak.unwrap_or(0).max(p));
                 }
                 if let Some(m) = max.filter(|m| *m != u64::MAX) {
-                    // Tightest configured cap across the workspace's scopes.
-                    memory_limit = Some(memory_limit.map_or(m, |cur: u64| cur.min(m)));
+                    // Each scope is independently capped, so the workspace's
+                    // ceiling is the sum across scopes — matching the summed
+                    // `MemoryCurrent` numerator. Taking the min here would let
+                    // summed usage exceed the displayed limit and peg the
+                    // gauge at 100% while still climbing.
+                    memory_limit = Some(memory_limit.unwrap_or(0) + m);
                 }
                 if let Some(a) = avail {
-                    memory_available = Some(memory_available.unwrap_or(0).max(a));
+                    memory_available = Some(memory_available.unwrap_or(0) + a);
                 }
             }
         }
