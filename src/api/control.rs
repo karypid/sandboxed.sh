@@ -7176,27 +7176,29 @@ async fn check_mission_oom_kills(
                 continue;
             };
             live_units.insert(unit.clone());
-            match oom_seen.get(&unit) {
-                Some(prev) if count > *prev => {
-                    let killed = count - prev;
-                    tracing::warn!(
-                        "Memory watchdog: {} OOM kill(s) in {} (mission {}, workspace {})",
-                        killed,
-                        unit,
-                        mission.id,
-                        workspace.name
-                    );
-                    let _ = events_tx.send(AgentEvent::MissionActivity {
-                        label: format!(
-                            "⚠ Memory limit hit: kernel OOM-killed {killed} process(es) in this \
-                             mission's cgroup. Builds should lower parallelism, or raise the \
-                             workspace memory cap (Resources panel / MISSION_MEMORY_MAX)."
-                        ),
-                        tool_name: "memory_watchdog".to_string(),
-                        mission_id: Some(mission.id),
-                    });
-                }
-                _ => {}
+            // Treat a never-seen scope as a baseline of 0 so the first kernel
+            // OOM in a freshly-discovered cgroup is reported rather than
+            // silently absorbed into the baseline (e.g. when the watchdog
+            // starts after a scope already accumulated kills).
+            let prev = oom_seen.get(&unit).copied().unwrap_or(0);
+            if count > prev {
+                let killed = count - prev;
+                tracing::warn!(
+                    "Memory watchdog: {} OOM kill(s) in {} (mission {}, workspace {})",
+                    killed,
+                    unit,
+                    mission.id,
+                    workspace.name
+                );
+                let _ = events_tx.send(AgentEvent::MissionActivity {
+                    label: format!(
+                        "⚠ Memory limit hit: kernel OOM-killed {killed} process(es) in this \
+                         mission's cgroup. Builds should lower parallelism, or raise the \
+                         workspace memory cap (Resources panel / MISSION_MEMORY_MAX)."
+                    ),
+                    tool_name: "memory_watchdog".to_string(),
+                    mission_id: Some(mission.id),
+                });
             }
             oom_seen.insert(unit, count);
         }

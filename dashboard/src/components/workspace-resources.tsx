@@ -78,6 +78,35 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
     }
   };
 
+  // Revert both overrides to the global MISSION_MEMORY_* defaults. The API
+  // treats an empty string as "clear this override" (vs. an absent field,
+  // which leaves it unchanged), so we send explicit empties here.
+  const resetDefaults = async () => {
+    setApplying(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await updateWorkspaceResources(workspaceId, {
+        memory_high: '',
+        memory_max: '',
+        persist: true,
+        apply_live: true,
+      });
+      setResult(
+        res.applied_units.length > 0
+          ? `Reset to defaults on ${res.applied_units.length} scope(s); cleared persisted overrides.`
+          : 'Cleared persisted overrides (applies at next boot).'
+      );
+      setMemoryHigh('');
+      setMemoryMax('');
+      mutate();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to reset resources');
+    } finally {
+      setApplying(false);
+    }
+  };
+
   return (
     <div className="rounded-lg bg-white/[0.02] border border-white/[0.05] p-3">
       <div className="flex items-center justify-between">
@@ -160,6 +189,14 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
           {applying ? 'Applying…' : 'Apply'}
         </button>
       </div>
+
+      <button
+        onClick={resetDefaults}
+        disabled={applying}
+        className="text-[10px] text-white/35 hover:text-white/60 mt-1.5 transition-colors disabled:cursor-not-allowed disabled:hover:text-white/35"
+      >
+        Reset to defaults
+      </button>
 
       {!inputsValid && hasInput && (
         <p className="text-[10px] text-red-300/80 mt-1.5">
