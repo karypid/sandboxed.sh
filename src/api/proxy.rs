@@ -537,6 +537,16 @@ pub(crate) async fn chat_completions_inner(
         );
     };
 
+    // Per-chain post-processing: strip `<think>` markup from responses for
+    // chains routed to models that leak reasoning into `content`. Direct
+    // provider/model passthrough ids aren't chains, so this resolves to false.
+    let strip_thinking = state
+        .chain_store
+        .get(&chain_id)
+        .await
+        .map(|c| c.strip_thinking)
+        .unwrap_or(false);
+
     if entries.is_empty() {
         if defer_on_rate_limit {
             return enqueue_deferred_request(&state, &headers, &chain_id, &body).await;
@@ -1663,7 +1673,7 @@ pub(crate) async fn chat_completions_inner(
                 Ok::<_, reqwest::Error>(bytes::Bytes::from(peek_buf))
             });
             let combined = peek_stream.chain(byte_stream);
-            let byte_stream = normalize_sse_stream(combined);
+            let byte_stream = normalize_sse_stream(combined, strip_thinking);
 
             // Wrap the stream to record success/failure on completion.
             let tracked_stream = track_stream_health(
@@ -1776,6 +1786,13 @@ pub(crate) async fn chat_completions_inner(
                         state.health_tracker.record_fallback_event(evt).await;
                     }
                 }
+                // Strip `<think>` markup from the completion body when the
+                // chain opts in (only meaningful on successful responses).
+                let resp_body = if strip_thinking && status.is_success() {
+                    strip_thinking_from_completion(&resp_body)
+                } else {
+                    resp_body
+                };
                 let mut builder = Response::builder().status(status);
                 if let Some(ct) = response_headers.get(header::CONTENT_TYPE) {
                     builder = builder.header(header::CONTENT_TYPE, ct);
@@ -2541,22 +2558,167 @@ fn classify_embedded_error(v: &serde_json::Value) -> CooldownReason {
     CooldownReason::ServerError
 }
 
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Incrementally strips model "thinking" markup from text: `<think>…</think>`
+/// blocks and stray orphan `</think>` tags. Some reasoning models prefill the
+/// opening `<think>` in the prompt template and emit only the closing tag, so
+/// orphan `</think>` must be dropped too. State persists across calls so a tag
+/// split across SSE deltas is handled correctly.
+#[derive(Default)]
+struct ThinkStripper {
+    /// True while inside an open `<think>` block.
+    inside: bool,
+    /// Trailing text held back because it may be the start of a tag that
+    /// continues in the next chunk.
+    pending: String,
+}
+
+impl ThinkStripper {
+    /// Feed a chunk of content; returns the text to emit. A partial tag at the
+    /// end is buffered until the next `feed`/`flush`.
+    fn feed(&mut self, input: &str) -> String {
+        let mut data = std::mem::take(&mut self.pending);
+        data.push_str(input);
+        let mut out = String::new();
+        loop {
+            if self.inside {
+                if let Some(pos) = data.find(THINK_CLOSE) {
+                    data.drain(..pos + THINK_CLOSE.len());
+                    self.inside = false;
+                    continue;
+                }
+                // No close yet — hold back a possible partial closing tag.
+                let keep = longest_tag_prefix_suffix(&data, &[THINK_CLOSE]);
+                self.pending = data.split_off(data.len() - keep);
+                return out;
+            }
+            // Outside a block: act on whichever of `<think>`/`</think>` is first.
+            match earliest_tag(data.find(THINK_OPEN), data.find(THINK_CLOSE)) {
+                Some((pos, true)) => {
+                    out.push_str(&data[..pos]);
+                    data.drain(..pos + THINK_OPEN.len());
+                    self.inside = true;
+                }
+                Some((pos, false)) => {
+                    // Orphan closing tag — emit preceding text, drop the tag.
+                    out.push_str(&data[..pos]);
+                    data.drain(..pos + THINK_CLOSE.len());
+                }
+                None => {
+                    let keep = longest_tag_prefix_suffix(&data, &[THINK_OPEN, THINK_CLOSE]);
+                    let emit_to = data.len() - keep;
+                    out.push_str(&data[..emit_to]);
+                    self.pending = data.split_off(emit_to);
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// Flush buffered text at end of stream. Leftover `pending` that never
+    /// completed a tag is literal content; drop it if still inside a block
+    /// (unterminated reasoning).
+    fn flush(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        if self.inside {
+            String::new()
+        } else {
+            pending
+        }
+    }
+}
+
+/// Of two optional `<think>`/`</think>` byte positions, return (pos, is_open)
+/// for whichever appears first.
+fn earliest_tag(open: Option<usize>, close: Option<usize>) -> Option<(usize, bool)> {
+    match (open, close) {
+        (Some(o), Some(c)) => Some(if o <= c { (o, true) } else { (c, false) }),
+        (Some(o), None) => Some((o, true)),
+        (None, Some(c)) => Some((c, false)),
+        (None, None) => None,
+    }
+}
+
+/// Length (bytes) of the longest suffix of `data` that is a proper prefix of
+/// any tag — the slice to hold back at a chunk boundary in case the tag
+/// continues. Tags are ASCII, so suffix boundaries are always valid.
+fn longest_tag_prefix_suffix(data: &str, tags: &[&str]) -> usize {
+    let upper = tags
+        .iter()
+        .map(|t| t.len() - 1)
+        .max()
+        .unwrap_or(0)
+        .min(data.len());
+    for len in (1..=upper).rev() {
+        let start = data.len() - len;
+        if !data.is_char_boundary(start) {
+            continue;
+        }
+        let suffix = &data[start..];
+        if tags.iter().any(|t| t.len() > len && t.starts_with(suffix)) {
+            return len;
+        }
+    }
+    0
+}
+
+/// Strip `<think>` markup from a non-streaming chat-completion JSON body's
+/// `choices[].message.content`. Returns the original bytes on parse failure or
+/// when nothing changed.
+fn strip_thinking_from_completion(body: &bytes::Bytes) -> bytes::Bytes {
+    let mut v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return body.clone(),
+    };
+    let mut changed = false;
+    if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        for choice in choices {
+            if let Some(msg) = choice.get_mut("message").and_then(|m| m.as_object_mut()) {
+                if let Some(content) = msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+                {
+                    let mut st = ThinkStripper::default();
+                    let mut stripped = st.feed(&content);
+                    stripped.push_str(&st.flush());
+                    if stripped != content {
+                        msg.insert("content".into(), serde_json::Value::String(stripped));
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    if !changed {
+        return body.clone();
+    }
+    serde_json::to_vec(&v)
+        .map(bytes::Bytes::from)
+        .unwrap_or_else(|_| body.clone())
+}
+
 /// Normalize an SSE byte stream to fix provider-specific quirks.
 ///
 /// Processes `data:` lines, parses the JSON chunk, and strips fields that
 /// break OpenAI-compatible clients (e.g. MiniMax sending `delta.role: ""`).
+/// When `strip_thinking` is set, also removes `<think>…</think>` markup from
+/// streamed `delta.content` (state threaded across chunks).
 fn normalize_sse_stream(
     inner: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    strip_thinking: bool,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     futures::stream::unfold(
-        (Box::pin(inner), Vec::<u8>::new()),
-        |(mut stream, mut buf)| async move {
+        (Box::pin(inner), Vec::<u8>::new(), ThinkStripper::default()),
+        move |(mut stream, mut buf, mut stripper)| async move {
             loop {
                 // Check if we have a complete line in the buffer
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line = buf.drain(..=pos).collect::<Vec<u8>>();
-                    let normalized = normalize_sse_line(&line);
-                    return Some((Ok(bytes::Bytes::from(normalized)), (stream, buf)));
+                    let normalized = normalize_sse_line(&line, strip_thinking, &mut stripper);
+                    return Some((Ok(bytes::Bytes::from(normalized)), (stream, buf, stripper)));
                 }
 
                 // Need more data
@@ -2565,7 +2727,10 @@ fn normalize_sse_stream(
                         buf.extend_from_slice(&chunk);
                     }
                     Some(Err(e)) => {
-                        return Some((Err(std::io::Error::other(e.to_string())), (stream, buf)));
+                        return Some((
+                            Err(std::io::Error::other(e.to_string())),
+                            (stream, buf, stripper),
+                        ));
                     }
                     None => {
                         // Stream ended — flush remaining buffer
@@ -2573,8 +2738,9 @@ fn normalize_sse_stream(
                             return None;
                         }
                         let remaining = std::mem::take(&mut buf);
-                        let normalized = normalize_sse_line(&remaining);
-                        return Some((Ok(bytes::Bytes::from(normalized)), (stream, buf)));
+                        let normalized =
+                            normalize_sse_line(&remaining, strip_thinking, &mut stripper);
+                        return Some((Ok(bytes::Bytes::from(normalized)), (stream, buf, stripper)));
                     }
                 }
             }
@@ -2584,7 +2750,7 @@ fn normalize_sse_stream(
 
 /// Normalize a single SSE line.  If it's a `data: {...}` line, parse and
 /// fix known provider quirks; otherwise pass through unchanged.
-fn normalize_sse_line(line: &[u8]) -> Vec<u8> {
+fn normalize_sse_line(line: &[u8], strip_thinking: bool, stripper: &mut ThinkStripper) -> Vec<u8> {
     let trimmed = line
         .strip_suffix(b"\r\n")
         .or_else(|| line.strip_suffix(b"\n"))
@@ -2613,13 +2779,30 @@ fn normalize_sse_line(line: &[u8]) -> Vec<u8> {
 
     let mut modified = false;
 
-    // Fix MiniMax: strip empty `delta.role` field
+    // Fix MiniMax: strip empty `delta.role` field, and (when enabled) strip
+    // `<think>` markup from streamed `delta.content`.
     if let Some(choices) = chunk.get_mut("choices").and_then(|v| v.as_array_mut()) {
         for choice in choices {
             if let Some(delta) = choice.get_mut("delta").and_then(|v| v.as_object_mut()) {
                 if delta.get("role").and_then(|v| v.as_str()) == Some("") {
                     delta.remove("role");
                     modified = true;
+                }
+                if strip_thinking {
+                    if let Some(content) = delta
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                    {
+                        // Always feed so the stripper's cross-chunk state
+                        // advances, even when the chunk is unchanged.
+                        let stripped = stripper.feed(&content);
+                        if stripped != content {
+                            delta
+                                .insert("content".to_string(), serde_json::Value::String(stripped));
+                            modified = true;
+                        }
+                    }
                 }
             }
         }
@@ -4304,6 +4487,77 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::StreamExt;
+
+    /// Feed an input as a single chunk and flush; the full-content path.
+    fn strip_once(input: &str) -> String {
+        let mut s = ThinkStripper::default();
+        let mut out = s.feed(input);
+        out.push_str(&s.flush());
+        out
+    }
+
+    #[test]
+    fn think_stripper_removes_full_block() {
+        assert_eq!(strip_once("<think>reasoning here</think>Hello"), "Hello");
+    }
+
+    #[test]
+    fn think_stripper_removes_orphan_closing_tag() {
+        // MiniMax prefills `<think>` in the prompt, so only the closing tag is
+        // emitted — the symptom seen in the Hermes Telegram gateway.
+        assert_eq!(strip_once("</think>\n\nThe answer"), "\n\nThe answer");
+    }
+
+    #[test]
+    fn think_stripper_handles_repeated_orphans() {
+        assert_eq!(strip_once("</think>a</think>b</think>c"), "abc");
+    }
+
+    #[test]
+    fn think_stripper_passes_through_plain_text() {
+        assert_eq!(strip_once("just a normal answer"), "just a normal answer");
+    }
+
+    #[test]
+    fn think_stripper_handles_tag_split_across_chunks() {
+        let mut s = ThinkStripper::default();
+        // `</think>` arrives split: "</thi" then "nk>answer".
+        assert_eq!(s.feed("foo</thi"), "foo");
+        assert_eq!(s.feed("nk>answer"), "answer");
+        assert_eq!(s.flush(), "");
+    }
+
+    #[test]
+    fn think_stripper_block_split_across_chunks() {
+        let mut s = ThinkStripper::default();
+        assert_eq!(s.feed("<think>some "), "");
+        assert_eq!(s.feed("long reasoning"), "");
+        assert_eq!(s.feed("</think>visible"), "visible");
+        assert_eq!(s.flush(), "");
+    }
+
+    #[test]
+    fn think_stripper_drops_unterminated_block() {
+        // An open block with no close = trailing reasoning; drop it.
+        assert_eq!(strip_once("answer<think>cut off"), "answer");
+    }
+
+    #[test]
+    fn strip_thinking_from_completion_rewrites_message_content() {
+        let body = Bytes::from(
+            r#"{"choices":[{"message":{"role":"assistant","content":"</think>Hi there"}}]}"#,
+        );
+        let out = strip_thinking_from_completion(&body);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Hi there");
+    }
+
+    #[test]
+    fn strip_thinking_from_completion_noop_when_clean() {
+        let body = Bytes::from(r#"{"choices":[{"message":{"content":"plain answer"}}]}"#);
+        let out = strip_thinking_from_completion(&body);
+        assert_eq!(out, body);
+    }
 
     #[test]
     fn parse_direct_model_entry_accepts_known_provider_prefix() {
