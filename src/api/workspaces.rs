@@ -1667,6 +1667,8 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
     let mut memory_peak: Option<u64> = None;
     let mut memory_limit: Option<u64> = None;
     let mut memory_available: Option<u64> = None;
+    let mut read_ok = false;
+    let mut last_error: Option<String> = None;
 
     for unit in &units {
         let output = tokio::process::Command::new("systemctl")
@@ -1678,8 +1680,21 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
             ])
             .output()
             .await;
+        match &output {
+            Ok(o) if !o.status.success() => {
+                last_error = Some(format!(
+                    "systemctl show {unit} failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ));
+            }
+            Err(e) => {
+                last_error = Some(format!("systemctl show {unit} errored: {e}"));
+            }
+            _ => {}
+        }
         if let Ok(output) = output {
             if output.status.success() {
+                read_ok = true;
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let (cur, peak, max, avail, _) = parse_systemd_memory_stats(&stdout);
                 if let Some(c) = cur {
@@ -1717,7 +1732,15 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
             .map(|b| format!("{:.2}", b as f64 / 1024.0 / 1024.0))
             .or(Some("unlimited".to_string())),
         container_name,
-        error: None,
+        // Scopes exist but not one `systemctl show` succeeded — surface it
+        // instead of returning blank stats with no explanation.
+        error: if read_ok {
+            None
+        } else {
+            Some(last_error.unwrap_or_else(|| {
+                "Found mission scopes but could not read their memory stats".to_string()
+            }))
+        },
     }
 }
 

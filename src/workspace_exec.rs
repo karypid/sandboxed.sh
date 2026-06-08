@@ -193,16 +193,18 @@ pub(crate) fn mission_memory_caps_from_env(env: &HashMap<String, String>) -> Mis
 }
 
 /// Resolve one memory-cap key: workspace env override first, then process env.
-/// Empty values mean "unset" at both levels, so a workspace can also *clear*
-/// a global default by setting the var to an empty string.
+/// An empty workspace value is treated as "no override" and falls back to the
+/// process default — same as removing the key — so clearing a cap via the raw
+/// env editor and via the Resources "Reset to defaults" button behave
+/// identically, and neither silently drops the mission out of its cgroup scope.
+/// To run a single workspace genuinely uncapped, set the value to `"infinity"`
+/// (which still wraps the mission in a discoverable scope).
 fn resolve_memory_var(workspace_env: &HashMap<String, String>, key: &str) -> Option<String> {
     if let Some(v) = workspace_env.get(key) {
         let v = v.trim();
-        return if v.is_empty() {
-            None
-        } else {
-            Some(v.to_string())
-        };
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
     }
     std::env::var(key)
         .ok()
