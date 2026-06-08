@@ -2710,15 +2710,34 @@ fn normalize_sse_stream(
     inner: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     strip_thinking: bool,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    // State carries the stream, the line buffer, the cross-chunk `<think>`
+    // stripper, a remembered chunk envelope (id/model/created — used to build a
+    // synthetic flush chunk for any text the stripper held back), and a flag so
+    // we flush that held-back text exactly once.
     futures::stream::unfold(
-        (Box::pin(inner), Vec::<u8>::new(), ThinkStripper::default()),
-        move |(mut stream, mut buf, mut stripper)| async move {
+        (
+            Box::pin(inner),
+            Vec::<u8>::new(),
+            ThinkStripper::default(),
+            Option::<serde_json::Value>::None,
+            false,
+        ),
+        move |(mut stream, mut buf, mut stripper, mut envelope, mut flushed)| async move {
             loop {
                 // Check if we have a complete line in the buffer
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line = buf.drain(..=pos).collect::<Vec<u8>>();
-                    let normalized = normalize_sse_line(&line, strip_thinking, &mut stripper);
-                    return Some((Ok(bytes::Bytes::from(normalized)), (stream, buf, stripper)));
+                    let normalized = normalize_sse_line(
+                        &line,
+                        strip_thinking,
+                        &mut stripper,
+                        &mut envelope,
+                        &mut flushed,
+                    );
+                    return Some((
+                        Ok(bytes::Bytes::from(normalized)),
+                        (stream, buf, stripper, envelope, flushed),
+                    ));
                 }
 
                 // Need more data
@@ -2729,18 +2748,43 @@ fn normalize_sse_stream(
                     Some(Err(e)) => {
                         return Some((
                             Err(std::io::Error::other(e.to_string())),
-                            (stream, buf, stripper),
+                            (stream, buf, stripper, envelope, flushed),
                         ));
                     }
                     None => {
-                        // Stream ended — flush remaining buffer
-                        if buf.is_empty() {
-                            return None;
+                        // Stream ended — flush remaining buffer first.
+                        if !buf.is_empty() {
+                            let remaining = std::mem::take(&mut buf);
+                            let normalized = normalize_sse_line(
+                                &remaining,
+                                strip_thinking,
+                                &mut stripper,
+                                &mut envelope,
+                                &mut flushed,
+                            );
+                            return Some((
+                                Ok(bytes::Bytes::from(normalized)),
+                                (stream, buf, stripper, envelope, flushed),
+                            ));
                         }
-                        let remaining = std::mem::take(&mut buf);
-                        let normalized =
-                            normalize_sse_line(&remaining, strip_thinking, &mut stripper);
-                        return Some((Ok(bytes::Bytes::from(normalized)), (stream, buf, stripper)));
+                        // Fallback flush for providers that end the stream without
+                        // a `[DONE]` terminator (the `[DONE]` path flushes inline,
+                        // before the terminator, so it doesn't reach here).
+                        if strip_thinking && !flushed {
+                            flushed = true;
+                            let leftover = stripper.flush();
+                            if !leftover.is_empty() {
+                                if let Some(chunk_line) =
+                                    build_flush_chunk_line(envelope.as_ref(), &leftover, b"\n")
+                                {
+                                    return Some((
+                                        Ok(bytes::Bytes::from(chunk_line)),
+                                        (stream, buf, stripper, envelope, flushed),
+                                    ));
+                                }
+                            }
+                        }
+                        return None;
                     }
                 }
             }
@@ -2750,7 +2794,13 @@ fn normalize_sse_stream(
 
 /// Normalize a single SSE line.  If it's a `data: {...}` line, parse and
 /// fix known provider quirks; otherwise pass through unchanged.
-fn normalize_sse_line(line: &[u8], strip_thinking: bool, stripper: &mut ThinkStripper) -> Vec<u8> {
+fn normalize_sse_line(
+    line: &[u8],
+    strip_thinking: bool,
+    stripper: &mut ThinkStripper,
+    envelope: &mut Option<serde_json::Value>,
+    flushed: &mut bool,
+) -> Vec<u8> {
     let trimmed = line
         .strip_suffix(b"\r\n")
         .or_else(|| line.strip_suffix(b"\n"))
@@ -2763,12 +2813,27 @@ fn normalize_sse_line(line: &[u8], strip_thinking: bool, stripper: &mut ThinkStr
 
     let json_bytes = &trimmed[data_prefix.len()..];
 
-    // "data: [DONE]" — pass through
+    // "data: [DONE]" — terminator. Before passing it through, emit any literal
+    // text the stripper held back at the last chunk boundary (e.g. a reply
+    // ending in `<` or `</thi`), so it isn't lost. It must precede `[DONE]`
+    // because clients stop reading at the terminator.
     let json_trimmed: &[u8] = {
         let s = std::str::from_utf8(json_bytes).unwrap_or("");
         s.trim().as_bytes()
     };
     if json_trimmed == b"[DONE]" {
+        if strip_thinking && !*flushed {
+            *flushed = true;
+            let leftover = stripper.flush();
+            if !leftover.is_empty() {
+                if let Some(mut chunk_line) =
+                    build_flush_chunk_line(envelope.as_ref(), &leftover, line)
+                {
+                    chunk_line.extend_from_slice(line);
+                    return chunk_line;
+                }
+            }
+        }
         return line.to_vec();
     }
 
@@ -2808,6 +2873,15 @@ fn normalize_sse_line(line: &[u8], strip_thinking: bool, stripper: &mut ThinkStr
         }
     }
 
+    // Remember the first envelope that has a `choices` array so an end-of-stream
+    // flush chunk can reuse its id/model/created framing.
+    if strip_thinking
+        && envelope.is_none()
+        && chunk.get("choices").and_then(|v| v.as_array()).is_some()
+    {
+        *envelope = Some(chunk.clone());
+    }
+
     if !modified {
         return line.to_vec();
     }
@@ -2824,6 +2898,44 @@ fn normalize_sse_line(line: &[u8], strip_thinking: bool, stripper: &mut ThinkStr
     let _ = serde_json::to_writer(&mut out, &chunk);
     out.extend_from_slice(suffix);
     out
+}
+
+/// Build a synthetic `data: {...}` SSE event carrying `leftover` as the first
+/// choice's `delta.content`, reusing `envelope` (a remembered chunk) for the
+/// id/model/created framing. Used to emit text the [`ThinkStripper`] held back
+/// at the final chunk boundary. Returns `None` when there is no usable
+/// envelope. The event is terminated with a blank line so clients treat it as
+/// its own SSE event.
+fn build_flush_chunk_line(
+    envelope: Option<&serde_json::Value>,
+    leftover: &str,
+    ref_line: &[u8],
+) -> Option<Vec<u8>> {
+    let mut chunk = envelope?.clone();
+    let choices = chunk.get_mut("choices")?.as_array_mut()?;
+    let first = choices.first_mut()?.as_object_mut()?;
+    let mut delta = serde_json::Map::new();
+    delta.insert(
+        "content".to_string(),
+        serde_json::Value::String(leftover.to_string()),
+    );
+    first.insert("delta".to_string(), serde_json::Value::Object(delta));
+    // A leftover-content chunk is not a terminal chunk.
+    first.remove("finish_reason");
+    // Keep only the first choice — we only carry single-choice leftover text.
+    choices.truncate(1);
+
+    let suffix: &[u8] = if ref_line.ends_with(b"\r\n") {
+        b"\r\n"
+    } else {
+        b"\n"
+    };
+    let mut out = Vec::from(&b"data: "[..]);
+    serde_json::to_writer(&mut out, &chunk).ok()?;
+    // Event line terminator + blank line separating this from the next event.
+    out.extend_from_slice(suffix);
+    out.extend_from_slice(suffix);
+    Some(out)
 }
 
 /// Wrap a streaming response to defer health tracking until the stream finishes.
@@ -4557,6 +4669,51 @@ mod tests {
         let body = Bytes::from(r#"{"choices":[{"message":{"content":"plain answer"}}]}"#);
         let out = strip_thinking_from_completion(&body);
         assert_eq!(out, body);
+    }
+
+    #[test]
+    fn normalize_sse_line_flushes_leftover_before_done() {
+        // Regression: a streamed reply whose final content delta ends in a
+        // tag-prefix char (`<`) had that char held back by the stripper and
+        // never emitted, because the stream-end flush ran after `[DONE]`.
+        let mut stripper = ThinkStripper::default();
+        let mut envelope = None;
+        let mut flushed = false;
+
+        // First content chunk — establishes the envelope, no tags to strip.
+        let l1 = b"data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n";
+        let out1 = normalize_sse_line(l1, true, &mut stripper, &mut envelope, &mut flushed);
+        assert_eq!(out1, l1.to_vec());
+
+        // Final content chunk ends with `<` — a tag-prefix, so it is held back.
+        let l2 = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a <\"}}]}\n";
+        let out2 = normalize_sse_line(l2, true, &mut stripper, &mut envelope, &mut flushed);
+        let s2 = String::from_utf8(out2).unwrap();
+        assert!(
+            s2.contains(r#""content":"a ""#),
+            "expected held-back `<`, got: {s2}"
+        );
+
+        // `[DONE]` — the held-back `<` must be emitted, and before the terminator.
+        let done = b"data: [DONE]\n";
+        let out3 = normalize_sse_line(done, true, &mut stripper, &mut envelope, &mut flushed);
+        let s3 = String::from_utf8(out3).unwrap();
+        let content_pos = s3
+            .find(r#""content":"<""#)
+            .unwrap_or_else(|| panic!("leftover `<` not flushed: {s3}"));
+        let done_pos = s3.find("[DONE]").unwrap();
+        assert!(content_pos < done_pos, "leftover must precede [DONE]: {s3}");
+    }
+
+    #[test]
+    fn normalize_sse_line_done_passthrough_when_nothing_held_back() {
+        // No leftover → `[DONE]` passes through untouched (no synthetic chunk).
+        let mut stripper = ThinkStripper::default();
+        let mut envelope = None;
+        let mut flushed = false;
+        let done = b"data: [DONE]\n";
+        let out = normalize_sse_line(done, true, &mut stripper, &mut envelope, &mut flushed);
+        assert_eq!(out, done.to_vec());
     }
 
     #[test]
