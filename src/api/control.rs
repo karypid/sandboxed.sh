@@ -7185,7 +7185,17 @@ async fn check_mission_oom_kills(
         let Some(workspace) = workspaces.get(*workspace_id).await else {
             continue;
         };
-        let units = crate::api::workspaces::list_workspace_scope_units(&workspace).await;
+        let units = match crate::api::workspaces::list_workspace_scope_units(&workspace).await {
+            Ok(units) => units,
+            Err(e) => {
+                tracing::warn!(
+                    "OOM watchdog: could not list scopes for {}: {}",
+                    workspace.name,
+                    e
+                );
+                continue;
+            }
+        };
         for unit in units {
             let Some(count) = read_scope_oom_kills(&unit).await else {
                 continue;

@@ -1641,7 +1641,25 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
     // `--register=no`, so machined scopes don't exist.
     let exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
     let container_name = exec.mission_scope_match_token();
-    let units = list_workspace_scope_units(workspace).await;
+    let units = match list_workspace_scope_units(workspace).await {
+        Ok(units) => units,
+        Err(e) => {
+            return WorkspaceMemoryStats {
+                workspace_id: workspace.id,
+                workspace_name: workspace.name.clone(),
+                workspace_type: workspace_type_str.to_string(),
+                memory_current_bytes: None,
+                memory_peak_bytes: None,
+                memory_limit_bytes: None,
+                memory_available_bytes: None,
+                memory_current_mb: None,
+                memory_peak_mb: None,
+                memory_limit_mb: None,
+                container_name,
+                error: Some(format!("Could not query mission scopes: {e}")),
+            };
+        }
+    };
 
     if units.is_empty() {
         return WorkspaceMemoryStats {
@@ -1746,10 +1764,17 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
 
 /// Every transient scope unit currently alive that belongs to this
 /// workspace's container: the boot scope plus per-exec attach scopes.
-pub(crate) async fn list_workspace_scope_units(workspace: &Workspace) -> Vec<String> {
+///
+/// `Ok(vec![])` means the query ran and the workspace genuinely has no live
+/// scopes; `Err` means the `systemctl list-units` query itself failed, so
+/// callers must not interpret the result as "no scopes" (the container may
+/// still be running and capped).
+pub(crate) async fn list_workspace_scope_units(
+    workspace: &Workspace,
+) -> Result<Vec<String>, String> {
     let exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
     let Some(token) = exec.mission_scope_match_token() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let output = tokio::process::Command::new("systemctl")
         .args([
@@ -1761,16 +1786,20 @@ pub(crate) async fn list_workspace_scope_units(workspace: &Workspace) -> Vec<Str
             "sandboxed-exec-*.scope",
         ])
         .output()
-        .await;
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&output.stdout)
+        .await
+        .map_err(|e| format!("failed to run systemctl list-units: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl list-units failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .filter(|unit| unit.contains(&token))
         .map(|s| s.to_string())
-        .collect()
+        .collect())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1877,7 +1906,19 @@ async fn update_workspace_resources(
     let mut applied_units = Vec::new();
     let mut failed_units = Vec::new();
     if req.apply_live {
-        let units = list_workspace_scope_units(&workspace).await;
+        let units = match list_workspace_scope_units(&workspace).await {
+            Ok(units) => units,
+            Err(e) => {
+                // Persist still applies (caps take at next boot); record why
+                // the live retune found nothing instead of silently skipping.
+                tracing::warn!(
+                    "apply_live: could not list scopes for {}: {}",
+                    workspace.name,
+                    e
+                );
+                Vec::new()
+            }
+        };
         for unit in units {
             let mut cmd = tokio::process::Command::new("systemctl");
             cmd.args(["set-property", "--runtime", &unit]);
