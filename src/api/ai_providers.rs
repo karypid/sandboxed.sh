@@ -6677,18 +6677,17 @@ async fn get_provider_usage(
                     // else probe the Codex backend directly. Never probed by the
                     // background loop (see spawn_usage_refresh_loop) — only here,
                     // on dashboard demand, throttled by the store's TTL.
-                    let token_ok = !oauth_token_expired(o.expires_at);
-                    let base = serde_json::json!({
+                    let mut base = serde_json::json!({
                         "provider_type": "openai",
                         "provider_name": provider_name,
                         "account_email": account_email,
-                        "status": if token_ok { "connected" } else { "needs_reauth" },
+                        "status": "connected",
                     });
                     // The codex_usage store is keyed by the provider account
                     // UUID so the proxy's passive `model_cooldown` capture
                     // (which only knows `entry.account_id`) and this active
-                    // probe agree on the key. The probe REQUEST still needs the
-                    // ChatGPT account id, decoded from the token below.
+                    // probe agree on the key. The probe REQUEST needs the
+                    // ChatGPT account id, decoded from the token.
                     let store_key = match provider_uuid {
                         Some(u) => u.to_string(),
                         None => crate::api::codex_usage::account_id_from_token(&o.access_token)
@@ -6707,17 +6706,51 @@ async fn get_provider_usage(
                     if let Some(snap) = state.codex_usage.get_fresh(&store_key).await {
                         return Ok(Json(merge_codex_usage(base, &snap)));
                     }
-                    // Expired token: don't probe (would 401). Show last known.
-                    if !token_ok {
+
+                    // Get a usable access token: refresh + persist if expired.
+                    // We excluded these accounts from the background refresh
+                    // loop, so don't rely on it having kept the token fresh.
+                    let working_dir = &state.config.working_dir;
+                    let token = match find_openai_oauth_account_by_chatgpt_account_id(
+                        working_dir,
+                        &chatgpt_account_id,
+                    ) {
+                        Some(acct) => {
+                            match prepare_codex_oauth_account_for_launch(working_dir, &acct).await {
+                                Ok(fresh) => Some(fresh.access_token),
+                                Err(e) => {
+                                    tracing::debug!("Codex usage token refresh failed: {}", e);
+                                    let lower = e.to_lowercase();
+                                    if lower.contains("invalid_grant")
+                                        || lower.contains("expired")
+                                        || lower.contains("revoked")
+                                    {
+                                        base["status"] = serde_json::json!("needs_reauth");
+                                    }
+                                    None
+                                }
+                            }
+                        }
+                        // Not in the store file (e.g. OpenCode-auth only): try
+                        // the token we already hold.
+                        None if !oauth_token_expired(o.expires_at) => Some(o.access_token.clone()),
+                        None => {
+                            base["status"] = serde_json::json!("needs_reauth");
+                            None
+                        }
+                    };
+                    let Some(token) = token else {
+                        // Couldn't get a live token — show last known snapshot.
                         if let Some(snap) = state.codex_usage.get_any(&store_key).await {
                             return Ok(Json(merge_codex_usage(base, &snap)));
                         }
                         return Ok(Json(base));
-                    }
+                    };
+
                     // Active probe (A).
                     match crate::api::codex_usage::probe(
                         &state.http_client,
-                        &o.access_token,
+                        &token,
                         &chatgpt_account_id,
                     )
                     .await
