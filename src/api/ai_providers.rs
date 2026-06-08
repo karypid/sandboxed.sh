@@ -6724,6 +6724,8 @@ async fn get_provider_usage(
                                     if lower.contains("invalid_grant")
                                         || lower.contains("expired")
                                         || lower.contains("revoked")
+                                        || lower.contains("401")
+                                        || lower.contains("unauthorized")
                                     {
                                         base["status"] = serde_json::json!("needs_reauth");
                                     }
