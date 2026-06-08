@@ -1802,6 +1802,9 @@ fn default_true() -> bool {
 pub struct UpdateWorkspaceResourcesResponse {
     /// Units the new caps were applied to live (empty when none running).
     pub applied_units: Vec<String>,
+    /// Running scopes whose live retune failed (e.g. `systemctl set-property`
+    /// errored). Non-empty here means scopes exist but caps did not take live.
+    pub failed_units: Vec<String>,
     pub persisted: bool,
     /// Effective caps after this call (override merged with global defaults).
     pub memory_max: Option<String>,
@@ -1872,6 +1875,7 @@ async fn update_workspace_resources(
     let caps = exec.mission_memory_caps();
 
     let mut applied_units = Vec::new();
+    let mut failed_units = Vec::new();
     if req.apply_live {
         let units = list_workspace_scope_units(&workspace).await;
         for unit in units {
@@ -1894,9 +1898,11 @@ async fn update_workspace_resources(
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     tracing::warn!("set-property failed for {}: {}", unit, stderr.trim());
+                    failed_units.push(unit);
                 }
                 Err(e) => {
                     tracing::warn!("set-property spawn failed for {}: {}", unit, e);
+                    failed_units.push(unit);
                 }
             }
         }
@@ -1918,6 +1924,7 @@ async fn update_workspace_resources(
 
     Ok(Json(UpdateWorkspaceResourcesResponse {
         applied_units,
+        failed_units,
         persisted: req.persist,
         memory_max: caps.max,
         memory_high: caps.high,

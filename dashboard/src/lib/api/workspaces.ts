@@ -192,6 +192,7 @@ export interface UpdateWorkspaceResourcesRequest {
 
 export interface UpdateWorkspaceResourcesResponse {
   applied_units: string[];
+  failed_units: string[];
   persisted: boolean;
   memory_max: string | null;
   memory_high: string | null;

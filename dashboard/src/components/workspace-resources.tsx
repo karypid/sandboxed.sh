@@ -63,11 +63,21 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
         persist: true,
         apply_live: true,
       });
-      setResult(
-        res.applied_units.length > 0
-          ? `Applied live to ${res.applied_units.length} scope(s); persisted for future boots.`
-          : 'Persisted; no running scopes to retune (applies at next boot).'
-      );
+      if (res.failed_units.length > 0 && res.applied_units.length === 0) {
+        setError(
+          `Persisted, but live retune failed on ${res.failed_units.length} running scope(s) — caps apply at next boot. Check server logs.`
+        );
+      } else {
+        setResult(
+          res.applied_units.length > 0
+            ? `Applied live to ${res.applied_units.length} scope(s)${
+                res.failed_units.length > 0
+                  ? ` (${res.failed_units.length} failed)`
+                  : ''
+              }; persisted for future boots.`
+            : 'Persisted; no running scopes to retune (applies at next boot).'
+        );
+      }
       setMemoryHigh('');
       setMemoryMax('');
       mutate();
@@ -92,11 +102,21 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
         persist: true,
         apply_live: true,
       });
-      setResult(
-        res.applied_units.length > 0
-          ? `Reset to defaults on ${res.applied_units.length} scope(s); cleared persisted overrides.`
-          : 'Cleared persisted overrides (applies at next boot).'
-      );
+      if (res.failed_units.length > 0 && res.applied_units.length === 0) {
+        setError(
+          `Cleared overrides, but live retune failed on ${res.failed_units.length} running scope(s) — defaults apply at next boot. Check server logs.`
+        );
+      } else {
+        setResult(
+          res.applied_units.length > 0
+            ? `Reset to defaults on ${res.applied_units.length} scope(s)${
+                res.failed_units.length > 0
+                  ? ` (${res.failed_units.length} failed)`
+                  : ''
+              }; cleared persisted overrides.`
+            : 'Cleared persisted overrides (applies at next boot).'
+        );
+      }
       setMemoryHigh('');
       setMemoryMax('');
       mutate();
