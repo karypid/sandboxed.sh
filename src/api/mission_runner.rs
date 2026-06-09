@@ -5524,6 +5524,13 @@ pub fn run_claudecode_turn<'a>(
                                                             )
                                                             .await;
                                                         }
+                                                        // Mark the mission as waiting on the user so the
+                                                        // stuck-mission watchdog does not interrupt it for
+                                                        // "inactivity" while it is parked here. The guard
+                                                        // clears the mark on every exit path (answered or
+                                                        // cancelled).
+                                                        let wait_guard =
+                                                            FrontendToolHub::begin_waiting(&hub, mission_id);
                                                         let rx = hub.register(id.clone()).await;
 
                                                         pty.kill();
@@ -5545,6 +5552,10 @@ pub fn run_claudecode_turn<'a>(
                                                                 }
                                                             }
                                                         };
+                                                        // Answer received — the mission is active again and
+                                                        // resumes emitting events, so release the watchdog
+                                                        // exemption before running the continuation turn.
+                                                        drop(wait_guard);
 
                                                         if let Some(ref status_ref) = status {
                                                             set_control_state_for_mission(
@@ -13163,6 +13174,84 @@ fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// Pull the "try again at <when>" reset window Codex appends to its usage-limit
+/// message, e.g. `Jun 11th, 2026 3:00 AM`. Returns the raw human string (without
+/// the trailing period) so it can be shown verbatim, since Codex does not
+/// include the timezone.
+fn extract_codex_reset_window(output: &str) -> Option<String> {
+    // The message is ASCII, so a case-insensitive byte search keeps offsets
+    // aligned with `output`.
+    let lower = output.to_ascii_lowercase();
+    let marker = "try again at ";
+    let start = lower.find(marker)? + marker.len();
+    let rest = &output[start..];
+    // Codex ends the sentence with a period; stop at that (or a newline).
+    let end = rest.find(['.', '\n']).unwrap_or(rest.len());
+    let window = rest[..end].trim();
+    (!window.is_empty()).then(|| window.to_string())
+}
+
+/// Best-effort parse of a Codex reset window into a comparable timestamp so the
+/// aggregated message can report the *earliest* reset across accounts. Returns
+/// `None` (and the caller falls back to display order) when the format drifts.
+fn parse_codex_reset_window(window: &str) -> Option<chrono::NaiveDateTime> {
+    // Drop the ordinal suffix that always precedes the comma ("11th," -> "11,").
+    let cleaned = window
+        .replace("th,", ",")
+        .replace("st,", ",")
+        .replace("nd,", ",")
+        .replace("rd,", ",");
+    for fmt in ["%b %d, %Y %I:%M %p", "%b %e, %Y %I:%M %p"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(cleaned.trim(), fmt) {
+            return Some(dt);
+        }
+    }
+    None
+}
+
+/// Build a single user-facing message for the case where rotation tried every
+/// connected Codex account and they were *all* at their ChatGPT usage limit.
+/// Without this the runner just echoes the last account's raw "try again at …"
+/// line, which is identical to the first account's and reads as if no rotation
+/// happened at all.
+fn summarize_codex_usage_caps(capped_outputs: &[String], account_count: usize) -> String {
+    // Distinct reset windows, soonest first when parseable.
+    let mut windows: Vec<(Option<chrono::NaiveDateTime>, String)> = Vec::new();
+    for output in capped_outputs {
+        if let Some(window) = extract_codex_reset_window(output) {
+            if !windows.iter().any(|(_, existing)| existing == &window) {
+                windows.push((parse_codex_reset_window(&window), window));
+            }
+        }
+    }
+    windows.sort_by(|a, b| match (a.0, b.0) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    let mut msg = format!(
+        "All {} connected Codex account{} are at their ChatGPT usage limit.",
+        account_count,
+        if account_count == 1 { "" } else { "s" }
+    );
+    match windows.split_first() {
+        Some(((_, earliest), [])) => {
+            msg.push_str(&format!(" Usage resets at {earliest}."));
+        }
+        Some(((_, earliest), _rest)) => {
+            msg.push_str(&format!(" Earliest reset at {earliest}."));
+        }
+        None => {}
+    }
+    msg.push_str(
+        " Connect a Codex account with available quota (or an OpenAI API key), \
+         switch this mission to another backend, or wait for the reset.",
+    );
+    msg
+}
+
 /// Run a codex turn through the unified credential pool with rotation and
 /// account-level cooldown handling. Shared by the initial mission dispatch
 /// and the control-channel follow-up path so a usage-capped ChatGPT account
@@ -13280,6 +13369,10 @@ pub(crate) async fn run_codex_turn_with_rotation(
         {
             let mut attempted_credentials: HashSet<String> = HashSet::new();
             let mut attempt_idx = 0usize;
+            // Raw outputs of attempts that failed specifically on a usage cap,
+            // so an exhausted pool can be summarized instead of echoing the
+            // last account's bare "try again at …" message.
+            let mut usage_capped_outputs: Vec<String> = Vec::new();
             let mut last_constrained_result: Option<AgentResult> = prior_empty_result;
 
             loop {
@@ -13400,6 +13493,16 @@ pub(crate) async fn run_codex_turn_with_rotation(
                 }
                 drop(lease);
 
+                // Record usage-cap failures so an all-capped pool can be
+                // summarized. Auth errors rotate too but aren't usage caps,
+                // so they're deliberately excluded from this tally.
+                if matches!(
+                    result.terminal_reason,
+                    Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
+                ) {
+                    usage_capped_outputs.push(result.output.clone());
+                }
+
                 match result.terminal_reason {
                     Some(
                         TerminalReason::RateLimited
@@ -13421,7 +13524,24 @@ pub(crate) async fn run_codex_turn_with_rotation(
                         );
                         last_constrained_result = Some(result);
                     }
-                    _ => break result,
+                    _ => {
+                        // When rotation tried multiple accounts and every one
+                        // was usage-capped, replace the last account's raw
+                        // message with an aggregate that makes the rotation
+                        // visible and names the soonest reset.
+                        let exhausted_all_on_usage_caps = matches!(
+                            result.terminal_reason,
+                            Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
+                        ) && usage_capped_outputs.len() >= 2
+                            && usage_capped_outputs.len() == attempt_idx;
+                        if exhausted_all_on_usage_caps {
+                            result.output = summarize_codex_usage_caps(
+                                &usage_capped_outputs,
+                                usage_capped_outputs.len(),
+                            );
+                        }
+                        break result;
+                    }
                 }
             }
         }
@@ -14844,23 +14964,25 @@ mod tests {
         codex_key_fingerprint, codex_missing_goal_final_response_message,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
         custom_opencode_provider_definition, ensure_opencode_provider_for_model,
-        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
-        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
-        is_success_path_auth_error, is_success_path_provider_payload_error,
-        is_success_path_rate_limited_error, is_tool_call_only_output,
-        opencode_goal_terminal_status, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
+        extract_codex_reset_window, extract_model_from_message, extract_opencode_session_id,
+        extract_part_text, extract_str, is_capacity_limited_error,
+        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
+        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
+        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
+        is_tool_call_only_output, opencode_goal_terminal_status,
+        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
+        opencode_session_token_from_line, parse_opencode_goal_objective,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
-        thinking_overlaps_visible_answer, use_thinking_only_fallback, utf8_safe_prefix,
-        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
-        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
+        summarize_recent_opencode_stderr, thinking_overlaps_visible_answer,
+        use_thinking_only_fallback, utf8_safe_prefix, ClaudeIncompleteTurnContext,
+        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
+        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState,
+        CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN, CODEX_RATE_LIMIT_COOLDOWN,
+        STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -14874,6 +14996,47 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn extract_codex_reset_window_pulls_the_reset_time() {
+        let msg = "You've hit your usage limit. Visit \
+                   https://chatgpt.com/codex/settings/usage to purchase more credits \
+                   or try again at Jun 11th, 2026 3:00 AM.";
+        assert_eq!(
+            extract_codex_reset_window(msg).as_deref(),
+            Some("Jun 11th, 2026 3:00 AM")
+        );
+        assert_eq!(extract_codex_reset_window("some other error"), None);
+    }
+
+    #[test]
+    fn summarize_codex_usage_caps_reports_earliest_reset() {
+        // Two distinct accounts, different reset windows. The summary should
+        // name the soonest (2:26 AM), not whichever was tried last.
+        let outputs = vec![
+            "You've hit your usage limit. … try again at Jun 11th, 2026 3:00 AM.".to_string(),
+            "You've hit your usage limit. … try again at Jun 11th, 2026 2:26 AM.".to_string(),
+        ];
+        let summary = summarize_codex_usage_caps(&outputs, 2);
+        assert!(
+            summary.contains("All 2 connected Codex accounts are at their ChatGPT usage limit"),
+            "unexpected summary: {summary}"
+        );
+        assert!(
+            summary.contains("Earliest reset at Jun 11th, 2026 2:26 AM."),
+            "should report the soonest reset: {summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_codex_usage_caps_single_window_uses_resets_at() {
+        let outputs = vec![
+            "hit your usage limit … try again at Jun 11th, 2026 3:00 AM.".to_string(),
+            "hit your usage limit … try again at Jun 11th, 2026 3:00 AM.".to_string(),
+        ];
+        let summary = summarize_codex_usage_caps(&outputs, 2);
+        assert!(summary.contains("Usage resets at Jun 11th, 2026 3:00 AM."));
+    }
 
     #[test]
     fn grok_typed_reasoning_event_is_not_answer_text() {
