@@ -36,7 +36,23 @@ use crate::util::{
     env_var_bool, home_dir, internal_error, strip_jsonc_comments, AI_PROVIDERS_PATH,
 };
 
-/// Anthropic OAuth client ID (from opencode-anthropic-auth plugin)
+static OAUTH_WARN_DEDUP: LazyLock<StdMutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+const OAUTH_WARN_COOLDOWN: Duration = Duration::from_secs(600);
+
+fn should_warn_oauth(key: &str) -> bool {
+    let mut map = OAUTH_WARN_DEDUP.lock().unwrap();
+    if let Some(last) = map.get(key) {
+        if last.elapsed() < OAUTH_WARN_COOLDOWN {
+            return false;
+        }
+    }
+    map.insert(key.to_string(), Instant::now());
+    true
+}
+
+/// Anthropic OAuth client ID (used for Anthropic OAuth flows)
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_CONSOLE_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 
@@ -6441,20 +6457,47 @@ async fn get_provider_usage(
                                 (access, None)
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    provider_id = %uuid,
-                                    "Per-provider Anthropic OAuth refresh failed: {}",
-                                    e
-                                );
+                                let lower = e.to_lowercase();
+                                let is_permanent = lower.contains("invalid_grant")
+                                    || lower.contains("refresh token not found");
+                                if is_permanent {
+                                    tracing::debug!(
+                                        provider_id = %uuid,
+                                        "Per-provider Anthropic OAuth refresh failed (permanent, re-auth needed): {}",
+                                        e
+                                    );
+                                } else if should_warn_oauth(&format!(
+                                    "anthropic-oauth-refresh:{}",
+                                    uuid
+                                )) {
+                                    tracing::warn!(
+                                        provider_id = %uuid,
+                                        "Per-provider Anthropic OAuth refresh failed: {}",
+                                        e
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        provider_id = %uuid,
+                                        "Per-provider Anthropic OAuth refresh failed (suppressed): {}",
+                                        e
+                                    );
+                                }
                                 (o.access_token.clone(), Some(e))
                             }
                         }
                     } else {
                         if let Err(e) = refresh_anthropic_oauth_token().await {
-                            tracing::warn!(
-                                "Failed to refresh Anthropic OAuth token for usage check: {}",
-                                e
-                            );
+                            if should_warn_oauth("anthropic-oauth-refresh:shared") {
+                                tracing::warn!(
+                                    "Failed to refresh Anthropic OAuth token for usage check: {}",
+                                    e
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Failed to refresh Anthropic OAuth token for usage check (suppressed): {}",
+                                    e
+                                );
+                            }
                         }
                         let tok = read_oauth_token_entry(ProviderType::Anthropic)
                             .map(|entry| entry.access_token)
