@@ -10416,16 +10416,6 @@ pub async fn run_opencode_turn(
             ensure_opencode_provider_for_model(&opencode_config_dir_host, app_working_dir, am);
         }
     }
-    let goal_plugin = "opencode-goal-plugin";
-    ensure_opencode_plugin_specs(&opencode_config_dir_host, &[goal_plugin]);
-    ensure_opencode_plugin_installed(
-        &workspace_exec,
-        work_dir,
-        &opencode_config_dir_host,
-        &opencode_config_dir_env,
-        goal_plugin,
-    )
-    .await;
     if needs_google {
         if let Some(project_id) = detect_google_project_id() {
             ensure_opencode_google_project_id(&opencode_config_dir_host, &project_id);
