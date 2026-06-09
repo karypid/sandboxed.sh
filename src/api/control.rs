@@ -3282,19 +3282,40 @@ impl FrontendToolHub {
 
     /// Resolve a pending tool call by id.
     ///
-    /// Returns `true` if a live waiter was registered (the result reached the
-    /// running mission). Returns `false` if no waiter was registered and the
-    /// result had to be cached in `early_results` — which, for a
-    /// human-answered question, almost always means the mission is no longer
-    /// running and the answer was dropped on the floor (the rare benign case
-    /// is a resolve-before-register race, impossible for a human to win).
+    /// Returns `true` if a live waiter received the result (the running mission
+    /// is consuming it). Returns `false` only when no waiter ever appears and
+    /// the result had to be cached in `early_results` — which, for a
+    /// human-answered question, means the mission is no longer running and the
+    /// answer was dropped on the floor.
+    ///
+    /// The harnesses broadcast the `ToolCall` to the frontend *before*
+    /// [`register`](Self::register) runs (there are a couple of `.await`
+    /// points in between), so a fast `tool_result` can race ahead of the
+    /// matching `register`. To avoid misreporting such a delivery as dropped,
+    /// we briefly wait for the imminent registration before falling back to the
+    /// cache. The wait is only ever paid when no waiter is present yet — the
+    /// common case (waiter already parked) returns immediately, and a mission
+    /// that has truly ended simply waits out the short grace window before we
+    /// correctly report the answer as undelivered.
     pub async fn resolve(&self, tool_call_id: &str, result: serde_json::Value) -> bool {
-        let mut pending = self.pending.lock().await;
-        if let Some(tx) = pending.remove(tool_call_id) {
-            let _ = tx.send(result);
-            return true;
+        // Total grace window ~250ms (10 × 25ms), only incurred when the waiter
+        // has not registered yet. Bounded so a genuinely dead mission still
+        // reports `delivered: false` promptly.
+        const REGISTER_GRACE_ATTEMPTS: u32 = 10;
+        const REGISTER_GRACE_STEP: std::time::Duration = std::time::Duration::from_millis(25);
+
+        for attempt in 0..=REGISTER_GRACE_ATTEMPTS {
+            {
+                let mut pending = self.pending.lock().await;
+                if let Some(tx) = pending.remove(tool_call_id) {
+                    let _ = tx.send(result);
+                    return true;
+                }
+            }
+            if attempt < REGISTER_GRACE_ATTEMPTS {
+                tokio::time::sleep(REGISTER_GRACE_STEP).await;
+            }
         }
-        drop(pending);
 
         let mut early = self.early_results.lock().await;
         const MAX_EARLY_RESULTS: usize = 256;
@@ -9704,10 +9725,16 @@ async fn control_actor_loop(
                     ControlCommand::ToolResult { tool_call_id, name, result, respond } => {
                         // Deliver to the tool hub. resolve() caches the result if
                         // no one has registered yet (resolve-before-register), and
-                        // reports whether a live waiter actually received it.
-                        let delivered = tool_hub.resolve(&tool_call_id, result).await;
-                        let _ = respond.send(delivered);
-                        tracing::debug!(tool_call_id = %tool_call_id, name = %name, delivered, "ToolResult delivered to hub");
+                        // reports whether a live waiter actually received it. It
+                        // may wait out a short grace window for an imminent
+                        // registration, so run it off the control loop to keep
+                        // command processing responsive.
+                        let hub = Arc::clone(&tool_hub);
+                        tokio::spawn(async move {
+                            let delivered = hub.resolve(&tool_call_id, result).await;
+                            let _ = respond.send(delivered);
+                            tracing::debug!(tool_call_id = %tool_call_id, name = %name, delivered, "ToolResult delivered to hub");
+                        });
                     }
                     ControlCommand::Cancel => {
                         if let Some(token) = &running_cancel {
