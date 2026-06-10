@@ -1430,6 +1430,36 @@ fn strip_think_tags(text: &str) -> String {
     result
 }
 
+/// Extract text inside `<think>...</think>` tags. Handles unclosed tags
+/// (returns everything after `<think>`) and multiple blocks (concatenates).
+fn extract_think_content(text: &str) -> Option<String> {
+    fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+        let needle_len = needle.len();
+        if haystack.len() < needle_len {
+            return None;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle_len)
+            .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    }
+
+    let start = find_ci(text, "<think>")?;
+    let after_open = start + 7;
+
+    let rest = if after_open <= text.len() {
+        &text[after_open..]
+    } else {
+        return Some(String::new());
+    };
+
+    if let Some(rel_close) = find_ci(rest, "</think>") {
+        Some(rest[..rel_close].to_string())
+    } else {
+        Some(rest.to_string())
+    }
+}
+
 fn normalize_stream_comparison_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -2033,16 +2063,26 @@ fn parse_opencode_sse_event(
             if text.is_empty() {
                 None
             } else {
-                // Strip <think>...</think> tags — emit clean text only
-                let clean = if let Some(end_pos) = text.find("</think>") {
-                    text[end_pos + 8..].trim()
-                } else if text.starts_with("<think>") {
-                    // Thinking-only block with no closing tag yet — skip
-                    ""
-                } else {
-                    text
-                };
-                if clean.is_empty() {
+                // Extract <think>...</think> content as thinking events before
+                // stripping them from the visible text. This captures reasoning
+                // from models (e.g. MiniMax-M3) that embed it in content.
+                if let Some(thinking) = extract_think_content(text) {
+                    if !thinking.trim().is_empty()
+                        && state.last_emitted_thinking.as_deref() != Some(thinking.as_str())
+                    {
+                        state.last_emitted_thinking = Some(thinking.clone());
+                        extra_events.push(AgentEvent::Thinking {
+                            content: thinking,
+                            done: false,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                }
+
+                // Strip <think>...</think> tags for the visible text
+                let clean = strip_think_tags(text);
+                let clean = clean.trim();
+                if clean.is_empty() || state.last_emitted_text.as_deref() == Some(clean) {
                     None
                 } else {
                     state.last_emitted_text = Some(clean.to_string());
@@ -6840,6 +6880,107 @@ fn sanitized_opencode_stdout(output: &str) -> Cow<'_, str> {
     strip_opencode_banner_lines(output)
 }
 
+/// Detect and truncate garbled/repetitive output where the model echoes tool
+/// results verbatim instead of summarizing them.
+///
+/// Models (observed: MiniMax-M3) sometimes get confused by long tool outputs
+/// (SSH warnings, nvidia-smi tables, etc.) and start echoing them verbatim in
+/// their text response, creating extremely long messages with >80% repetition.
+///
+/// Returns `Some(truncated)` if garbling was detected, `None` if the output
+/// looks normal.
+fn truncate_garbled_output(text: &str) -> Option<String> {
+    const MIN_LENGTH: usize = 2000;
+    const MAX_REPETITION_RATIO: f64 = 0.70;
+    const MIN_UNIQUE_BLOCKS: usize = 5;
+
+    if text.len() < MIN_LENGTH {
+        return None;
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 20 {
+        return None;
+    }
+
+    let unique_lines: std::collections::HashSet<&str> = lines.iter().copied().collect();
+    let unique_ratio = unique_lines.len() as f64 / lines.len() as f64;
+
+    if unique_ratio >= (1.0 - MAX_REPETITION_RATIO) {
+        return None;
+    }
+
+    // Also check for repeated multi-line blocks (the model repeats entire
+    // nvidia-smi tables or SSH warning blocks).
+    let block_size = 3;
+    let mut block_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for chunk in lines.chunks(block_size) {
+        if chunk.len() == block_size {
+            let key: String = chunk.join("\n");
+            *block_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let unique_blocks = block_counts.len();
+
+    if unique_blocks < MIN_UNIQUE_BLOCKS {
+        return None;
+    }
+
+    let block_repetition_ratio =
+        1.0 - (unique_blocks as f64 / block_counts.values().sum::<usize>() as f64);
+    if block_repetition_ratio < MAX_REPETITION_RATIO {
+        return None;
+    }
+
+    // Garbling detected. Find the end of the first unique-content region by
+    // walking forward and stopping when we see a line that has appeared before.
+    let mut seen_lines = std::collections::HashSet::new();
+    let mut cutoff = lines.len();
+
+    for (i, &line) in lines.iter().enumerate() {
+        if i > 0 && seen_lines.contains(line) && !line.trim().is_empty() {
+            // Check if the next few lines are also repeats (to avoid cutting
+            // in the middle of legitimate repeated words)
+            let ahead_repeats = lines[i..]
+                .iter()
+                .take(5)
+                .filter(|&&l| seen_lines.contains(l) && !l.trim().is_empty())
+                .count();
+            if ahead_repeats >= 3 {
+                cutoff = i;
+                break;
+            }
+        }
+        seen_lines.insert(line);
+    }
+
+    if cutoff >= lines.len() {
+        return None;
+    }
+
+    let truncated = lines[..cutoff].join("\n");
+    let truncated = truncated.trim();
+
+    if truncated.len() >= text.len() / 2 {
+        return None;
+    }
+
+    if truncated.is_empty() {
+        return Some(format!(
+            "[Agent output was garbled — model echoed tool output verbatim. Original length: {} bytes]",
+            text.len()
+        ));
+    }
+
+    Some(format!(
+        "{}\n\n[... output truncated: model echoed tool output repeatedly. Original: {} bytes, kept: {} bytes]",
+        truncated,
+        text.len(),
+        truncated.len()
+    ))
+}
+
 fn is_opencode_exit_status_placeholder(output: &str) -> bool {
     output
         .lines()
@@ -10838,6 +10979,10 @@ pub async fn run_opencode_turn(
     let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let latest_tool_result_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let rate_limit_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Track text delta repetition to suppress garbled streaming output where
+    // the model echoes tool results verbatim instead of summarizing them.
+    let _sse_text_repeat_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let _sse_text_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
     let (sse_complete_tx, mut sse_complete_rx) = tokio::sync::watch::channel(false);
     let (sse_session_idle_tx, mut sse_session_idle_rx) = tokio::sync::watch::channel(false);
@@ -11089,7 +11234,11 @@ pub async fn run_opencode_turn(
     // after emitting an initial acknowledgement and finishing a tool-call step.
     // A short timeout turns that acknowledgement into a false successful answer
     // for Telegram. Let the global inactivity timeout handle truly stuck turns.
-    const OPENCODE_TEXT_IDLE_TIMEOUT_SECS: u64 = 120;
+    let opencode_text_idle_timeout_secs: u64 =
+        std::env::var("SANDBOXED_SH_OPENCODE_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
 
     loop {
         tokio::select! {
@@ -11262,7 +11411,7 @@ pub async fn run_opencode_turn(
                     }
                 }
                 if let Some(last_text) = text_output_at {
-                    if last_text.elapsed() >= std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS) {
+                    if last_text.elapsed() >= std::time::Duration::from_secs(opencode_text_idle_timeout_secs) {
                         // Only kill if there's also no recent SSE/stderr activity
                         // AND no tools are actively running.  A long tool execution
                         // (build, test, sleep) may produce no text output for >30s;
@@ -11282,7 +11431,7 @@ pub async fn run_opencode_turn(
                         let recent_activity = last_activity
                             .lock()
                             .ok()
-                            .map(|g| g.elapsed() < std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS))
+                            .map(|g| g.elapsed() < std::time::Duration::from_secs(opencode_text_idle_timeout_secs))
                             .unwrap_or(false);
                         if !recent_activity && !tools_active {
                             tracing::info!(
@@ -11434,20 +11583,46 @@ pub async fn run_opencode_turn(
                                     if let Some(text) =
                                         part.get("text").and_then(|t| t.as_str())
                                     {
-                                        // Strip <think>...</think> tags for final result
-                                        let clean_text =
-                                            if let Some(end_pos) = text.find("</think>") {
-                                                text[end_pos + 8..].trim().to_string()
-                                            } else {
-                                                text.to_string()
-                                            };
+                                        // Extract <think>...</think> content as
+                                        // thinking events before stripping them.
+                                        if let Some(thinking) = extract_think_content(text) {
+                                            if !thinking.trim().is_empty()
+                                                && state.last_emitted_thinking.as_deref()
+                                                    != Some(thinking.as_str())
+                                            {
+                                                state.last_emitted_thinking =
+                                                    Some(thinking.clone());
+                                                sse_emitted_thinking.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                                sse_done_sent.store(
+                                                    false,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                                let _ =
+                                                    events_tx.send(AgentEvent::Thinking {
+                                                        content: thinking,
+                                                        done: false,
+                                                        mission_id: Some(mission_id),
+                                                    });
+                                            }
+                                        }
+
+                                        // Strip <think>...</think> tags for
+                                        // visible text / final result
+                                        let clean_text = strip_think_tags(text);
+                                        let clean_text = clean_text.trim();
                                         if !clean_text.is_empty() {
-                                            final_result = clean_text.clone();
+                                            final_result = clean_text.to_string();
                                             let _ = text_output_tx.send(true);
-                                            // Emit text delta for Telegram streaming
+                                            sse_emitted_text.store(
+                                                true,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            );
                                             let _ =
                                                 events_tx.send(AgentEvent::TextDelta {
-                                                    content: clean_text,
+                                                    content: clean_text.to_string(),
                                                     mission_id: Some(mission_id),
                                                 });
                                         }
@@ -11474,7 +11649,7 @@ pub async fn run_opencode_turn(
                                 } else {
                                     // Track consecutive tool-call steps to detect runaway loops
                                     tool_call_step_count += 1;
-                                    const MAX_TOOL_CALL_STEPS: u32 = 15;
+                                    const MAX_TOOL_CALL_STEPS: u32 = 40;
                                     if tool_call_step_count >= MAX_TOOL_CALL_STEPS {
                                         tracing::warn!(
                                             mission_id = %mission_id,
@@ -11915,6 +12090,21 @@ pub async fn run_opencode_turn(
         if let Cow::Owned(clean) = cleaned_result {
             final_result = clean;
         }
+    }
+
+    // Detect and truncate garbled/repetitive output where the model echoes
+    // tool results (SSH warnings, nvidia-smi tables, etc.) verbatim in its
+    // text response instead of summarizing them. This produces extremely
+    // long assistant messages with >80% line repetition and repeated tool
+    // output blocks. Truncate to the first unique-content region.
+    if let Some(truncated) = truncate_garbled_output(&final_result) {
+        tracing::warn!(
+            mission_id = %mission_id,
+            original_len = final_result.len(),
+            truncated_len = truncated.len(),
+            "Truncated garbled/repetitive assistant output"
+        );
+        final_result = truncated;
     }
 
     if let Ok(guard) = latest_tool_result_text.lock() {
@@ -12606,6 +12796,47 @@ pub async fn run_grok_turn(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
+
+    if workspace.id == crate::workspace::DEFAULT_WORKSPACE_ID
+        && !work_dir.join(".git").exists()
+    {
+        let file_count = std::fs::read_dir(work_dir)
+            .map(|mut d| {
+                d.by_ref()
+                    .filter(|e| {
+                        e.as_ref()
+                            .map(|e| {
+                                let n = e.file_name();
+                                let n = n.to_string_lossy();
+                                !n.starts_with('.') && n != "output"
+                            })
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if file_count == 0 && !is_continuation {
+            let dir_display = work_dir.display();
+            tracing::warn!(
+                mission_id = %mission_id,
+                work_dir = %dir_display,
+                "Grok mission running in empty host workspace with no git repo — goal loop will hallucinate edits"
+            );
+            let msg = format!(
+                "The mission workspace ({dir_display}) is empty and has no git repository. \
+                 Grok cannot edit files or push changes without a project checkout. \
+                 Create this mission on a workspace that contains the target repository, \
+                 or clone the repo into the workspace first.",
+            );
+            let _ = events_tx.send(AgentEvent::AssistantMessage {
+                mission_id: Some(mission_id),
+                content: msg.clone(),
+            });
+            return AgentResult::success(msg, 0)
+                .with_terminal_reason(TerminalReason::TurnComplete);
+        }
+    }
+
     let cli_path =
         get_backend_string_setting("grok", "cli_path").unwrap_or_else(|| "grok".to_string());
     let cli_path = match ensure_grok_cli_available(&workspace_exec, work_dir, &cli_path).await {
@@ -15207,7 +15438,7 @@ mod tests {
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
         custom_opencode_provider_definition, ensure_opencode_provider_for_model,
         extract_codex_reset_window, extract_model_from_message, extract_opencode_session_id,
-        extract_part_text, extract_str, is_capacity_limited_error,
+        extract_part_text, extract_str, extract_think_content, is_capacity_limited_error,
         is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
         is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
@@ -16544,6 +16775,39 @@ mod tests {
         let input = "before<think>🛡 reasoning 🎯</think>after";
         let result = strip_think_tags(input);
         assert_eq!(result, "beforeafter");
+    }
+
+    // ── extract_think_content tests ───────────────────────────────────
+
+    #[test]
+    fn extract_think_content_closed_tag() {
+        let text = "<think>secret reasoning</think>\n\nvisible answer";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("secret reasoning")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_unclosed_tag() {
+        let text = "<think>still thinking...";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("still thinking...")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_no_tags() {
+        assert!(extract_think_content("no think tags here").is_none());
+    }
+
+    #[test]
+    fn extract_think_content_empty() {
+        assert_eq!(
+            extract_think_content("<think></think>").as_deref(),
+            Some("")
+        );
     }
 
     #[test]

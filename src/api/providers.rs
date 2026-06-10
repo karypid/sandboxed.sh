@@ -1604,7 +1604,6 @@ pub async fn validate_model_override(
 
     match backend {
         "opencode" => {
-            // OpenCode expects "provider/model" format
             if let Some((provider_id, model_id)) = model_override.split_once('/') {
                 // Check if this is a known provider with a model catalog
                 if let Some(provider) = providers.iter().find(|p| p.id == provider_id) {
@@ -1631,10 +1630,10 @@ pub async fn validate_model_override(
                 // Unknown provider - allow as custom (escape hatch)
                 Ok(())
             } else {
-                Err(format!(
-                    "Invalid format for OpenCode model override. Expected 'provider/model' (e.g., 'openai/gpt-4'), got '{}'",
-                    model_override
-                ))
+                // Plain model name without '/' — could be a routing chain ID
+                // (e.g. "grok"), a builtin model alias, or a custom model name.
+                // Allow through as an escape hatch.
+                Ok(())
             }
         }
         "claudecode" => {

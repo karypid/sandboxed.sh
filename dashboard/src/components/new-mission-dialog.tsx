@@ -613,6 +613,12 @@ export function NewMissionDialog({
 
   const handleCreate = async (openInNewTab: boolean) => {
     if (disabled || submitting) return;
+    if (newMissionWorkspace) {
+      const ws = workspaces.find(w => w.id === newMissionWorkspace);
+      if (ws && ws.status !== 'ready') {
+        return;
+      }
+    }
     const pendingTab = openInNewTab ? window.open('about:blank', '_blank') : null;
     if (pendingTab) {
       pendingTab.opener = null;
@@ -733,20 +739,27 @@ export function NewMissionDialog({
                 {workspaces
                   .filter(
                     (ws) =>
-                      ws.status === 'ready' &&
                       ws.id !== '00000000-0000-0000-0000-000000000000'
                   )
                   .map((workspace) => (
                     <option
                       key={workspace.id}
                       value={workspace.id}
+                      disabled={workspace.status !== 'ready'}
                       className="bg-[#1a1a1a]"
                     >
-                      {workspace.name} ({formatWorkspaceType(workspace.workspace_type)})
+                      {workspace.name} ({formatWorkspaceType(workspace.workspace_type)}){workspace.status !== 'ready' ? ` — ${workspace.status}` : ''}
                     </option>
                   ))}
               </select>
-              <p className="text-xs text-white/30 mt-1.5">Where the mission will run</p>
+              {workspaces.filter(ws => ws.id !== '00000000-0000-0000-0000-000000000000' && ws.status !== 'ready').length > 0 && (
+                <p className="text-xs text-amber-400/60 mt-1.5">
+                  {workspaces.filter(ws => ws.id !== '00000000-0000-0000-0000-000000000000' && ws.status !== 'ready').length} workspace(s) unavailable (not ready). Start them first.
+                </p>
+              )}
+              {workspaces.filter(ws => ws.id !== '00000000-0000-0000-0000-000000000000' && ws.status !== 'ready').length === 0 && (
+                <p className="text-xs text-white/30 mt-1.5">Where the mission will run</p>
+              )}
             </div>
 
             {/* Agent selection (includes backend) */}

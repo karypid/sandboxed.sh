@@ -12753,10 +12753,15 @@ async fn run_single_control_turn(
             };
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
+            let grok_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
             Box::pin(super::mission_runner::run_grok_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &user_message,
+                &grok_message_owned,
                 requested_model
                     .as_deref()
                     .or(config.default_model.as_deref()),
@@ -12840,10 +12845,16 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
+            let opencode_message_owned: String = if user_message.trim_start().starts_with("/goal ")
+            {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
             Box::pin(super::mission_runner::run_opencode_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &user_message,
+                &opencode_message_owned,
                 config.default_model.as_deref(),
                 requested_model_effort.as_deref(),
                 config.opencode_agent.as_deref(),

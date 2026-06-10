@@ -898,6 +898,17 @@ impl ModelChainStore {
                     changed = true;
                     tracing::info!("Migrated builtin/smart model IDs to current defaults");
                 }
+                // Force strip_thinking=false: the backend now extracts <think>
+                // content as thinking events before stripping. Keeping it true
+                // discards reasoning at the proxy level.
+                if chain.strip_thinking {
+                    chain.strip_thinking = false;
+                    chain.updated_at = now;
+                    changed = true;
+                    tracing::info!(
+                        "Reset builtin/smart strip_thinking to false (backend handles extraction)"
+                    );
+                }
             }
         }
 
