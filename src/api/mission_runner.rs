@@ -3638,8 +3638,13 @@ async fn run_mission_turn(
         "opencode" => {
             // Use per-workspace CLI execution for all workspace types to ensure
             // native bash + correct filesystem scope.
-            let opencode_message_owned: String = if user_message.trim_start().starts_with("/goal ")
-            {
+            // Same prompt-selection rule as the `control` arm above: pass the
+            // bare user message when we have a stored session_id (the opencode
+            // CLI will load prior history itself), and use the history-framed
+            // `convo` only for fresh sessions that don't have one yet.
+            let is_goal_mode = user_message.trim_start().starts_with("/goal ");
+            let has_session_history = session_id.is_some();
+            let opencode_message_owned: String = if is_goal_mode || has_session_history {
                 user_message.clone()
             } else {
                 convo.clone()
@@ -3655,6 +3660,8 @@ async fn run_mission_turn(
                 events_tx.clone(),
                 cancel,
                 &config.working_dir,
+                session_id.as_deref(),
+                is_continuation,
             )
             .await
         }
@@ -6630,15 +6637,16 @@ fn is_success_path_provider_payload_error(message: &str) -> bool {
 }
 
 fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
-    let partial_output = partial_output.trim();
-    if partial_output.is_empty() {
-        return "OpenCode idle timeout: the model stopped producing output before finishing the turn. No response was generated.".to_string();
-    }
-
-    format!(
-        "OpenCode idle timeout: the model stopped producing output before finishing the turn. Partial output was discarded because it was incomplete.\n\nPartial output:\n{}",
-        partial_output
-    )
+    // The previous version echoed a snippet of the model's last text fragment
+    // (often a half-finished `<think>` tail) into the assistant bubble, which
+    // read as a corrupted reply. The model output is intentionally discarded:
+    // a kill for inactivity means we never received a terminal result event,
+    // so we have no idea whether the fragment was a real answer or a
+    // pre-response leak. Surface a clean, retryable error instead.
+    let _ = partial_output.trim();
+    "OpenCode turn aborted: the model stopped producing output before finishing \
+     the turn (idle timeout). Click Resume to retry."
+        .to_string()
 }
 
 pub(crate) fn is_provider_payload_error(message: &str) -> bool {
@@ -10449,6 +10457,8 @@ pub async fn run_opencode_turn(
     events_tx: broadcast::Sender<AgentEvent>,
     cancel: CancellationToken,
     app_working_dir: &std::path::Path,
+    session_id: Option<&str>,
+    is_continuation: bool,
 ) -> AgentResult {
     use super::ai_providers::{
         ensure_anthropic_oauth_token_valid, ensure_google_oauth_token_valid,
@@ -10742,6 +10752,25 @@ pub async fn run_opencode_turn(
         inner_cmd.push_str(" --agent ");
         inner_cmd.push_str(&shell_escape(a));
     }
+    // Resume the per-mission OpenCode session on continuation turns so the
+    // CLI loads prior message history from `<XDG_DATA_HOME>/opencode/storage`
+    // (which is now scoped to the workspace — see the XDG overrides above).
+    // Without this, every turn starts a brand-new session and the model
+    // loses all prior context. `--continue` is the simpler "resume last
+    // session in this dir" form for freshly-created missions that don't
+    // have a stored session id yet.
+    if is_continuation {
+        if let Some(sid) = session_id {
+            if !sid.trim().is_empty() {
+                inner_cmd.push_str(" --session ");
+                inner_cmd.push_str(&shell_escape(sid));
+            } else {
+                inner_cmd.push_str(" --continue");
+            }
+        } else {
+            inner_cmd.push_str(" --continue");
+        }
+    }
     inner_cmd.push_str(" --dir ");
     inner_cmd.push_str(&shell_escape(&work_dir_arg));
     inner_cmd.push_str(" \"$(cat ");
@@ -10794,6 +10823,76 @@ pub async fn run_opencode_turn(
         env.insert("API_URL".to_string(), public_url);
     } else if let Some(local_url) = localhost_api_base_url_from_env() {
         env.insert("API_URL".to_string(), local_url);
+    }
+
+    // Per-mission XDG isolation for OpenCode. Without this, every mission on
+    // the same host shares the operator's `~/.local/share/opencode` storage,
+    // which (a) lets sessions from concurrent missions collide on the same
+    // SQLite DB and (b) means resuming mission A pulls in any unrelated
+    // session that the operator's opencode created locally. Mirror the
+    // per-mission HOME/XDG pattern used by Claude Code (see the `claudecode`
+    // arm above) so storage and config are scoped to the workspace.
+    let opencode_xdg_config = work_dir.join(".config");
+    let opencode_xdg_data = work_dir.join(".local").join("share");
+    let opencode_xdg_state = work_dir.join(".local").join("state");
+    let opencode_xdg_cache = work_dir.join(".cache");
+    for dir in [
+        &opencode_xdg_config,
+        &opencode_xdg_data,
+        &opencode_xdg_state,
+        &opencode_xdg_cache,
+    ] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(
+                mission_id = %mission_id,
+                path = %dir.display(),
+                error = %e,
+                "Failed to create per-mission OpenCode XDG directory"
+            );
+        }
+    }
+    let opencode_xdg_config_env = workspace_path_for_env(workspace, &opencode_xdg_config);
+    let opencode_xdg_data_env = workspace_path_for_env(workspace, &opencode_xdg_data);
+    let opencode_xdg_state_env = workspace_path_for_env(workspace, &opencode_xdg_state);
+    let opencode_xdg_cache_env = workspace_path_for_env(workspace, &opencode_xdg_cache);
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        opencode_xdg_config_env.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "XDG_DATA_HOME".to_string(),
+        opencode_xdg_data_env.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "XDG_STATE_HOME".to_string(),
+        opencode_xdg_state_env.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "XDG_CACHE_HOME".to_string(),
+        opencode_xdg_cache_env.to_string_lossy().to_string(),
+    );
+    // HOME is the fallback OpenCode uses when XDG_* aren't set. Setting it to
+    // the workspace also keeps credential lookups (e.g. `~/.local/share/opencode/auth.json`)
+    // inside the per-mission XDG_DATA_HOME we just set above.
+    env.insert(
+        "HOME".to_string(),
+        workspace_path_for_env(workspace, work_dir)
+            .to_string_lossy()
+            .to_string(),
+    );
+    // Allow opting out of the per-mission XDG override when an operator
+    // explicitly wants the opencode CLI to share storage with the host (e.g.
+    // for debugging with `opencode session list` on the host shell).
+    if std::env::var("SANDBOXED_SH_OPENCODE_SHARED_XDG")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_some()
+    {
+        env.remove("XDG_CONFIG_HOME");
+        env.remove("XDG_DATA_HOME");
+        env.remove("XDG_STATE_HOME");
+        env.remove("XDG_CACHE_HOME");
+        env.remove("HOME");
     }
     if telegram_action_helpers_enabled {
         if let Some(token) = crate::api::telegram::build_internal_telegram_action_token(mission_id)
@@ -11993,6 +12092,15 @@ pub async fn run_opencode_turn(
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let session_id = session_id.or_else(|| extract_opencode_session_id(&final_result));
+    // Persist the opencode session id so the next turn can resume the
+    // conversation with `--session <id>`. Mirrors the path used by Grok
+    // (see `AgentEvent::SessionIdUpdate` emission in `run_grok_turn`).
+    if let Some(sid) = session_id.as_deref() {
+        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+            mission_id,
+            session_id: sid.to_string(),
+        });
+    }
     let stored_message = session_id
         .as_deref()
         .and_then(|id| load_latest_opencode_assistant_message(workspace, id));
@@ -15458,10 +15566,10 @@ mod tests {
         sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
         summarize_recent_opencode_stderr, text_buffer_stream_looks_degenerate,
-        thinking_overlaps_visible_answer, use_thinking_only_fallback, utf8_safe_prefix,
-        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
+        thinking_overlaps_visible_answer, truncate_garbled_output, use_thinking_only_fallback,
+        utf8_safe_prefix, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
+        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
         CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
@@ -15996,14 +16104,69 @@ mod tests {
     }
 
     #[test]
-    fn opencode_idle_timeout_result_discards_partial_success_text() {
-        let message =
-            opencode_idle_timeout_result_message("Je m'en occupe ! Je te fais ça en parallèle.");
+    fn opencode_idle_timeout_result_does_not_leak_model_fragment() {
+        // The previous version echoed a snippet of the model's last text
+        // fragment (often a half-finished `<think>` tail) into the assistant
+        // bubble, which read as a corrupted reply. The new message must not
+        // contain that fragment.
+        let model_fragment = "Je m'en occupe ! Je te fais ça en parallèle.";
+        let message = opencode_idle_timeout_result_message(model_fragment);
 
-        assert!(message.starts_with("OpenCode idle timeout:"));
-        assert!(message.contains("Partial output was discarded"));
-        assert!(message.contains("Je m'en occupe"));
-        assert!(!message.contains("La réponse a été interrompue"));
+        assert!(
+            message.starts_with("OpenCode turn aborted"),
+            "expected clean turn-aborted header, got: {message}"
+        );
+        assert!(
+            !message.contains(model_fragment),
+            "idle-timeout error must not leak the model fragment: {message}"
+        );
+        assert!(message.contains("Resume") || message.contains("retry"));
+    }
+
+    #[test]
+    fn opencode_idle_timeout_result_with_empty_partial() {
+        let message = opencode_idle_timeout_result_message("");
+        assert!(message.starts_with("OpenCode turn aborted"));
+        assert!(message.contains("Resume") || message.contains("retry"));
+    }
+
+    #[test]
+    fn truncate_garbled_output_leaves_normal_long_text_alone() {
+        // 30 unique lines, no repetition — should not be touched.
+        let text = (0..30)
+            .map(|i| format!("This is line number {i} with some unique content here."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(truncate_garbled_output(&text).is_none());
+    }
+
+    #[test]
+    fn truncate_garbled_output_truncates_repeated_block_dump() {
+        // Simulate the production bug: a model echoing an nvidia-smi table
+        // over and over, prefixed by a short non-repeated intro.
+        let intro = "Let me check the GPU state on the DGX.\n";
+        let block = "\
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+|  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC  |";
+        let repeated = vec![block; 30].join("\n");
+        let text = format!("{intro}{repeated}");
+
+        let truncated = truncate_garbled_output(&text).expect("garbling detected");
+        // The intro is preserved; the repeated block is cut.
+        assert!(truncated.starts_with(intro.trim_end()));
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.len() < text.len());
+    }
+
+    #[test]
+    fn truncate_garbled_output_ignores_short_inputs() {
+        // Anything below the MIN_LENGTH threshold (2000) is left alone —
+        // the heuristic is only safe on long outputs where repetition is
+        // statistically meaningful.
+        let text = "this is repeated\n".repeat(50);
+        assert!(truncate_garbled_output(&text).is_none());
     }
 
     #[test]

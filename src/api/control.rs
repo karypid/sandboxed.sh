@@ -12845,12 +12845,25 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
-            let opencode_message_owned: String = if user_message.trim_start().starts_with("/goal ")
-            {
-                user_message.clone()
-            } else {
-                convo.clone()
-            };
+            let opencode_is_continuation =
+                force_session_resume || history.iter().any(|(role, _)| role == "assistant");
+            // Goal-mode missions drive a /goal <objective> loop and need the
+            // raw message preserved verbatim. For normal continuations, when
+            // we have a stored session_id the opencode CLI will load prior
+            // messages from its own storage, so we send the bare user
+            // message instead of the history-framed `convo` (which would
+            // duplicate the context the session already has). When we don't
+            // have a session_id (first turn of a brand-new mission, or a
+            // legacy mission that never persisted one), keep using `convo`
+            // so the model still gets a history-aware prompt.
+            let is_goal_mode = user_message.trim_start().starts_with("/goal ");
+            let has_session_history = session_id.is_some();
+            let opencode_message_owned: String =
+                if is_goal_mode || (opencode_is_continuation && has_session_history) {
+                    user_message.clone()
+                } else {
+                    convo.clone()
+                };
             Box::pin(super::mission_runner::run_opencode_turn(
                 exec_workspace,
                 &ctx.working_dir,
@@ -12862,6 +12875,8 @@ async fn run_single_control_turn(
                 events_tx.clone(),
                 cancel,
                 &config.working_dir,
+                session_id.as_deref(),
+                opencode_is_continuation,
             ))
             .await
         }
