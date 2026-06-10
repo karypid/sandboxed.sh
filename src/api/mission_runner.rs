@@ -11126,10 +11126,6 @@ pub async fn run_opencode_turn(
     let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let latest_tool_result_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let rate_limit_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Track text delta repetition to suppress garbled streaming output where
-    // the model echoes tool results verbatim instead of summarizing them.
-    let _sse_text_repeat_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let _sse_text_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
     let (sse_complete_tx, mut sse_complete_rx) = tokio::sync::watch::channel(false);
     let (sse_session_idle_tx, mut sse_session_idle_rx) = tokio::sync::watch::channel(false);
