@@ -1812,6 +1812,18 @@ fn thinking_final_event(content: String, mission_id: Uuid) -> AgentEvent {
     }
 }
 
+// Error classification moved to `super::runners::errors` (Phase 1 of the
+// mission_runner decomposition). Re-exported so call sites and tests keep
+// their existing paths.
+#[allow(unused_imports)] // several are consumed only by this module's tests
+pub(crate) use super::runners::errors::{
+    contains_ascii_case_insensitive, find_ascii_case_insensitive, is_auth_error,
+    is_capacity_limited_error, is_provider_payload_error, is_rate_limited_error,
+    is_standalone_invalid_credentials_message, is_success_path_auth_error,
+    is_success_path_provider_payload_error, is_success_path_rate_limited_error,
+    looks_like_explicit_provider_error_output, starts_with_ascii_case_insensitive,
+};
+
 fn parse_opencode_stderr_text_part(line: &str) -> Option<String> {
     let marker = "message.part (text):";
     let idx = line.find(marker)?;
@@ -6645,161 +6657,6 @@ fn is_opencode_banner_line(line: &str) -> bool {
         || opencode_session_token_from_line(line).is_some()
 }
 
-fn starts_with_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    if haystack.len() < needle.len() {
-        return false;
-    }
-
-    haystack[..needle.len()]
-        .iter()
-        .zip(needle.iter())
-        .all(|(&left, &right)| ascii_lower(left) == ascii_lower(right))
-}
-
-fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if haystack.len() < needle.len() || needle.is_empty() {
-        return None;
-    }
-
-    for idx in 0..=haystack.len() - needle.len() {
-        if starts_with_ascii_case_insensitive(&haystack[idx..], needle) {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-#[inline]
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-    find_ascii_case_insensitive(haystack.as_bytes(), needle.as_bytes()).is_some()
-}
-
-#[inline]
-fn ascii_lower(byte: u8) -> u8 {
-    match byte {
-        b'A'..=b'Z' => byte + 32,
-        _ => byte,
-    }
-}
-
-pub(crate) fn is_auth_error(message: &str) -> bool {
-    const AUTH_MARKERS: [&str; 10] = [
-        "invalid authentication credentials",
-        "authentication_error",
-        "invalid api key",
-        "invalid x-api-key",
-        "failed to authenticate",
-        "error: 401",
-        // Codex/ChatGPT OAuth surfaces refresh-token reuse with these
-        // phrasings; both should drive account rotation rather than failing
-        // the mission outright (the user may have another configured account
-        // whose refresh_token is still valid).
-        "refresh token was already used",
-        "refresh_token was already used",
-        "refresh_token_reused",
-        "please log out and sign in again",
-    ];
-
-    AUTH_MARKERS
-        .iter()
-        .any(|needle| contains_ascii_case_insensitive(message, needle))
-}
-
-pub(crate) fn is_rate_limited_error(message: &str) -> bool {
-    const RATE_LIMIT_MARKERS: [&str; 15] = [
-        "overloaded_error",
-        "rate limit",
-        "rate_limit",
-        "resource_exhausted",
-        "too many requests",
-        "error: 429",
-        "error: 529",
-        "status code: 429",
-        "status code: 529",
-        "out of extra usage",
-        "out of regular usage",
-        // Claude Code CLI surfaces subscription quota exhaustion with this
-        // phrasing (e.g. "You've hit your limit · resets 9pm"). Treat it
-        // as a rate-limit signal so account rotation kicks in.
-        "hit your limit",
-        // Codex CLI / ChatGPT account quota exhaustion. Codex emits
-        // TurnFailed with messages like:
-        //   "You've hit your usage limit. Visit
-        //    https://chatgpt.com/codex/settings/usage to purchase more
-        //    credits or try again at Apr 28th, 2026 10:03 PM."
-        // The reset window is days, not minutes — match it as a
-        // rate-limit so the harness classifies the turn correctly and
-        // surfaces the actionable message instead of the generic
-        // "Codex CLI exited before completing the turn" wrapper.
-        "hit your usage limit",
-        "purchase more credits",
-        "settings/usage",
-    ];
-
-    RATE_LIMIT_MARKERS
-        .iter()
-        .any(|needle| contains_ascii_case_insensitive(message, needle))
-}
-
-fn looks_like_explicit_provider_error_output(message: &str) -> bool {
-    let trimmed = message.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let compact_lower = lower
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect::<String>();
-    let starts_with_error_payload = compact_lower.starts_with("{\"error\":")
-        || compact_lower.starts_with("[{\"error\":")
-        || compact_lower.starts_with("{\"type\":\"error\"");
-    let structured_provider_error = starts_with_error_payload
-        && (compact_lower.contains("\"error\":{")
-            || compact_lower.contains("\"message\":")
-            || compact_lower.contains("\"code\":")
-            || compact_lower.contains("authentication_error")
-            || compact_lower.contains("invalid_request_error")
-            || compact_lower.contains("permission_error")
-            || compact_lower.contains("rate_limit_error")
-            || compact_lower.contains("overloaded_error"));
-
-    trimmed.starts_with("API Error:")
-        || lower.starts_with("error:")
-        || lower.starts_with("anthropic api error:")
-        || lower.starts_with("claude code error:")
-        || structured_provider_error
-        || lower.contains("status code: 401")
-        || lower.contains("status code: 429")
-        || lower.contains("status code: 529")
-}
-
-fn is_standalone_invalid_credentials_message(message: &str) -> bool {
-    let normalized = message
-        .trim()
-        .trim_matches(|c: char| matches!(c, '.' | '!' | '"' | '\''))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    normalized == "invalid authentication credentials"
-}
-
-fn is_success_path_rate_limited_error(message: &str) -> bool {
-    let lower = message.trim().replace('\u{2019}', "'").to_ascii_lowercase();
-    lower.starts_with("you've hit your limit")
-        || lower.starts_with("you have hit your limit")
-        || (looks_like_explicit_provider_error_output(message) && is_rate_limited_error(message))
-}
-
-fn is_success_path_auth_error(message: &str) -> bool {
-    is_standalone_invalid_credentials_message(message)
-        || (looks_like_explicit_provider_error_output(message) && is_auth_error(message))
-}
-
-fn is_success_path_provider_payload_error(message: &str) -> bool {
-    (looks_like_explicit_provider_error_output(message)
-        || message.trim_start().starts_with("messages."))
-        && is_provider_payload_error(message)
-}
-
 fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
     // The previous version echoed a snippet of the model's last text fragment
     // (often a half-finished `<think>` tail) into the assistant bubble, which
@@ -6811,18 +6668,6 @@ fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
     "OpenCode turn aborted: the model stopped producing output before finishing \
      the turn (idle timeout). Click Resume to retry."
         .to_string()
-}
-
-pub(crate) fn is_provider_payload_error(message: &str) -> bool {
-    const PROVIDER_PAYLOAD_MARKERS: [&str; 3] = [
-        "image.source.base64.data",
-        "image dimensions exceed max allowed size",
-        "many-image requests: 2000 pixels",
-    ];
-
-    PROVIDER_PAYLOAD_MARKERS
-        .iter()
-        .any(|needle| contains_ascii_case_insensitive(message, needle))
 }
 
 pub(crate) struct AnthropicRotationAccounts {
@@ -6933,41 +6778,6 @@ pub(crate) async fn refresh_claude_credentials_after_auth_error(
             e
         );
     }
-}
-
-pub(crate) fn is_capacity_limited_error(message: &str) -> bool {
-    const CAPACITY_LIMIT_MARKERS: [&str; 8] = [
-        "already have five missions running",
-        "already have 5 missions running",
-        "too many concurrent missions",
-        "concurrent mission limit",
-        "maximum concurrent missions",
-        // OpenAI's model-level capacity rejection, emitted by Codex CLI
-        // as a TurnFailed error when the selected model (e.g. GPT-5.5
-        // during its rollout window) is saturated.
-        "selected model is at capacity",
-        "model is at capacity",
-        "please try a different model",
-    ];
-
-    if CAPACITY_LIMIT_MARKERS
-        .iter()
-        .any(|needle| contains_ascii_case_insensitive(message, needle))
-    {
-        return true;
-    }
-
-    let has_already_have = contains_ascii_case_insensitive(message, "already have");
-    let has_missions_running = contains_ascii_case_insensitive(message, "missions running");
-    if has_already_have && has_missions_running {
-        return true;
-    }
-
-    let has_concurrent = contains_ascii_case_insensitive(message, "concurrent");
-    let has_mission = contains_ascii_case_insensitive(message, "mission");
-    let has_limit = contains_ascii_case_insensitive(message, "limit")
-        || contains_ascii_case_insensitive(message, "exceeded");
-    has_concurrent && has_mission && has_limit
 }
 
 const CODEX_PENDING_TOOLS_ERROR_PREFIX: &str = "Codex stopped while tool calls were still pending";
