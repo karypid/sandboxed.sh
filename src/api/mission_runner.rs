@@ -939,8 +939,6 @@ fn codex_account_semaphore_for_credential(credential: &CodexCredential) -> Arc<S
         .clone()
 }
 
-/// Re-export the canonical cost resolver from the shared cost module.
-
 pub(crate) fn preferred_model_for_cost<'a>(
     requested_model: Option<&'a str>,
     observed_model: Option<&'a str>,
