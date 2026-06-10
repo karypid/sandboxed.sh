@@ -1430,6 +1430,67 @@ fn strip_think_tags(text: &str) -> String {
     result
 }
 
+/// Extract text inside `<think>...</think>` tags. Handles unclosed tags
+/// (the trailing unclosed opener is included verbatim) and multiple blocks
+/// (concatenated in order, separated by a single newline so callers can
+/// distinguish boundaries; trim will absorb the joiner's whitespace).
+fn extract_think_content(text: &str) -> Option<String> {
+    fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+        let needle_len = needle.len();
+        if haystack.len() < needle_len {
+            return None;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle_len)
+            .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    }
+
+    const OPEN_TAG: &str = "<think>";
+    const CLOSE_TAG: &str = "</think>";
+
+    // Walk every `<think>` opener in order. For each one, take everything up
+    // to the next `</think>` (or to the end of the string if the close tag
+    // is missing — the model streamed the tag header but not the footer yet).
+    let mut combined = String::new();
+    let mut cursor = 0usize;
+    let mut found_any = false;
+    while let Some(open) = find_ci(&text[cursor..], OPEN_TAG) {
+        found_any = true;
+        let abs_open = cursor + open;
+        let after_open = abs_open + OPEN_TAG.len();
+        let scan_from = if after_open <= text.len() {
+            after_open
+        } else {
+            text.len()
+        };
+        match find_ci(&text[scan_from..], CLOSE_TAG) {
+            Some(rel_close) => {
+                let abs_close = scan_from + rel_close;
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&text[after_open..abs_close]);
+                cursor = abs_close + CLOSE_TAG.len();
+            }
+            None => {
+                // Unclosed trailing opener: include the rest of the string
+                // so the model can stream the closing tag in a later delta.
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&text[after_open..]);
+                break;
+            }
+        }
+    }
+
+    if !found_any {
+        return None;
+    }
+    Some(combined)
+}
+
 fn normalize_stream_comparison_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -2033,16 +2094,26 @@ fn parse_opencode_sse_event(
             if text.is_empty() {
                 None
             } else {
-                // Strip <think>...</think> tags — emit clean text only
-                let clean = if let Some(end_pos) = text.find("</think>") {
-                    text[end_pos + 8..].trim()
-                } else if text.starts_with("<think>") {
-                    // Thinking-only block with no closing tag yet — skip
-                    ""
-                } else {
-                    text
-                };
-                if clean.is_empty() {
+                // Extract <think>...</think> content as thinking events before
+                // stripping them from the visible text. This captures reasoning
+                // from models (e.g. MiniMax-M3) that embed it in content.
+                if let Some(thinking) = extract_think_content(text) {
+                    if !thinking.trim().is_empty()
+                        && state.last_emitted_thinking.as_deref() != Some(thinking.as_str())
+                    {
+                        state.last_emitted_thinking = Some(thinking.clone());
+                        extra_events.push(AgentEvent::Thinking {
+                            content: thinking,
+                            done: false,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                }
+
+                // Strip <think>...</think> tags for the visible text
+                let clean = strip_think_tags(text);
+                let clean = clean.trim();
+                if clean.is_empty() || state.last_emitted_text.as_deref() == Some(clean) {
                     None
                 } else {
                     state.last_emitted_text = Some(clean.to_string());
@@ -3598,8 +3669,28 @@ async fn run_mission_turn(
         "opencode" => {
             // Use per-workspace CLI execution for all workspace types to ensure
             // native bash + correct filesystem scope.
-            let opencode_message_owned: String = if user_message.trim_start().starts_with("/goal ")
-            {
+            // Same prompt-selection + session-resume rule as the `control`
+            // arm above: if we have a stored OpenCode-format session_id
+            // (starts with `ses_`, with or without an in-memory assistant
+            // history) the opencode CLI will load prior history from its
+            // per-mission XDG storage, so:
+            //   - pass bare `user_message` (not the history-framed `convo`,
+            //     which would duplicate the context the CLI is about to
+            //     load), AND
+            //   - pass `--session <id>` (preferred) or `--continue` (safe
+            //     fallback when history was lost but storage still has the
+            //     most-recent session for this mission) so we never start a
+            //     brand-new session and lose context (Bugbot e8dd69f8).
+            // Only use `convo` and no-resume for a brand-new mission with no
+            // OpenCode session_id yet. Mission-creation pre-assigns a UUID
+            // for Claude Code persistence — that is NOT an OpenCode session
+            // id, so we ignore it and treat the mission as fresh.
+            let is_goal_mode = user_message.trim_start().starts_with("/goal ");
+            let has_opencode_session = session_id
+                .as_deref()
+                .map(is_opencode_session_id)
+                .unwrap_or(false);
+            let opencode_message_owned: String = if is_goal_mode || has_opencode_session {
                 user_message.clone()
             } else {
                 convo.clone()
@@ -3615,14 +3706,33 @@ async fn run_mission_turn(
                 events_tx.clone(),
                 cancel,
                 &config.working_dir,
+                session_id.as_deref(),
+                // Always treat a stored OpenCode session_id as a
+                // continuation: even if the in-memory history doesn't have
+                // an assistant message (e.g. server restart, mission
+                // resume, history rebuild), the per-mission XDG storage
+                // has the prior session, and we want --session/--continue
+                // to fire so we don't lose it.
+                is_continuation || has_opencode_session,
             )
             .await
         }
         "grok" => {
+            // Goal-mode missions drive a /goal <objective> loop and need the
+            // raw message preserved verbatim. For normal Grok turns we pass
+            // the history-framed `convo` so the model sees the prior
+            // conversation and the standard turn-instructions scaffolding —
+            // same rule as the `control` arm above (Bugbot 67883f8c). Without
+            // this, queued Grok missions miss conversation history.
+            let grok_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
             run_grok_turn(
                 &workspace,
                 &mission_work_dir,
-                &user_message,
+                &grok_message_owned,
                 config.default_model.as_deref(),
                 mission_id,
                 events_tx.clone(),
@@ -5095,7 +5205,6 @@ pub fn run_claudecode_turn<'a>(
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4096);
         let mut first_text_delta_at: Option<Instant> = None;
-        let mut degenerate_stream_detected: bool = false;
         let mut degenerate_stage_triggered: bool = false;
 
         let mut saw_non_init_event = false;
@@ -5455,7 +5564,7 @@ pub fn run_claudecode_turn<'a>(
                                                         // streaming duration we kill the CLI, surface a
                                                         // clear "model entered a degenerate loop"
                                                         // failure, and let the user send a new turn.
-                                                        if !degenerate_stream_detected {
+                                                        if !degenerate_stage_triggered {
                                                             if first_text_delta_at.is_none() {
                                                                 first_text_delta_at = Some(Instant::now());
                                                             }
@@ -5475,11 +5584,6 @@ pub fn run_claudecode_turn<'a>(
                                                                     degenerate_min_repeats,
                                                                 )
                                                             {
-                                                                // Set both flags; `degenerate_stream_detected`
-                                                                // gates this whole `if` so we never fire twice,
-                                                                // and `degenerate_stage_triggered` is what
-                                                                // the post-loop failure path reads.
-                                                                degenerate_stream_detected = true;
                                                                 tracing::warn!(
                                                                     mission_id = %mission_id,
                                                                     streaming_for_secs = streaming_for.as_secs(),
@@ -6407,6 +6511,21 @@ fn extract_opencode_session_id(output: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Return true if `s` looks like an OpenCode session id (e.g.
+/// `ses_14ecf17a4ffezc57OUz1Zz9Noc`) — the prefix and shape the CLI uses
+/// for its own session files. We use this to reject the *Claude Code*-style
+/// UUIDs that mission creation pre-assigns for conversation persistence —
+/// those are valid for `claude --session-id` but cause the opencode CLI
+/// to print "Session not found" if we hand them to `--session`.
+pub(crate) fn is_opencode_session_id(s: &str) -> bool {
+    let s = s.trim();
+    if !s.starts_with("ses_") {
+        return false;
+    }
+    // ses_<alphanumeric>, at least 4 chars of body.
+    s.len() >= 7 && s[4..].chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 /// Returns true if the line is an OpenCode runner/status banner (not model output).
 ///
 /// OpenCode writes a fixed set of status lines to stdout. We filter these
@@ -6595,15 +6714,16 @@ fn is_success_path_provider_payload_error(message: &str) -> bool {
 }
 
 fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
-    let partial_output = partial_output.trim();
-    if partial_output.is_empty() {
-        return "OpenCode idle timeout: the model stopped producing output before finishing the turn. No response was generated.".to_string();
-    }
-
-    format!(
-        "OpenCode idle timeout: the model stopped producing output before finishing the turn. Partial output was discarded because it was incomplete.\n\nPartial output:\n{}",
-        partial_output
-    )
+    // The previous version echoed a snippet of the model's last text fragment
+    // (often a half-finished `<think>` tail) into the assistant bubble, which
+    // read as a corrupted reply. The model output is intentionally discarded:
+    // a kill for inactivity means we never received a terminal result event,
+    // so we have no idea whether the fragment was a real answer or a
+    // pre-response leak. Surface a clean, retryable error instead.
+    let _ = partial_output.trim();
+    "OpenCode turn aborted: the model stopped producing output before finishing \
+     the turn (idle timeout). Click Resume to retry."
+        .to_string()
 }
 
 pub(crate) fn is_provider_payload_error(message: &str) -> bool {
@@ -6843,6 +6963,107 @@ fn strip_opencode_banner_lines(output: &str) -> Cow<'_, str> {
 
 fn sanitized_opencode_stdout(output: &str) -> Cow<'_, str> {
     strip_opencode_banner_lines(output)
+}
+
+/// Detect and truncate garbled/repetitive output where the model echoes tool
+/// results verbatim instead of summarizing them.
+///
+/// Models (observed: MiniMax-M3) sometimes get confused by long tool outputs
+/// (SSH warnings, nvidia-smi tables, etc.) and start echoing them verbatim in
+/// their text response, creating extremely long messages with >80% repetition.
+///
+/// Returns `Some(truncated)` if garbling was detected, `None` if the output
+/// looks normal.
+fn truncate_garbled_output(text: &str) -> Option<String> {
+    const MIN_LENGTH: usize = 2000;
+    const MAX_REPETITION_RATIO: f64 = 0.70;
+    const MIN_UNIQUE_BLOCKS: usize = 1;
+
+    if text.len() < MIN_LENGTH {
+        return None;
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 20 {
+        return None;
+    }
+
+    let unique_lines: std::collections::HashSet<&str> = lines.iter().copied().collect();
+    let unique_ratio = unique_lines.len() as f64 / lines.len() as f64;
+
+    if unique_ratio >= (1.0 - MAX_REPETITION_RATIO) {
+        return None;
+    }
+
+    // Also check for repeated multi-line blocks (the model repeats entire
+    // nvidia-smi tables or SSH warning blocks).
+    let block_size = 3;
+    let mut block_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for chunk in lines.chunks(block_size) {
+        if chunk.len() == block_size {
+            let key: String = chunk.join("\n");
+            *block_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let unique_blocks = block_counts.len();
+
+    if unique_blocks < MIN_UNIQUE_BLOCKS {
+        return None;
+    }
+
+    let block_repetition_ratio =
+        1.0 - (unique_blocks as f64 / block_counts.values().sum::<usize>() as f64);
+    if block_repetition_ratio < MAX_REPETITION_RATIO {
+        return None;
+    }
+
+    // Garbling detected. Find the end of the first unique-content region by
+    // walking forward and stopping when we see a line that has appeared before.
+    let mut seen_lines = std::collections::HashSet::new();
+    let mut cutoff = lines.len();
+
+    for (i, &line) in lines.iter().enumerate() {
+        if i > 0 && seen_lines.contains(line) && !line.trim().is_empty() {
+            // Check if the next few lines are also repeats (to avoid cutting
+            // in the middle of legitimate repeated words)
+            let ahead_repeats = lines[i..]
+                .iter()
+                .take(5)
+                .filter(|&&l| seen_lines.contains(l) && !l.trim().is_empty())
+                .count();
+            if ahead_repeats >= 3 {
+                cutoff = i;
+                break;
+            }
+        }
+        seen_lines.insert(line);
+    }
+
+    if cutoff >= lines.len() {
+        return None;
+    }
+
+    let truncated = lines[..cutoff].join("\n");
+    let truncated = truncated.trim();
+
+    if truncated.len() >= text.len() / 2 {
+        return None;
+    }
+
+    if truncated.is_empty() {
+        return Some(format!(
+            "[Agent output was garbled — model echoed tool output verbatim. Original length: {} bytes]",
+            text.len()
+        ));
+    }
+
+    Some(format!(
+        "{}\n\n[... output truncated: model echoed tool output repeatedly. Original: {} bytes, kept: {} bytes]",
+        truncated,
+        text.len(),
+        truncated.len()
+    ))
 }
 
 fn is_opencode_exit_status_placeholder(output: &str) -> bool {
@@ -10313,6 +10534,8 @@ pub async fn run_opencode_turn(
     events_tx: broadcast::Sender<AgentEvent>,
     cancel: CancellationToken,
     app_working_dir: &std::path::Path,
+    session_id: Option<&str>,
+    is_continuation: bool,
 ) -> AgentResult {
     use super::ai_providers::{
         ensure_anthropic_oauth_token_valid, ensure_google_oauth_token_valid,
@@ -10606,6 +10829,32 @@ pub async fn run_opencode_turn(
         inner_cmd.push_str(" --agent ");
         inner_cmd.push_str(&shell_escape(a));
     }
+    // Resume the per-mission OpenCode session on continuation turns so the
+    // CLI loads prior message history from `<XDG_DATA_HOME>/opencode/storage`
+    // (which is now scoped to the workspace — see the XDG overrides above).
+    // Without this, every turn starts a brand-new session and the model
+    // loses all prior context. `--continue` is the simpler "resume last
+    // session in this dir" form for freshly-created missions that don't
+    // have a stored session id yet.
+    //
+    // Mission rows in the DB also carry a *Claude Code*-style session id
+    // (a plain UUID generated at mission creation) that is NOT a valid
+    // OpenCode session id. Passing `--session <UUID>` to the opencode CLI
+    // makes it error out with "Session not found". Only treat a session
+    // id as an OpenCode id when it starts with the "ses_" prefix the CLI
+    // uses (`ses_<base62>`); fall back to `--continue` otherwise.
+    if is_continuation {
+        let opencode_sid = session_id.filter(|s| is_opencode_session_id(s));
+        match opencode_sid {
+            Some(sid) => {
+                inner_cmd.push_str(" --session ");
+                inner_cmd.push_str(&shell_escape(sid));
+            }
+            None => {
+                inner_cmd.push_str(" --continue");
+            }
+        }
+    }
     inner_cmd.push_str(" --dir ");
     inner_cmd.push_str(&shell_escape(&work_dir_arg));
     inner_cmd.push_str(" \"$(cat ");
@@ -10658,6 +10907,76 @@ pub async fn run_opencode_turn(
         env.insert("API_URL".to_string(), public_url);
     } else if let Some(local_url) = localhost_api_base_url_from_env() {
         env.insert("API_URL".to_string(), local_url);
+    }
+
+    // Per-mission XDG isolation for OpenCode. Without this, every mission on
+    // the same host shares the operator's `~/.local/share/opencode` storage,
+    // which (a) lets sessions from concurrent missions collide on the same
+    // SQLite DB and (b) means resuming mission A pulls in any unrelated
+    // session that the operator's opencode created locally. Mirror the
+    // per-mission HOME/XDG pattern used by Claude Code (see the `claudecode`
+    // arm above) so storage and config are scoped to the workspace.
+    let opencode_xdg_config = work_dir.join(".config");
+    let opencode_xdg_data = work_dir.join(".local").join("share");
+    let opencode_xdg_state = work_dir.join(".local").join("state");
+    let opencode_xdg_cache = work_dir.join(".cache");
+    for dir in [
+        &opencode_xdg_config,
+        &opencode_xdg_data,
+        &opencode_xdg_state,
+        &opencode_xdg_cache,
+    ] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(
+                mission_id = %mission_id,
+                path = %dir.display(),
+                error = %e,
+                "Failed to create per-mission OpenCode XDG directory"
+            );
+        }
+    }
+    let opencode_xdg_config_env = workspace_path_for_env(workspace, &opencode_xdg_config);
+    let opencode_xdg_data_env = workspace_path_for_env(workspace, &opencode_xdg_data);
+    let opencode_xdg_state_env = workspace_path_for_env(workspace, &opencode_xdg_state);
+    let opencode_xdg_cache_env = workspace_path_for_env(workspace, &opencode_xdg_cache);
+    env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        opencode_xdg_config_env.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "XDG_DATA_HOME".to_string(),
+        opencode_xdg_data_env.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "XDG_STATE_HOME".to_string(),
+        opencode_xdg_state_env.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "XDG_CACHE_HOME".to_string(),
+        opencode_xdg_cache_env.to_string_lossy().to_string(),
+    );
+    // HOME is the fallback OpenCode uses when XDG_* aren't set. Setting it to
+    // the workspace also keeps credential lookups (e.g. `~/.local/share/opencode/auth.json`)
+    // inside the per-mission XDG_DATA_HOME we just set above.
+    env.insert(
+        "HOME".to_string(),
+        workspace_path_for_env(workspace, work_dir)
+            .to_string_lossy()
+            .to_string(),
+    );
+    // Allow opting out of the per-mission XDG override when an operator
+    // explicitly wants the opencode CLI to share storage with the host (e.g.
+    // for debugging with `opencode session list` on the host shell).
+    if std::env::var("SANDBOXED_SH_OPENCODE_SHARED_XDG")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_some()
+    {
+        env.remove("XDG_CONFIG_HOME");
+        env.remove("XDG_DATA_HOME");
+        env.remove("XDG_STATE_HOME");
+        env.remove("XDG_CACHE_HOME");
+        env.remove("HOME");
     }
     if telegram_action_helpers_enabled {
         if let Some(token) = crate::api::telegram::build_internal_telegram_action_token(mission_id)
@@ -10843,6 +11162,10 @@ pub async fn run_opencode_turn(
     let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let latest_tool_result_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let rate_limit_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Track text delta repetition to suppress garbled streaming output where
+    // the model echoes tool results verbatim instead of summarizing them.
+    let _sse_text_repeat_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let _sse_text_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
     let (sse_complete_tx, mut sse_complete_rx) = tokio::sync::watch::channel(false);
     let (sse_session_idle_tx, mut sse_session_idle_rx) = tokio::sync::watch::channel(false);
@@ -11094,7 +11417,11 @@ pub async fn run_opencode_turn(
     // after emitting an initial acknowledgement and finishing a tool-call step.
     // A short timeout turns that acknowledgement into a false successful answer
     // for Telegram. Let the global inactivity timeout handle truly stuck turns.
-    const OPENCODE_TEXT_IDLE_TIMEOUT_SECS: u64 = 120;
+    let opencode_text_idle_timeout_secs: u64 =
+        std::env::var("SANDBOXED_SH_OPENCODE_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
 
     loop {
         tokio::select! {
@@ -11267,7 +11594,7 @@ pub async fn run_opencode_turn(
                     }
                 }
                 if let Some(last_text) = text_output_at {
-                    if last_text.elapsed() >= std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS) {
+                    if last_text.elapsed() >= std::time::Duration::from_secs(opencode_text_idle_timeout_secs) {
                         // Only kill if there's also no recent SSE/stderr activity
                         // AND no tools are actively running.  A long tool execution
                         // (build, test, sleep) may produce no text output for >30s;
@@ -11287,7 +11614,7 @@ pub async fn run_opencode_turn(
                         let recent_activity = last_activity
                             .lock()
                             .ok()
-                            .map(|g| g.elapsed() < std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS))
+                            .map(|g| g.elapsed() < std::time::Duration::from_secs(opencode_text_idle_timeout_secs))
                             .unwrap_or(false);
                         if !recent_activity && !tools_active {
                             tracing::info!(
@@ -11439,20 +11766,46 @@ pub async fn run_opencode_turn(
                                     if let Some(text) =
                                         part.get("text").and_then(|t| t.as_str())
                                     {
-                                        // Strip <think>...</think> tags for final result
-                                        let clean_text =
-                                            if let Some(end_pos) = text.find("</think>") {
-                                                text[end_pos + 8..].trim().to_string()
-                                            } else {
-                                                text.to_string()
-                                            };
+                                        // Extract <think>...</think> content as
+                                        // thinking events before stripping them.
+                                        if let Some(thinking) = extract_think_content(text) {
+                                            if !thinking.trim().is_empty()
+                                                && state.last_emitted_thinking.as_deref()
+                                                    != Some(thinking.as_str())
+                                            {
+                                                state.last_emitted_thinking =
+                                                    Some(thinking.clone());
+                                                sse_emitted_thinking.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                                sse_done_sent.store(
+                                                    false,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                                let _ =
+                                                    events_tx.send(AgentEvent::Thinking {
+                                                        content: thinking,
+                                                        done: false,
+                                                        mission_id: Some(mission_id),
+                                                    });
+                                            }
+                                        }
+
+                                        // Strip <think>...</think> tags for
+                                        // visible text / final result
+                                        let clean_text = strip_think_tags(text);
+                                        let clean_text = clean_text.trim();
                                         if !clean_text.is_empty() {
-                                            final_result = clean_text.clone();
+                                            final_result = clean_text.to_string();
                                             let _ = text_output_tx.send(true);
-                                            // Emit text delta for Telegram streaming
+                                            sse_emitted_text.store(
+                                                true,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            );
                                             let _ =
                                                 events_tx.send(AgentEvent::TextDelta {
-                                                    content: clean_text,
+                                                    content: clean_text.to_string(),
                                                     mission_id: Some(mission_id),
                                                 });
                                         }
@@ -11479,7 +11832,7 @@ pub async fn run_opencode_turn(
                                 } else {
                                     // Track consecutive tool-call steps to detect runaway loops
                                     tool_call_step_count += 1;
-                                    const MAX_TOOL_CALL_STEPS: u32 = 15;
+                                    const MAX_TOOL_CALL_STEPS: u32 = 40;
                                     if tool_call_step_count >= MAX_TOOL_CALL_STEPS {
                                         tracing::warn!(
                                             mission_id = %mission_id,
@@ -11823,6 +12176,15 @@ pub async fn run_opencode_turn(
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let session_id = session_id.or_else(|| extract_opencode_session_id(&final_result));
+    // Persist the opencode session id so the next turn can resume the
+    // conversation with `--session <id>`. Mirrors the path used by Grok
+    // (see `AgentEvent::SessionIdUpdate` emission in `run_grok_turn`).
+    if let Some(sid) = session_id.as_deref() {
+        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+            mission_id,
+            session_id: sid.to_string(),
+        });
+    }
     let stored_message = session_id
         .as_deref()
         .and_then(|id| load_latest_opencode_assistant_message(workspace, id));
@@ -11920,6 +12282,21 @@ pub async fn run_opencode_turn(
         if let Cow::Owned(clean) = cleaned_result {
             final_result = clean;
         }
+    }
+
+    // Detect and truncate garbled/repetitive output where the model echoes
+    // tool results (SSH warnings, nvidia-smi tables, etc.) verbatim in its
+    // text response instead of summarizing them. This produces extremely
+    // long assistant messages with >80% line repetition and repeated tool
+    // output blocks. Truncate to the first unique-content region.
+    if let Some(truncated) = truncate_garbled_output(&final_result) {
+        tracing::warn!(
+            mission_id = %mission_id,
+            original_len = final_result.len(),
+            truncated_len = truncated.len(),
+            "Truncated garbled/repetitive assistant output"
+        );
+        final_result = truncated;
     }
 
     if let Ok(guard) = latest_tool_result_text.lock() {
@@ -12611,6 +12988,48 @@ pub async fn run_grok_turn(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
+
+    if workspace.id == crate::workspace::DEFAULT_WORKSPACE_ID && !work_dir.join(".git").exists() {
+        let file_count = std::fs::read_dir(work_dir)
+            .map(|mut d| {
+                d.by_ref()
+                    .filter(|e| {
+                        e.as_ref()
+                            .map(|e| {
+                                let n = e.file_name();
+                                let n = n.to_string_lossy();
+                                !n.starts_with('.') && n != "output"
+                            })
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if file_count == 0 && !is_continuation {
+            let dir_display = work_dir.display();
+            tracing::warn!(
+                mission_id = %mission_id,
+                work_dir = %dir_display,
+                "Grok mission running in empty host workspace with no git repo — goal loop will hallucinate edits"
+            );
+            let msg = format!(
+                "The mission workspace ({dir_display}) is empty and has no git repository. \
+                 Grok cannot edit files or push changes without a project checkout. \
+                 Create this mission on a workspace that contains the target repository, \
+                 or clone the repo into the workspace first.",
+            );
+            // Return a failure result so the control loop emits a single
+            // `AssistantMessage { success: false }` and marks the mission
+            // `Failed` (Bugbot f4a7a2d8). Emitting a manual AssistantMessage
+            // and then returning success:true caused the control loop to
+            // emit a SECOND assistant message with success:true and record
+            // automations as successful, despite the workspace being
+            // unusable. LlmError is the right terminal reason: this is a
+            // "can't run" error, not a clean turn boundary.
+            return AgentResult::failure(msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    }
+
     let cli_path =
         get_backend_string_setting("grok", "cli_path").unwrap_or_else(|| "grok".to_string());
     let cli_path = match ensure_grok_cli_available(&workspace_exec, work_dir, &cli_path).await {
@@ -15212,23 +15631,23 @@ mod tests {
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
         custom_opencode_provider_definition, ensure_opencode_provider_for_model,
         extract_codex_reset_window, extract_model_from_message, extract_opencode_session_id,
-        extract_part_text, extract_str, is_capacity_limited_error,
-        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
-        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
-        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
-        is_tool_call_only_output, opencode_goal_terminal_status,
-        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
-        opencode_session_token_from_line, parse_opencode_goal_objective,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, record_codex_error_message,
+        extract_part_text, extract_str, extract_think_content, is_capacity_limited_error,
+        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_opencode_session_id,
+        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
+        is_success_path_auth_error, is_success_path_provider_payload_error,
+        is_success_path_rate_limited_error, is_tool_call_only_output,
+        opencode_goal_terminal_status, opencode_idle_timeout_result_message,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
+        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
         summarize_recent_opencode_stderr, text_buffer_stream_looks_degenerate,
-        thinking_overlaps_visible_answer, use_thinking_only_fallback, utf8_safe_prefix,
-        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
+        thinking_overlaps_visible_answer, truncate_garbled_output, use_thinking_only_fallback,
+        utf8_safe_prefix, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
+        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
         CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
@@ -15763,14 +16182,69 @@ mod tests {
     }
 
     #[test]
-    fn opencode_idle_timeout_result_discards_partial_success_text() {
-        let message =
-            opencode_idle_timeout_result_message("Je m'en occupe ! Je te fais ça en parallèle.");
+    fn opencode_idle_timeout_result_does_not_leak_model_fragment() {
+        // The previous version echoed a snippet of the model's last text
+        // fragment (often a half-finished `<think>` tail) into the assistant
+        // bubble, which read as a corrupted reply. The new message must not
+        // contain that fragment.
+        let model_fragment = "Je m'en occupe ! Je te fais ça en parallèle.";
+        let message = opencode_idle_timeout_result_message(model_fragment);
 
-        assert!(message.starts_with("OpenCode idle timeout:"));
-        assert!(message.contains("Partial output was discarded"));
-        assert!(message.contains("Je m'en occupe"));
-        assert!(!message.contains("La réponse a été interrompue"));
+        assert!(
+            message.starts_with("OpenCode turn aborted"),
+            "expected clean turn-aborted header, got: {message}"
+        );
+        assert!(
+            !message.contains(model_fragment),
+            "idle-timeout error must not leak the model fragment: {message}"
+        );
+        assert!(message.contains("Resume") || message.contains("retry"));
+    }
+
+    #[test]
+    fn opencode_idle_timeout_result_with_empty_partial() {
+        let message = opencode_idle_timeout_result_message("");
+        assert!(message.starts_with("OpenCode turn aborted"));
+        assert!(message.contains("Resume") || message.contains("retry"));
+    }
+
+    #[test]
+    fn truncate_garbled_output_leaves_normal_long_text_alone() {
+        // 30 unique lines, no repetition — should not be touched.
+        let text = (0..30)
+            .map(|i| format!("This is line number {i} with some unique content here."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(truncate_garbled_output(&text).is_none());
+    }
+
+    #[test]
+    fn truncate_garbled_output_truncates_repeated_block_dump() {
+        // Simulate the production bug: a model echoing an nvidia-smi table
+        // over and over, prefixed by a short non-repeated intro.
+        let intro = "Let me check the GPU state on the DGX.\n";
+        let block = "\
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+|  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC  |";
+        let repeated = vec![block; 30].join("\n");
+        let text = format!("{intro}{repeated}");
+
+        let truncated = truncate_garbled_output(&text).expect("garbling detected");
+        // The intro is preserved; the repeated block is cut.
+        assert!(truncated.starts_with(intro.trim_end()));
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.len() < text.len());
+    }
+
+    #[test]
+    fn truncate_garbled_output_ignores_short_inputs() {
+        // Anything below the MIN_LENGTH threshold (2000) is left alone —
+        // the heuristic is only safe on long outputs where repetition is
+        // statistically meaningful.
+        let text = "this is repeated\n".repeat(50);
+        assert!(truncate_garbled_output(&text).is_none());
     }
 
     #[test]
@@ -15965,6 +16439,39 @@ mod tests {
         assert_eq!(opencode_session_token_from_line("session=foo_bar"), None);
         assert_eq!(opencode_session_token_from_line("session id: short"), None);
         assert_eq!(opencode_session_token_from_line("no session here"), None);
+    }
+
+    #[test]
+    fn is_opencode_session_id_accepts_ses_prefix_alphanumeric() {
+        // Real OpenCode session ids: `ses_` prefix + base62/alphanumeric body.
+        assert!(is_opencode_session_id("ses_14ecf17a4ffezc57OUz1Zz9Noc"));
+        assert!(is_opencode_session_id("ses_abc123"));
+        assert!(is_opencode_session_id("ses_ZZ9a0bC1"));
+    }
+
+    #[test]
+    fn is_opencode_session_id_rejects_claude_code_uuid() {
+        // Mission creation pre-assigns a UUID for Claude Code conversation
+        // persistence. Handing that to the opencode CLI causes
+        // 'Error: Session not found', so we must NOT treat it as an
+        // OpenCode session id.
+        let uuid = "71082b52-ccc7-4845-b7a4-f96dbaf6020e";
+        assert!(!is_opencode_session_id(uuid));
+        assert!(!is_opencode_session_id(
+            "b5e8d8d9-11ad-4870-8b37-fe9c33b32c8f"
+        ));
+    }
+
+    #[test]
+    fn is_opencode_session_id_rejects_garbage() {
+        assert!(!is_opencode_session_id(""));
+        assert!(!is_opencode_session_id("ses_")); // missing body
+        assert!(!is_opencode_session_id("ses")); // missing prefix
+        assert!(!is_opencode_session_id("session_abc")); // wrong prefix
+        assert!(!is_opencode_session_id("ses_abc-def")); // hyphens not allowed
+                                                         // Whitespace is trimmed before the prefix check, so leading/trailing
+                                                         // spaces do not disqualify a valid id.
+        assert!(is_opencode_session_id("  ses_abc123  "));
     }
 
     #[test]
@@ -16549,6 +17056,76 @@ mod tests {
         let input = "before<think>🛡 reasoning 🎯</think>after";
         let result = strip_think_tags(input);
         assert_eq!(result, "beforeafter");
+    }
+
+    // ── extract_think_content tests ───────────────────────────────────
+
+    #[test]
+    fn extract_think_content_closed_tag() {
+        let text = "<think>secret reasoning</think>\n\nvisible answer";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("secret reasoning")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_unclosed_tag() {
+        let text = "<think>still thinking...";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("still thinking...")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_no_tags() {
+        assert!(extract_think_content("no think tags here").is_none());
+    }
+
+    #[test]
+    fn extract_think_content_empty() {
+        assert_eq!(
+            extract_think_content("<think></think>").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_concatenates_multiple_blocks() {
+        // The model emits two reasoning chunks separated by visible text —
+        // both blocks should land in the same Thinking event.
+        let text = "<think>first reasoning</think> visible <think>second reasoning</think>";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("first reasoning\nsecond reasoning")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_handles_unclosed_then_closed() {
+        // Edge case: a previous unclosed opener (we'll just include the rest)
+        // then a new closed block. Order is preserved.
+        let text = "<think>still going...<think>fresh start</think>";
+        // First opener has no close, so we include everything from after it
+        // until end of input. The second opener is inside that region so we
+        // re-enter the loop on the next iteration.
+        let got = extract_think_content(text).expect("some opener found");
+        assert!(got.contains("still going..."), "got: {got}");
+        assert!(got.contains("fresh start"), "got: {got}");
+    }
+
+    #[test]
+    fn extract_think_content_case_insensitive_open() {
+        // Some models emit <Think> (capitalised) — we already match openers
+        // case-insensitively, but close-tag handling must too. Pin the
+        // current contract: OPEN tag is case-insensitive, close tag follows
+        // suit because both go through find_ci.
+        let text = "<Think>mixed case reasoning</Think>";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("mixed case reasoning")
+        );
     }
 
     #[test]

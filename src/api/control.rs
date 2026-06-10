@@ -2297,7 +2297,7 @@ pub(crate) async fn resolve_claudecode_default_model(
 ) -> Option<String> {
     // Keep this fallback aligned with Anthropic's model catalog:
     // https://docs.anthropic.com/en/docs/about-claude/models/overview
-    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-opus-4-8";
+    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-fable-5";
 
     let lib = {
         let guard = library.read().await;
@@ -6786,7 +6786,7 @@ fn spawn_control_session(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        lag_total = lag_total.saturating_add(n as u64);
+                        lag_total = lag_total.saturating_add(n);
                         tracing::warn!(
                             dropped = n,
                             lag_total = lag_total,
@@ -12753,10 +12753,15 @@ async fn run_single_control_turn(
             };
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
+            let grok_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
             Box::pin(super::mission_runner::run_grok_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &user_message,
+                &grok_message_owned,
                 requested_model
                     .as_deref()
                     .or(config.default_model.as_deref()),
@@ -12840,10 +12845,49 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
+            // A stored OpenCode-format session_id (starts with `ses_`) is
+            // itself a strong signal of a continuation even when the
+            // in-memory history has no assistant message (e.g. server
+            // restart, mission resume, history rebuild). The per-mission
+            // XDG storage still has the prior session, and we want
+            // --session/--continue to fire so we don't lose context. This
+            // mirrors the `mission_runner` arm and fixes Bugbot e8dd69f8.
+            //
+            // Note: missions also carry a *Claude Code*-style UUID
+            // session_id from mission creation, which the opencode CLI
+            // does not understand. We ignore that here (treat as no
+            // session) and let `is_opencode_session_id` in the runner
+            // filter it out as well, so the CLI never receives an invalid
+            // `--session <UUID>` and errors with "Session not found".
+            let has_opencode_session = session_id
+                .as_deref()
+                .map(super::mission_runner::is_opencode_session_id)
+                .unwrap_or(false);
+            let opencode_is_continuation = force_session_resume
+                || history.iter().any(|(role, _)| role == "assistant")
+                || has_opencode_session;
+            // Goal-mode missions drive a /goal <objective> loop and need the
+            // raw message preserved verbatim. For normal continuations, when
+            // we have a stored OpenCode session_id the opencode CLI will
+            // load prior messages from its own storage, so we send the bare
+            // user message instead of the history-framed `convo` (which
+            // would duplicate the context the session already has). When we
+            // don't have an OpenCode session_id (first turn of a brand-new
+            // mission, a legacy mission that never persisted one, or a
+            // mission that only has the Claude-Code UUID placeholder),
+            // keep using `convo` so the model still gets a history-aware
+            // prompt.
+            let is_goal_mode = user_message.trim_start().starts_with("/goal ");
+            let opencode_message_owned: String =
+                if is_goal_mode || (opencode_is_continuation && has_opencode_session) {
+                    user_message.clone()
+                } else {
+                    convo.clone()
+                };
             Box::pin(super::mission_runner::run_opencode_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &user_message,
+                &opencode_message_owned,
                 config.default_model.as_deref(),
                 requested_model_effort.as_deref(),
                 config.opencode_agent.as_deref(),
@@ -12851,6 +12895,8 @@ async fn run_single_control_turn(
                 events_tx.clone(),
                 cancel,
                 &config.working_dir,
+                session_id.as_deref(),
+                opencode_is_continuation,
             ))
             .await
         }
