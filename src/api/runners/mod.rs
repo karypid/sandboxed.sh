@@ -5,6 +5,7 @@
 //! backend turn runners themselves) move here so `mission_runner.rs` can
 //! shrink down to orchestration (dispatch, retry/fallback, TerminalReason).
 
+pub(crate) mod claudecode;
 pub(crate) mod codex;
 pub(crate) mod errors;
 pub(crate) mod gemini;

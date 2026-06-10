@@ -69,7 +69,7 @@ const ACK_GRACE_SECONDS: u64 = 3600;
 const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
-pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
+pub(crate) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
         return s.len();
     }
