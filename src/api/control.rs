@@ -12845,8 +12845,15 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
-            let opencode_is_continuation =
-                force_session_resume || history.iter().any(|(role, _)| role == "assistant");
+            // A stored session_id is itself a strong signal of a continuation
+            // even when the in-memory history has no assistant message (e.g.
+            // server restart, mission resume, history rebuild). The per-mission
+            // XDG storage still has the prior session, and we want
+            // --session/--continue to fire so we don't lose context. This
+            // mirrors the `mission_runner` arm and fixes Bugbot e8dd69f8.
+            let opencode_is_continuation = force_session_resume
+                || history.iter().any(|(role, _)| role == "assistant")
+                || session_id.is_some();
             // Goal-mode missions drive a /goal <objective> loop and need the
             // raw message preserved verbatim. For normal continuations, when
             // we have a stored session_id the opencode CLI will load prior

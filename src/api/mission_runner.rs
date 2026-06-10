@@ -1431,7 +1431,9 @@ fn strip_think_tags(text: &str) -> String {
 }
 
 /// Extract text inside `<think>...</think>` tags. Handles unclosed tags
-/// (returns everything after `<think>`) and multiple blocks (concatenates).
+/// (the trailing unclosed opener is included verbatim) and multiple blocks
+/// (concatenated in order, separated by a single newline so callers can
+/// distinguish boundaries; trim will absorb the joiner's whitespace).
 fn extract_think_content(text: &str) -> Option<String> {
     fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
         let needle_len = needle.len();
@@ -1444,20 +1446,49 @@ fn extract_think_content(text: &str) -> Option<String> {
             .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
     }
 
-    let start = find_ci(text, "<think>")?;
-    let after_open = start + 7;
+    const OPEN_TAG: &str = "<think>";
+    const CLOSE_TAG: &str = "</think>";
 
-    let rest = if after_open <= text.len() {
-        &text[after_open..]
-    } else {
-        return Some(String::new());
-    };
-
-    if let Some(rel_close) = find_ci(rest, "</think>") {
-        Some(rest[..rel_close].to_string())
-    } else {
-        Some(rest.to_string())
+    // Walk every `<think>` opener in order. For each one, take everything up
+    // to the next `</think>` (or to the end of the string if the close tag
+    // is missing — the model streamed the tag header but not the footer yet).
+    let mut combined = String::new();
+    let mut cursor = 0usize;
+    let mut found_any = false;
+    while let Some(open) = find_ci(&text[cursor..], OPEN_TAG) {
+        found_any = true;
+        let abs_open = cursor + open;
+        let after_open = abs_open + OPEN_TAG.len();
+        let scan_from = if after_open <= text.len() {
+            after_open
+        } else {
+            text.len()
+        };
+        match find_ci(&text[scan_from..], CLOSE_TAG) {
+            Some(rel_close) => {
+                let abs_close = scan_from + rel_close;
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&text[after_open..abs_close]);
+                cursor = abs_close + CLOSE_TAG.len();
+            }
+            None => {
+                // Unclosed trailing opener: include the rest of the string
+                // so the model can stream the closing tag in a later delta.
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&text[after_open..]);
+                break;
+            }
+        }
     }
+
+    if !found_any {
+        return None;
+    }
+    Some(combined)
 }
 
 fn normalize_stream_comparison_text(text: &str) -> String {
@@ -3638,10 +3669,19 @@ async fn run_mission_turn(
         "opencode" => {
             // Use per-workspace CLI execution for all workspace types to ensure
             // native bash + correct filesystem scope.
-            // Same prompt-selection rule as the `control` arm above: pass the
-            // bare user message when we have a stored session_id (the opencode
-            // CLI will load prior history itself), and use the history-framed
-            // `convo` only for fresh sessions that don't have one yet.
+            // Same prompt-selection + session-resume rule as the `control`
+            // arm above: if we have a stored session_id (with or without
+            // an in-memory assistant history) the opencode CLI will load
+            // prior history from its per-mission XDG storage, so:
+            //   - pass bare `user_message` (not the history-framed `convo`,
+            //     which would duplicate the context the CLI is about to
+            //     load), AND
+            //   - pass `--session <id>` (preferred) or `--continue` (safe
+            //     fallback when history was lost but storage still has the
+            //     most-recent session for this mission) so we never start a
+            //     brand-new session and lose context (Bugbot e8dd69f8).
+            // Only use `convo` and no-resume for a brand-new mission with no
+            // session_id yet.
             let is_goal_mode = user_message.trim_start().starts_with("/goal ");
             let has_session_history = session_id.is_some();
             let opencode_message_owned: String = if is_goal_mode || has_session_history {
@@ -3661,7 +3701,12 @@ async fn run_mission_turn(
                 cancel,
                 &config.working_dir,
                 session_id.as_deref(),
-                is_continuation,
+                // Always treat a stored session_id as a continuation: even if
+                // the in-memory history doesn't have an assistant message
+                // (e.g. server restart, mission resume, history rebuild),
+                // the per-mission XDG storage has the prior session, and we
+                // want --session/--continue to fire so we don't lose it.
+                is_continuation || has_session_history,
             )
             .await
         }
@@ -5142,7 +5187,6 @@ pub fn run_claudecode_turn<'a>(
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4096);
         let mut first_text_delta_at: Option<Instant> = None;
-        let degenerate_stream_detected: bool = false;
         let mut degenerate_stage_triggered: bool = false;
 
         let mut saw_non_init_event = false;
@@ -5502,7 +5546,7 @@ pub fn run_claudecode_turn<'a>(
                                                         // streaming duration we kill the CLI, surface a
                                                         // clear "model entered a degenerate loop"
                                                         // failure, and let the user send a new turn.
-                                                        if !degenerate_stream_detected {
+                                                        if !degenerate_stage_triggered {
                                                             if first_text_delta_at.is_none() {
                                                                 first_text_delta_at = Some(Instant::now());
                                                             }
@@ -12934,21 +12978,15 @@ pub async fn run_grok_turn(
                  Create this mission on a workspace that contains the target repository, \
                  or clone the repo into the workspace first.",
             );
-            let _ = events_tx.send(AgentEvent::AssistantMessage {
-                id: uuid::Uuid::new_v4(),
-                content: msg.clone(),
-                success: false,
-                cost_cents: 0,
-                cost_source: crate::agents::CostSource::Unknown,
-                usage: None,
-                model: None,
-                model_normalized: None,
-                mission_id: Some(mission_id),
-                shared_files: None,
-                resumable: false,
-                completion_evidence: None,
-            });
-            return AgentResult::success(msg, 0).with_terminal_reason(TerminalReason::TurnComplete);
+            // Return a failure result so the control loop emits a single
+            // `AssistantMessage { success: false }` and marks the mission
+            // `Failed` (Bugbot f4a7a2d8). Emitting a manual AssistantMessage
+            // and then returning success:true caused the control loop to
+            // emit a SECOND assistant message with success:true and record
+            // automations as successful, despite the workspace being
+            // unusable. LlmError is the right terminal reason: this is a
+            // "can't run" error, not a clean turn boundary.
+            return AgentResult::failure(msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
     }
 
@@ -16977,6 +17015,43 @@ mod tests {
         assert_eq!(
             extract_think_content("<think></think>").as_deref(),
             Some("")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_concatenates_multiple_blocks() {
+        // The model emits two reasoning chunks separated by visible text —
+        // both blocks should land in the same Thinking event.
+        let text = "<think>first reasoning</think> visible <think>second reasoning</think>";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("first reasoning\nsecond reasoning")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_handles_unclosed_then_closed() {
+        // Edge case: a previous unclosed opener (we'll just include the rest)
+        // then a new closed block. Order is preserved.
+        let text = "<think>still going...<think>fresh start</think>";
+        // First opener has no close, so we include everything from after it
+        // until end of input. The second opener is inside that region so we
+        // re-enter the loop on the next iteration.
+        let got = extract_think_content(text).expect("some opener found");
+        assert!(got.contains("still going..."), "got: {got}");
+        assert!(got.contains("fresh start"), "got: {got}");
+    }
+
+    #[test]
+    fn extract_think_content_case_insensitive_open() {
+        // Some models emit <Think> (capitalised) — we already match openers
+        // case-insensitively, but close-tag handling must too. Pin the
+        // current contract: OPEN tag is case-insensitive, close tag follows
+        // suit because both go through find_ci.
+        let text = "<Think>mixed case reasoning</Think>";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("mixed case reasoning")
         );
     }
 
