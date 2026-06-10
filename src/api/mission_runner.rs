@@ -7963,6 +7963,35 @@ fn ensure_opencode_provider_for_model(
     }
 }
 
+/// Whether an OpenCode session is present in the given XDG data home
+/// (`<data_home>/opencode/storage`). Sessions store an info JSON named
+/// `<session_id>.json` (layout has moved between CLI versions, so search a
+/// few levels deep) and per-message files under `message/<session_id>/`.
+fn opencode_session_exists_in_data_home(data_home: &std::path::Path, session_id: &str) -> bool {
+    let storage = data_home.join("opencode").join("storage");
+    if storage.join("message").join(session_id).is_dir() {
+        return true;
+    }
+    let target = format!("{session_id}.json");
+    fn find_file(dir: &std::path::Path, target: &str, depth: u8) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if path.file_name().and_then(|n| n.to_str()) == Some(target) {
+                    return true;
+                }
+            } else if depth > 0 && path.is_dir() && find_file(&path, target, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+    find_file(&storage.join("session"), &target, 3)
+}
+
 fn opencode_storage_roots(workspace: &Workspace) -> Vec<std::path::PathBuf> {
     if workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
@@ -10944,13 +10973,34 @@ pub async fn run_opencode_turn(
     // id as an OpenCode id when it starts with the "ses_" prefix the CLI
     // uses (`ses_<base62>`); fall back to `--continue` otherwise.
     if is_continuation {
-        let opencode_sid = session_id.filter(|s| is_opencode_session_id(s));
+        // A stored `ses_*` id is only usable if the session actually lives in
+        // the store the CLI will read. Missions created before the per-mission
+        // XDG isolation persisted their sessions in the shared host store —
+        // passing `--session` for those makes the CLI fail with "Session not
+        // found". Fall back to `--continue` (resume last session in this dir)
+        // when the session is not present in the effective store.
+        let shared_xdg = std::env::var("SANDBOXED_SH_OPENCODE_SHARED_XDG")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_some();
+        let mission_data_home = work_dir.join(".local").join("share");
+        let opencode_sid = session_id
+            .filter(|s| is_opencode_session_id(s))
+            .filter(|s| shared_xdg || opencode_session_exists_in_data_home(&mission_data_home, s));
         match opencode_sid {
             Some(sid) => {
                 inner_cmd.push_str(" --session ");
                 inner_cmd.push_str(&shell_escape(sid));
             }
             None => {
+                if session_id.is_some() {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        session_id = ?session_id,
+                        "Stored OpenCode session not found in per-mission storage \
+                         (likely created before XDG isolation); using --continue"
+                    );
+                }
                 inner_cmd.push_str(" --continue");
             }
         }
@@ -15743,9 +15793,10 @@ mod tests {
         is_success_path_auth_error, is_success_path_provider_payload_error,
         is_success_path_rate_limited_error, is_tool_call_only_output,
         opencode_goal_terminal_status, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
+        opencode_output_needs_fallback, opencode_session_exists_in_data_home,
+        opencode_session_token_from_line, parse_opencode_goal_objective,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
@@ -16934,6 +16985,33 @@ mod tests {
             opencode_json["provider"]["spark"]["options"]["baseURL"],
             "https://spark-de79.gazella-vector.ts.net/v1"
         );
+    }
+
+    #[test]
+    fn opencode_session_exists_checks_per_mission_store() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_home = temp.path().join(".local/share");
+
+        // Empty store → session not found (legacy pre-XDG-isolation session).
+        assert!(!opencode_session_exists_in_data_home(
+            &data_home,
+            "ses_abc123"
+        ));
+
+        // Session info file present (nested layout) → found.
+        let info_dir = data_home.join("opencode/storage/session/proj");
+        fs::create_dir_all(&info_dir).unwrap();
+        fs::write(info_dir.join("ses_abc123.json"), "{}").unwrap();
+        assert!(opencode_session_exists_in_data_home(
+            &data_home,
+            "ses_abc123"
+        ));
+
+        // Message dir layout also counts.
+        let temp2 = tempfile::tempdir().expect("temp dir");
+        let data_home2 = temp2.path().join(".local/share");
+        fs::create_dir_all(data_home2.join("opencode/storage/message/ses_xyz")).unwrap();
+        assert!(opencode_session_exists_in_data_home(&data_home2, "ses_xyz"));
     }
 
     #[test]
