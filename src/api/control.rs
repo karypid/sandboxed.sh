@@ -12845,28 +12845,41 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
-            // A stored session_id is itself a strong signal of a continuation
-            // even when the in-memory history has no assistant message (e.g.
-            // server restart, mission resume, history rebuild). The per-mission
+            // A stored OpenCode-format session_id (starts with `ses_`) is
+            // itself a strong signal of a continuation even when the
+            // in-memory history has no assistant message (e.g. server
+            // restart, mission resume, history rebuild). The per-mission
             // XDG storage still has the prior session, and we want
             // --session/--continue to fire so we don't lose context. This
             // mirrors the `mission_runner` arm and fixes Bugbot e8dd69f8.
+            //
+            // Note: missions also carry a *Claude Code*-style UUID
+            // session_id from mission creation, which the opencode CLI
+            // does not understand. We ignore that here (treat as no
+            // session) and let `is_opencode_session_id` in the runner
+            // filter it out as well, so the CLI never receives an invalid
+            // `--session <UUID>` and errors with "Session not found".
+            let has_opencode_session = session_id
+                .as_deref()
+                .map(super::mission_runner::is_opencode_session_id)
+                .unwrap_or(false);
             let opencode_is_continuation = force_session_resume
                 || history.iter().any(|(role, _)| role == "assistant")
-                || session_id.is_some();
+                || has_opencode_session;
             // Goal-mode missions drive a /goal <objective> loop and need the
             // raw message preserved verbatim. For normal continuations, when
-            // we have a stored session_id the opencode CLI will load prior
-            // messages from its own storage, so we send the bare user
-            // message instead of the history-framed `convo` (which would
-            // duplicate the context the session already has). When we don't
-            // have a session_id (first turn of a brand-new mission, or a
-            // legacy mission that never persisted one), keep using `convo`
-            // so the model still gets a history-aware prompt.
+            // we have a stored OpenCode session_id the opencode CLI will
+            // load prior messages from its own storage, so we send the bare
+            // user message instead of the history-framed `convo` (which
+            // would duplicate the context the session already has). When we
+            // don't have an OpenCode session_id (first turn of a brand-new
+            // mission, a legacy mission that never persisted one, or a
+            // mission that only has the Claude-Code UUID placeholder),
+            // keep using `convo` so the model still gets a history-aware
+            // prompt.
             let is_goal_mode = user_message.trim_start().starts_with("/goal ");
-            let has_session_history = session_id.is_some();
             let opencode_message_owned: String =
-                if is_goal_mode || (opencode_is_continuation && has_session_history) {
+                if is_goal_mode || (opencode_is_continuation && has_opencode_session) {
                     user_message.clone()
                 } else {
                     convo.clone()

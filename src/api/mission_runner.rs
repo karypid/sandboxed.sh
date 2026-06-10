@@ -3670,9 +3670,10 @@ async fn run_mission_turn(
             // Use per-workspace CLI execution for all workspace types to ensure
             // native bash + correct filesystem scope.
             // Same prompt-selection + session-resume rule as the `control`
-            // arm above: if we have a stored session_id (with or without
-            // an in-memory assistant history) the opencode CLI will load
-            // prior history from its per-mission XDG storage, so:
+            // arm above: if we have a stored OpenCode-format session_id
+            // (starts with `ses_`, with or without an in-memory assistant
+            // history) the opencode CLI will load prior history from its
+            // per-mission XDG storage, so:
             //   - pass bare `user_message` (not the history-framed `convo`,
             //     which would duplicate the context the CLI is about to
             //     load), AND
@@ -3681,10 +3682,15 @@ async fn run_mission_turn(
             //     most-recent session for this mission) so we never start a
             //     brand-new session and lose context (Bugbot e8dd69f8).
             // Only use `convo` and no-resume for a brand-new mission with no
-            // session_id yet.
+            // OpenCode session_id yet. Mission-creation pre-assigns a UUID
+            // for Claude Code persistence — that is NOT an OpenCode session
+            // id, so we ignore it and treat the mission as fresh.
             let is_goal_mode = user_message.trim_start().starts_with("/goal ");
-            let has_session_history = session_id.is_some();
-            let opencode_message_owned: String = if is_goal_mode || has_session_history {
+            let has_opencode_session = session_id
+                .as_deref()
+                .map(is_opencode_session_id)
+                .unwrap_or(false);
+            let opencode_message_owned: String = if is_goal_mode || has_opencode_session {
                 user_message.clone()
             } else {
                 convo.clone()
@@ -3701,12 +3707,13 @@ async fn run_mission_turn(
                 cancel,
                 &config.working_dir,
                 session_id.as_deref(),
-                // Always treat a stored session_id as a continuation: even if
-                // the in-memory history doesn't have an assistant message
-                // (e.g. server restart, mission resume, history rebuild),
-                // the per-mission XDG storage has the prior session, and we
-                // want --session/--continue to fire so we don't lose it.
-                is_continuation || has_session_history,
+                // Always treat a stored OpenCode session_id as a
+                // continuation: even if the in-memory history doesn't have
+                // an assistant message (e.g. server restart, mission
+                // resume, history rebuild), the per-mission XDG storage
+                // has the prior session, and we want --session/--continue
+                // to fire so we don't lose it.
+                is_continuation || has_opencode_session,
             )
             .await
         }
@@ -6491,6 +6498,21 @@ fn extract_opencode_session_id(output: &str) -> Option<String> {
         .lines()
         .find_map(opencode_session_token_from_line)
         .map(ToOwned::to_owned)
+}
+
+/// Return true if `s` looks like an OpenCode session id (e.g.
+/// `ses_14ecf17a4ffezc57OUz1Zz9Noc`) — the prefix and shape the CLI uses
+/// for its own session files. We use this to reject the *Claude Code*-style
+/// UUIDs that mission creation pre-assigns for conversation persistence —
+/// those are valid for `claude --session-id` but cause the opencode CLI
+/// to print "Session not found" if we hand them to `--session`.
+pub(crate) fn is_opencode_session_id(s: &str) -> bool {
+    let s = s.trim();
+    if !s.starts_with("ses_") {
+        return false;
+    }
+    // ses_<alphanumeric>, at least 4 chars of body.
+    s.len() >= 7 && s[4..].chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// Returns true if the line is an OpenCode runner/status banner (not model output).
@@ -10803,16 +10825,23 @@ pub async fn run_opencode_turn(
     // loses all prior context. `--continue` is the simpler "resume last
     // session in this dir" form for freshly-created missions that don't
     // have a stored session id yet.
+    //
+    // Mission rows in the DB also carry a *Claude Code*-style session id
+    // (a plain UUID generated at mission creation) that is NOT a valid
+    // OpenCode session id. Passing `--session <UUID>` to the opencode CLI
+    // makes it error out with "Session not found". Only treat a session
+    // id as an OpenCode id when it starts with the "ses_" prefix the CLI
+    // uses (`ses_<base62>`); fall back to `--continue` otherwise.
     if is_continuation {
-        if let Some(sid) = session_id {
-            if !sid.trim().is_empty() {
+        let opencode_sid = session_id.filter(|s| is_opencode_session_id(s));
+        match opencode_sid {
+            Some(sid) => {
                 inner_cmd.push_str(" --session ");
                 inner_cmd.push_str(&shell_escape(sid));
-            } else {
+            }
+            None => {
                 inner_cmd.push_str(" --continue");
             }
-        } else {
-            inner_cmd.push_str(" --continue");
         }
     }
     inner_cmd.push_str(" --dir ");
@@ -15592,14 +15621,14 @@ mod tests {
         custom_opencode_provider_definition, ensure_opencode_provider_for_model,
         extract_codex_reset_window, extract_model_from_message, extract_opencode_session_id,
         extract_part_text, extract_str, extract_think_content, is_capacity_limited_error,
-        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
-        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
-        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
-        is_tool_call_only_output, opencode_goal_terminal_status,
-        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
-        opencode_session_token_from_line, parse_opencode_goal_objective,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, record_codex_error_message,
+        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_opencode_session_id,
+        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
+        is_success_path_auth_error, is_success_path_provider_payload_error,
+        is_success_path_rate_limited_error, is_tool_call_only_output,
+        opencode_goal_terminal_status, opencode_idle_timeout_result_message,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
+        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
@@ -16399,6 +16428,39 @@ mod tests {
         assert_eq!(opencode_session_token_from_line("session=foo_bar"), None);
         assert_eq!(opencode_session_token_from_line("session id: short"), None);
         assert_eq!(opencode_session_token_from_line("no session here"), None);
+    }
+
+    #[test]
+    fn is_opencode_session_id_accepts_ses_prefix_alphanumeric() {
+        // Real OpenCode session ids: `ses_` prefix + base62/alphanumeric body.
+        assert!(is_opencode_session_id("ses_14ecf17a4ffezc57OUz1Zz9Noc"));
+        assert!(is_opencode_session_id("ses_abc123"));
+        assert!(is_opencode_session_id("ses_ZZ9a0bC1"));
+    }
+
+    #[test]
+    fn is_opencode_session_id_rejects_claude_code_uuid() {
+        // Mission creation pre-assigns a UUID for Claude Code conversation
+        // persistence. Handing that to the opencode CLI causes
+        // 'Error: Session not found', so we must NOT treat it as an
+        // OpenCode session id.
+        let uuid = "71082b52-ccc7-4845-b7a4-f96dbaf6020e";
+        assert!(!is_opencode_session_id(uuid));
+        assert!(!is_opencode_session_id(
+            "b5e8d8d9-11ad-4870-8b37-fe9c33b32c8f"
+        ));
+    }
+
+    #[test]
+    fn is_opencode_session_id_rejects_garbage() {
+        assert!(!is_opencode_session_id(""));
+        assert!(!is_opencode_session_id("ses_")); // missing body
+        assert!(!is_opencode_session_id("ses")); // missing prefix
+        assert!(!is_opencode_session_id("session_abc")); // wrong prefix
+        assert!(!is_opencode_session_id("ses_abc-def")); // hyphens not allowed
+                                                         // Whitespace is trimmed before the prefix check, so leading/trailing
+                                                         // spaces do not disqualify a valid id.
+        assert!(is_opencode_session_id("  ses_abc123  "));
     }
 
     #[test]
