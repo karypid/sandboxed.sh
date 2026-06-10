@@ -6,3 +6,4 @@
 //! shrink down to orchestration (dispatch, retry/fallback, TerminalReason).
 
 pub(crate) mod errors;
+pub(crate) mod grok;
