@@ -52,6 +52,7 @@ mod routes;
 pub(crate) mod runners;
 pub mod secrets;
 pub mod settings;
+pub(crate) mod supervision;
 pub mod system;
 pub mod telegram;
 pub mod types;
