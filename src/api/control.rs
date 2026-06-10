@@ -12524,301 +12524,42 @@ async fn run_single_control_turn(
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            // Check if this is a continuation turn (has prior assistant response).
-            // Note: history may include the current user message before the turn runs,
-            // so we check for assistant messages to determine if this is truly a continuation.
-            // Also use --resume if force_session_resume is set (e.g., for mission resume operations
-            // where the session exists but history may not have assistant messages yet).
+            // Continuation: prior assistant response in history, or an
+            // explicit resume request (e.g. mission resume operations where
+            // the session exists but history may not have assistant
+            // messages yet).
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
-            let mut effective_message = user_message.clone();
-            let mut effective_session_id = session_id.clone();
-            let mut attempted_same_session_resume = false;
-            let mut attempted_session_reset = false;
-            let mut result = Box::pin(super::mission_runner::run_claudecode_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &effective_message,
-                config.default_model.as_deref(),
-                requested_model_effort.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel.clone(),
-                None, // secrets - not available in control context
-                &config.working_dir,
-                effective_session_id.as_deref(),
-                is_continuation,
-                Some(tool_hub.clone()),
-                Some(status.clone()),
-                None, // override_auth
+            // Full recovery orchestration (transport retries, SIGKILL OAuth
+            // refresh, stale-credential retry, account rotation) is shared
+            // with the mission dispatch via the runners layer. This arm
+            // previously carried a near-duplicate copy that was missing the
+            // SIGKILL refresh and the initial auth retry.
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(crate::api::runners::ClaudeCodeRunner.run_turn(
+                crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &user_message,
+                    model: config.default_model.as_deref(),
+                    model_effort: requested_model_effort.as_deref(),
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel: cancel.clone(),
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation,
+                    extras: crate::api::runners::TurnExtras::ClaudeCode {
+                        secrets: None, // not available in control context
+                        tool_hub: Some(tool_hub.clone()),
+                        status: Some(status.clone()),
+                        history: &history,
+                        max_history_total_chars: config.context.max_history_total_chars,
+                    },
+                },
             ))
-            .await;
-
-            loop {
-                if cancel.is_cancelled() || super::routes::is_shutdown_initiated() {
-                    tracing::debug!(
-                        mission_id = %mid,
-                        "Skipping Claude transport recovery because execution is cancelling or shutting down"
-                    );
-                    break;
-                }
-
-                match super::mission_runner::claudecode_transport_recovery_strategy(
-                    &result,
-                    effective_session_id.is_some(),
-                    attempted_same_session_resume,
-                    attempted_session_reset,
-                ) {
-                    super::mission_runner::ClaudeTransportRecoveryStrategy::None => break,
-                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
-                        attempted_same_session_resume = true;
-                        tracing::warn!(
-                            mission_id = %mid,
-                            session_id = ?effective_session_id,
-                            error = %result.output,
-                            "Incomplete Claude turn detected; retrying once by continuing the current session"
-                        );
-                        effective_message =
-                            super::mission_runner::claudecode_resume_current_session_message()
-                                .to_string();
-                        result = Box::pin(super::mission_runner::run_claudecode_turn(
-                            exec_workspace,
-                            &ctx.working_dir,
-                            &effective_message,
-                            config.default_model.as_deref(),
-                            requested_model_effort.as_deref(),
-                            config.opencode_agent.as_deref(),
-                            mid,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            None,
-                            &config.working_dir,
-                            effective_session_id.as_deref(),
-                            true,
-                            Some(tool_hub.clone()),
-                            Some(status.clone()),
-                            None,
-                        ))
-                        .await;
-                    }
-                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
-                        attempted_session_reset = true;
-                        let new_session_id = Uuid::new_v4().to_string();
-                        tracing::warn!(
-                            mission_id = %mid,
-                            old_session_id = ?effective_session_id,
-                            new_session_id = %new_session_id,
-                            attempted_same_session_resume,
-                            error = %result.output,
-                            "Session corruption detected; resetting session and retrying once"
-                        );
-
-                        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                            mission_id: mid,
-                            session_id: new_session_id.clone(),
-                        });
-
-                        let session_marker = ctx.working_dir.join(".claude-session-initiated");
-                        if session_marker.exists() {
-                            let _ = std::fs::remove_file(&session_marker);
-                        }
-
-                        let history_for_retry = match history.last() {
-                            Some((role, content)) if role == "user" && content == &user_message => {
-                                &history[..history.len() - 1]
-                            }
-                            _ => history.as_slice(),
-                        };
-                        let retry_message = if history_for_retry.is_empty() {
-                            user_message.clone()
-                        } else {
-                            let history_ctx = build_history_context(
-                                history_for_retry,
-                                config.context.max_history_total_chars,
-                            );
-                            format!(
-                                "## Prior conversation (session was reset due to a transient error)\n\n\
-                                 {history_ctx}\
-                                 ## Current message\n\n\
-                                 {user_message}"
-                            )
-                        };
-
-                        effective_message = retry_message;
-                        effective_session_id = Some(new_session_id);
-
-                        result = Box::pin(super::mission_runner::run_claudecode_turn(
-                            exec_workspace,
-                            &ctx.working_dir,
-                            &effective_message,
-                            config.default_model.as_deref(),
-                            requested_model_effort.as_deref(),
-                            config.opencode_agent.as_deref(),
-                            mid,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            None,
-                            &config.working_dir,
-                            effective_session_id.as_deref(),
-                            false,
-                            Some(tool_hub.clone()),
-                            Some(status.clone()),
-                            None,
-                        ))
-                        .await;
-                    }
-                }
-            }
-
-            // Auth error recovery: if the token was revoked server-side but the
-            // local expiry hadn't passed yet, invalidate stale credentials, force
-            // an OAuth refresh, and retry once.
-            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
-                tracing::warn!(
-                    mission_id = %mid,
-                    "Auth error detected — invalidating stale credentials and retrying"
-                );
-
-                super::mission_runner::refresh_claude_credentials_after_auth_error(
-                    &ctx.working_dir,
-                    "control_initial_auth_error",
-                )
-                .await;
-
-                // Retry with fresh credentials
-                result = Box::pin(super::mission_runner::run_claudecode_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &effective_message,
-                    config.default_model.as_deref(),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    None,
-                    &config.working_dir,
-                    effective_session_id.as_deref(),
-                    is_continuation,
-                    Some(tool_hub.clone()),
-                    Some(status.clone()),
-                    None,
-                ))
-                .await;
-            }
-
-            // Account rotation: if rate-limited, try alternate Anthropic credentials.
-            // The first entry in the list is the highest-priority credential, which
-            // is almost certainly what the initial (override_auth=None) call used.
-            // Skip it to avoid a guaranteed duplicate rate-limit failure.
-            let mut rotated_anthropic_account = false;
-            if result.terminal_reason == Some(TerminalReason::RateLimited) && !cancel.is_cancelled()
-            {
-                let rotation_accounts = super::mission_runner::anthropic_rotation_accounts(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &config.working_dir,
-                );
-                if !rotation_accounts.accounts.is_empty() {
-                    tracing::info!(
-                        mission_id = %mid,
-                        total_accounts = rotation_accounts.total_accounts,
-                        alternate_accounts = rotation_accounts.accounts.len(),
-                        skipped_current = rotation_accounts.skipped_current,
-                        "Rate limited on primary account; trying alternate Anthropic credentials"
-                    );
-                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        rotated_anthropic_account = true;
-                        tracing::info!(
-                            mission_id = %mid,
-                            rotation_attempt = idx + 1,
-                            auth_type = match &alt_auth {
-                                super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
-                                super::ai_providers::ClaudeCodeAuth::OAuthToken(_) =>
-                                    "oauth_token",
-                            },
-                            "Rotating to alternate Anthropic account"
-                        );
-                        result = Box::pin(super::mission_runner::run_claudecode_turn(
-                            exec_workspace,
-                            &ctx.working_dir,
-                            &effective_message,
-                            config.default_model.as_deref(),
-                            requested_model_effort.as_deref(),
-                            config.opencode_agent.as_deref(),
-                            mid,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            None,
-                            &config.working_dir,
-                            effective_session_id.as_deref(),
-                            is_continuation,
-                            Some(tool_hub.clone()),
-                            Some(status.clone()),
-                            Some(alt_auth),
-                        ))
-                        .await;
-                        // Only continue rotating on rate-limit errors.
-                        match result.terminal_reason {
-                            Some(TerminalReason::RateLimited) => {
-                                tracing::info!(
-                                    mission_id = %mid,
-                                    rotation_attempt = idx + 1,
-                                    "Rate limited; rotating to next account"
-                                );
-                                continue;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-
-            // Account rotation can surface a revoked/expired alternate OAuth
-            // credential. Run the same stale-credential recovery after rotation
-            // so the mission retries with freshly refreshed host credentials
-            // instead of stopping on "Invalid authentication credentials".
-            if rotated_anthropic_account
-                && result.terminal_reason == Some(TerminalReason::AuthError)
-                && !cancel.is_cancelled()
-            {
-                tracing::warn!(
-                    mission_id = %mid,
-                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
-                );
-
-                super::mission_runner::refresh_claude_credentials_after_auth_error(
-                    &ctx.working_dir,
-                    "control_rotated_auth_error",
-                )
-                .await;
-
-                result = Box::pin(super::mission_runner::run_claudecode_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &effective_message,
-                    config.default_model.as_deref(),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    None,
-                    &config.working_dir,
-                    effective_session_id.as_deref(),
-                    is_continuation,
-                    Some(tool_hub.clone()),
-                    Some(status.clone()),
-                    None,
-                ))
-                .await;
-            }
-
-            result
+            .await
         }
         Some("grok") => {
             let mid = match require_mission_id(mission_id, "Grok Build", &events_tx) {
@@ -12832,20 +12573,26 @@ async fn run_single_control_turn(
             } else {
                 convo.clone()
             };
-            Box::pin(super::mission_runner::run_grok_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &grok_message_owned,
-                requested_model
-                    .as_deref()
-                    .or(config.default_model.as_deref()),
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-                is_continuation,
-            ))
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::GrokRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &grok_message_owned,
+                    model: requested_model
+                        .as_deref()
+                        .or(config.default_model.as_deref()),
+                    model_effort: None,
+                    agent: None,
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
             .await
         }
         Some("codex") => {
@@ -12873,19 +12620,24 @@ async fn run_single_control_turn(
             // account kept re-hitting the same cap instead of rotating to
             // the next account. Fallback-model and tool-stall retries are
             // handled inside the wrapper per attempted credential.
-            Box::pin(super::mission_runner::run_codex_turn_with_rotation(
-                exec_workspace,
-                &ctx.working_dir,
-                codex_message,
-                requested_codex_model,
-                requested_model_effort.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel.clone(),
-                &config.working_dir,
-                session_id.as_deref(),
-            ))
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::CodexRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: codex_message,
+                    model: requested_codex_model,
+                    model_effort: requested_model_effort.as_deref(),
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel: cancel.clone(),
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: false,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
             .await
         }
         Some("gemini") => {
@@ -12893,18 +12645,24 @@ async fn run_single_control_turn(
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            Box::pin(super::mission_runner::run_gemini_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &convo,
-                config.default_model.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-            ))
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::GeminiRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &convo,
+                    model: config.default_model.as_deref(),
+                    model_effort: None,
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: false,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
             .await
         }
         Some(backend) if backend != "opencode" => {
@@ -12958,19 +12716,23 @@ async fn run_single_control_turn(
                 } else {
                     convo.clone()
                 };
-            Box::pin(super::mission_runner::run_opencode_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &opencode_message_owned,
-                config.default_model.as_deref(),
-                requested_model_effort.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-                opencode_is_continuation,
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(crate::api::runners::OpenCodeRunner.run_turn(
+                crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &opencode_message_owned,
+                    model: config.default_model.as_deref(),
+                    model_effort: requested_model_effort.as_deref(),
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: opencode_is_continuation,
+                    extras: crate::api::runners::TurnExtras::None,
+                },
             ))
             .await
         }

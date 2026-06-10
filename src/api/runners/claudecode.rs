@@ -20,7 +20,7 @@ use crate::api::mission_runner::*;
 use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
 use crate::cost::resolve_cost_cents_and_source;
 use crate::secrets::SecretsStore;
-use crate::util::env_var_bool;
+use crate::util::{build_history_context, env_var_bool};
 use crate::workspace::{Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
@@ -2467,4 +2467,347 @@ pub fn run_claudecode_turn<'a>(
         result = result.with_cost_source(cost_source);
         result
     }) // end Box::pin(async move { ... })
+}
+
+/// Claude Code turn with the full recovery orchestration:
+/// transport-failure retries (resume current session, then fresh-session
+/// reset with condensed history), SIGKILL-driven proactive OAuth refresh,
+/// stale-credential retry on auth errors, and Anthropic account rotation
+/// on rate-limit/auth failures.
+///
+/// Shared by both the mission arm and the control arm (Phase 3) — they
+/// previously carried near-duplicate copies of this loop, with the control
+/// copy missing the SIGKILL refresh and initial auth retry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_claudecode_turn_with_recovery(
+    workspace: &Workspace,
+    work_dir: &std::path::Path,
+    message: &str,
+    model: Option<&str>,
+    model_effort: Option<&str>,
+    agent: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    secrets: Option<Arc<SecretsStore>>,
+    app_working_dir: &std::path::Path,
+    session_id: Option<&str>,
+    is_continuation: bool,
+    tool_hub: Option<Arc<FrontendToolHub>>,
+    status: Option<Arc<RwLock<ControlStatus>>>,
+    history: &[(String, String)],
+    max_history_total_chars: usize,
+) -> AgentResult {
+    // Track the effective message and session used for the most recent
+    // attempt, so account rotation uses the right context (e.g. after
+    // session corruption recovery rebuilds the message).
+    let mut effective_msg = message.to_string();
+    let mut effective_sid: Option<String> = session_id.map(str::to_string);
+    let mut attempted_same_session_resume = false;
+    let mut attempted_session_reset = false;
+
+    let mut result = run_claudecode_turn(
+        workspace,
+        work_dir,
+        &effective_msg,
+        model,
+        model_effort,
+        agent,
+        mission_id,
+        events_tx.clone(),
+        cancel.clone(),
+        secrets.clone(),
+        app_working_dir,
+        effective_sid.as_deref(),
+        is_continuation,
+        tool_hub.clone(),
+        status.clone(),
+        None, // override_auth: use default credential resolution
+    )
+    .await;
+
+    loop {
+        if cancel.is_cancelled() || crate::api::routes::is_shutdown_initiated() {
+            tracing::debug!(
+                mission_id = %mission_id,
+                "Skipping Claude transport recovery because execution is cancelling or shutting down"
+            );
+            break;
+        }
+
+        match claudecode_transport_recovery_strategy(
+            &result,
+            effective_sid.is_some(),
+            attempted_same_session_resume,
+            attempted_session_reset,
+        ) {
+            ClaudeTransportRecoveryStrategy::None => break,
+            ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
+                attempted_same_session_resume = true;
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    session_id = ?effective_sid,
+                    error = %result.output,
+                    "Incomplete Claude turn detected; retrying once by continuing the current session"
+                );
+                effective_msg = claudecode_resume_current_session_message().to_string();
+                result = run_claudecode_turn(
+                    workspace,
+                    work_dir,
+                    &effective_msg,
+                    model,
+                    model_effort,
+                    agent,
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    secrets.clone(),
+                    app_working_dir,
+                    effective_sid.as_deref(),
+                    true,
+                    tool_hub.clone(),
+                    status.clone(),
+                    None,
+                )
+                .await;
+            }
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
+                attempted_session_reset = true;
+                let new_session_id = Uuid::new_v4().to_string();
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    old_session_id = ?effective_sid,
+                    new_session_id = %new_session_id,
+                    attempted_same_session_resume,
+                    is_continuation = is_continuation,
+                    error = %result.output,
+                    "Claude transport recovery is rotating to a fresh session"
+                );
+
+                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                    mission_id,
+                    session_id: new_session_id.clone(),
+                });
+
+                let session_marker = work_dir.join(".claude-session-initiated");
+                if session_marker.exists() {
+                    let _ = std::fs::remove_file(&session_marker);
+                }
+
+                let history_for_retry = match history.last() {
+                    Some((role, content)) if role == "user" && content == message => {
+                        &history[..history.len() - 1]
+                    }
+                    _ => history,
+                };
+                let retry_message = if history_for_retry.is_empty() {
+                    message.to_string()
+                } else {
+                    let history_ctx =
+                        build_history_context(history_for_retry, max_history_total_chars);
+                    format!(
+                        "## Prior conversation (session was reset due to a transient error)\n\n\
+                         {history_ctx}\
+                         ## Current message\n\n\
+                         {message}"
+                    )
+                };
+
+                effective_msg = retry_message;
+                effective_sid = Some(new_session_id);
+
+                result = run_claudecode_turn(
+                    workspace,
+                    work_dir,
+                    &effective_msg,
+                    model,
+                    model_effort,
+                    agent,
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    secrets.clone(),
+                    app_working_dir,
+                    effective_sid.as_deref(),
+                    false,
+                    tool_hub.clone(),
+                    status.clone(),
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
+    // Proactive auth refresh for SIGKILL'd processes: when Claude Code is
+    // killed mid-turn (signal: Killed, no terminal result), the cause is often
+    // an expired OAuth token that caused Node.js to crash. Even if we can't
+    // detect "auth error" in the output, preemptively refresh credentials so
+    // the transport recovery retry (above) uses fresh tokens. This is cheap
+    // (just a token validity check) and prevents cascading auth failures.
+    if !cancel.is_cancelled()
+        && result.terminal_reason == Some(TerminalReason::LlmError)
+        && result.output.contains("signal: Some(\"Killed\")")
+    {
+        tracing::info!(
+            mission_id = %mission_id,
+            "SIGKILL detected — preemptively refreshing OAuth credentials"
+        );
+        let mission_creds = work_dir.join(".claude").join(".credentials.json");
+        if mission_creds.exists() {
+            let _ = std::fs::remove_file(&mission_creds);
+        }
+        if let Err(e) = crate::api::ai_providers::force_refresh_anthropic_oauth_token().await {
+            tracing::debug!(
+                "Preemptive OAuth refresh after SIGKILL failed (non-fatal): {}",
+                e
+            );
+        }
+    }
+
+    // Auth error recovery: if the token was revoked server-side but the
+    // local expiry hadn't passed yet, invalidate stale credentials, force
+    // an OAuth refresh, and retry once.
+    if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Auth error detected — invalidating stale credentials and retrying"
+        );
+
+        refresh_claude_credentials_after_auth_error(work_dir, "mission_runner_initial_auth_error")
+            .await;
+
+        // Retry with fresh credentials (override_auth=None forces re-resolution)
+        result = run_claudecode_turn(
+            workspace,
+            work_dir,
+            &effective_msg,
+            model,
+            model_effort,
+            agent,
+            mission_id,
+            events_tx.clone(),
+            cancel.clone(),
+            secrets.clone(),
+            app_working_dir,
+            effective_sid.as_deref(),
+            false,
+            tool_hub.clone(),
+            status.clone(),
+            None,
+        )
+        .await;
+    }
+
+    // Account rotation: if rate-limited, or if auth still fails after
+    // one refresh attempt, try alternate Anthropic credentials.
+    // The first entry in the list is the highest-priority credential, which
+    // is almost certainly what the initial (override_auth=None) call used.
+    // Skip it to avoid a guaranteed duplicate failure.
+    let mut rotated_anthropic_account = false;
+    if matches!(
+        result.terminal_reason,
+        Some(TerminalReason::RateLimited | TerminalReason::AuthError)
+    ) {
+        let rotation_reason = result.terminal_reason;
+        let rotation_accounts = anthropic_rotation_accounts(workspace, work_dir, app_working_dir);
+        if !rotation_accounts.accounts.is_empty() {
+            tracing::info!(
+                mission_id = %mission_id,
+                total_accounts = rotation_accounts.total_accounts,
+                alternate_accounts = rotation_accounts.accounts.len(),
+                skipped_current = rotation_accounts.skipped_current,
+                ?rotation_reason,
+                "Primary Anthropic credential failed; trying alternate credentials"
+            );
+            for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                rotated_anthropic_account = true;
+                tracing::info!(
+                    mission_id = %mission_id,
+                    rotation_attempt = idx + 1,
+                    auth_type = match &alt_auth {
+                        crate::api::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
+                        crate::api::ai_providers::ClaudeCodeAuth::OAuthToken(_) => "oauth_token",
+                    },
+                    "Rotating to alternate Anthropic account"
+                );
+                result = run_claudecode_turn(
+                    workspace,
+                    work_dir,
+                    &effective_msg,
+                    model,
+                    model_effort,
+                    agent,
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    secrets.clone(),
+                    app_working_dir,
+                    effective_sid.as_deref(),
+                    is_continuation,
+                    tool_hub.clone(),
+                    status.clone(),
+                    Some(alt_auth),
+                )
+                .await;
+                // Continue rotating on account-specific failures.
+                // Other LLM errors (model errors, context limit, etc.)
+                // would fail on every account, so stop early to avoid
+                // masking the real failure.
+                match result.terminal_reason {
+                    Some(TerminalReason::RateLimited | TerminalReason::AuthError) => {
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            rotation_attempt = idx + 1,
+                            ?result.terminal_reason,
+                            "Anthropic credential failed; rotating to next account"
+                        );
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    // If an alternate OAuth credential is revoked, rotation returns
+    // AuthError. Refresh stale Claude credentials and retry once with
+    // freshly resolved auth instead of surfacing a raw 401.
+    if rotated_anthropic_account
+        && result.terminal_reason == Some(TerminalReason::AuthError)
+        && !cancel.is_cancelled()
+    {
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Auth error detected after credential rotation - invalidating stale credentials and retrying"
+        );
+
+        refresh_claude_credentials_after_auth_error(work_dir, "mission_runner_rotated_auth_error")
+            .await;
+
+        result = run_claudecode_turn(
+            workspace,
+            work_dir,
+            &effective_msg,
+            model,
+            model_effort,
+            agent,
+            mission_id,
+            events_tx.clone(),
+            cancel.clone(),
+            secrets.clone(),
+            app_working_dir,
+            effective_sid.as_deref(),
+            is_continuation,
+            tool_hub.clone(),
+            status.clone(),
+            None,
+        )
+        .await;
+    }
+
+    result
 }

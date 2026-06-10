@@ -3427,459 +3427,84 @@ async fn run_mission_turn(
     // Note: history may include the current user message before the turn runs,
     // so we check for assistant messages to determine if this is truly a continuation.
     let is_continuation = history.iter().any(|(role, _)| role == "assistant");
-    let result = match backend_id.as_str() {
-        "claudecode" => {
-            // Track the effective message and session used for the most recent
-            // attempt, so account rotation uses the right context (e.g. after
-            // session corruption recovery rebuilds the message).
-            let mut effective_msg = user_message.clone();
-            let mut effective_sid = session_id.clone();
-            let mut attempted_same_session_resume = false;
-            let mut attempted_session_reset = false;
+    // Per-backend message framing + continuation semantics. These are
+    // call-site decisions (the runner receives exactly the message it should
+    // send): goal-mode missions need the raw `/goal ...` text preserved;
+    // OpenCode resumes its own per-mission session storage (so the framed
+    // `convo` would duplicate context the CLI is about to load); grok/codex
+    // see the history-framed convo on normal turns; gemini always gets the
+    // framed convo; Claude Code maintains its own session and gets the raw
+    // user message.
+    let is_goal_mode = user_message.trim_start().starts_with("/goal ");
+    let has_opencode_session = session_id
+        .as_deref()
+        .map(is_opencode_session_id)
+        .unwrap_or(false);
+    let (turn_message, turn_is_continuation): (String, bool) = match backend_id.as_str() {
+        "opencode" => (
+            if is_goal_mode || has_opencode_session {
+                user_message.clone()
+            } else {
+                convo.clone()
+            },
+            // A stored OpenCode session id is always a continuation: even if
+            // the in-memory history lost its assistant messages (restart,
+            // resume, rebuild), the per-mission XDG storage has the prior
+            // session and --session/--continue must fire.
+            is_continuation || has_opencode_session,
+        ),
+        "grok" | "codex" => (
+            if is_goal_mode {
+                user_message.clone()
+            } else {
+                convo.clone()
+            },
+            is_continuation,
+        ),
+        "gemini" => (convo.clone(), is_continuation),
+        _ => (user_message.clone(), is_continuation),
+    };
 
-            let mut result = run_claudecode_turn(
-                &workspace,
-                &mission_work_dir,
-                &effective_msg,
-                config.default_model.as_deref(),
-                model_effort.as_deref(),
-                effective_agent.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel.clone(),
-                secrets.clone(),
-                &config.working_dir,
-                effective_sid.as_deref(),
-                is_continuation,
-                Some(Arc::clone(&tool_hub)),
-                Some(Arc::clone(&status)),
-                None, // override_auth: use default credential resolution
-            )
-            .await;
-
-            loop {
-                if cancel.is_cancelled() || super::routes::is_shutdown_initiated() {
-                    tracing::debug!(
-                        mission_id = %mission_id,
-                        "Skipping Claude transport recovery because execution is cancelling or shutting down"
-                    );
-                    break;
+    let result = match super::runners::runner_for(&backend_id) {
+        Some(runner) => {
+            tracing::debug!(
+                mission_id = %mission_id,
+                runner = runner.name(),
+                "Dispatching mission turn to harness runner"
+            );
+            let extras = if backend_id == "claudecode" {
+                super::runners::TurnExtras::ClaudeCode {
+                    secrets: secrets.clone(),
+                    tool_hub: Some(Arc::clone(&tool_hub)),
+                    status: Some(Arc::clone(&status)),
+                    history: &history,
+                    max_history_total_chars: config.context.max_history_total_chars,
                 }
-
-                match claudecode_transport_recovery_strategy(
-                    &result,
-                    effective_sid.is_some(),
-                    attempted_same_session_resume,
-                    attempted_session_reset,
-                ) {
-                    ClaudeTransportRecoveryStrategy::None => break,
-                    ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
-                        attempted_same_session_resume = true;
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            session_id = ?effective_sid,
-                            error = %result.output,
-                            "Incomplete Claude turn detected; retrying once by continuing the current session"
-                        );
-                        effective_msg = claudecode_resume_current_session_message().to_string();
-                        result = run_claudecode_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            &effective_msg,
-                            config.default_model.as_deref(),
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            secrets.clone(),
-                            &config.working_dir,
-                            effective_sid.as_deref(),
-                            true,
-                            Some(Arc::clone(&tool_hub)),
-                            Some(Arc::clone(&status)),
-                            None,
-                        )
-                        .await;
-                    }
-                    ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
-                        attempted_session_reset = true;
-                        let new_session_id = Uuid::new_v4().to_string();
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            old_session_id = ?effective_sid,
-                            new_session_id = %new_session_id,
-                            attempted_same_session_resume,
-                            is_continuation = is_continuation,
-                            error = %result.output,
-                            "Claude transport recovery is rotating to a fresh session"
-                        );
-
-                        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                            mission_id,
-                            session_id: new_session_id.clone(),
-                        });
-
-                        let session_marker = mission_work_dir.join(".claude-session-initiated");
-                        if session_marker.exists() {
-                            let _ = std::fs::remove_file(&session_marker);
-                        }
-
-                        let history_for_retry = match history.last() {
-                            Some((role, content)) if role == "user" && content == &user_message => {
-                                &history[..history.len() - 1]
-                            }
-                            _ => history.as_slice(),
-                        };
-                        let retry_message = if history_for_retry.is_empty() {
-                            user_message.clone()
-                        } else {
-                            let history_ctx = build_history_context(
-                                history_for_retry,
-                                config.context.max_history_total_chars,
-                            );
-                            format!(
-                                "## Prior conversation (session was reset due to a transient error)\n\n\
-                                 {history_ctx}\
-                                 ## Current message\n\n\
-                                 {user_message}"
-                            )
-                        };
-
-                        effective_msg = retry_message;
-                        effective_sid = Some(new_session_id);
-
-                        result = run_claudecode_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            &effective_msg,
-                            config.default_model.as_deref(),
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            secrets.clone(),
-                            &config.working_dir,
-                            effective_sid.as_deref(),
-                            false,
-                            Some(Arc::clone(&tool_hub)),
-                            Some(Arc::clone(&status)),
-                            None,
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            // Proactive auth refresh for SIGKILL'd processes: when Claude Code is
-            // killed mid-turn (signal: Killed, no terminal result), the cause is often
-            // an expired OAuth token that caused Node.js to crash. Even if we can't
-            // detect "auth error" in the output, preemptively refresh credentials so
-            // the transport recovery retry (above) uses fresh tokens. This is cheap
-            // (just a token validity check) and prevents cascading auth failures.
-            if !cancel.is_cancelled()
-                && result.terminal_reason == Some(TerminalReason::LlmError)
-                && result.output.contains("signal: Some(\"Killed\")")
-            {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    "SIGKILL detected — preemptively refreshing OAuth credentials"
-                );
-                let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
-                if mission_creds.exists() {
-                    let _ = std::fs::remove_file(&mission_creds);
-                }
-                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
-                    tracing::debug!(
-                        "Preemptive OAuth refresh after SIGKILL failed (non-fatal): {}",
-                        e
-                    );
-                }
-            }
-
-            // Auth error recovery: if the token was revoked server-side but the
-            // local expiry hadn't passed yet, invalidate stale credentials, force
-            // an OAuth refresh, and retry once.
-            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    "Auth error detected — invalidating stale credentials and retrying"
-                );
-
-                refresh_claude_credentials_after_auth_error(
-                    &mission_work_dir,
-                    "mission_runner_initial_auth_error",
-                )
-                .await;
-
-                // Retry with fresh credentials (override_auth=None forces re-resolution)
-                result = run_claudecode_turn(
-                    &workspace,
-                    &mission_work_dir,
-                    &effective_msg,
-                    config.default_model.as_deref(),
-                    model_effort.as_deref(),
-                    effective_agent.as_deref(),
+            } else {
+                super::runners::TurnExtras::None
+            };
+            runner
+                .run_turn(super::runners::TurnContext {
+                    workspace: &workspace,
+                    work_dir: &mission_work_dir,
+                    message: &turn_message,
+                    model: config.default_model.as_deref(),
+                    model_effort: model_effort.as_deref(),
+                    agent: effective_agent.as_deref(),
                     mission_id,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    secrets.clone(),
-                    &config.working_dir,
-                    effective_sid.as_deref(),
-                    false,
-                    Some(Arc::clone(&tool_hub)),
-                    Some(Arc::clone(&status)),
-                    None,
-                )
-                .await;
-            }
-
-            // Account rotation: if rate-limited, or if auth still fails after
-            // one refresh attempt, try alternate Anthropic credentials.
-            // The first entry in the list is the highest-priority credential, which
-            // is almost certainly what the initial (override_auth=None) call used.
-            // Skip it to avoid a guaranteed duplicate failure.
-            let mut rotated_anthropic_account = false;
-            if matches!(
-                result.terminal_reason,
-                Some(TerminalReason::RateLimited | TerminalReason::AuthError)
-            ) {
-                let rotation_reason = result.terminal_reason;
-                let rotation_accounts =
-                    anthropic_rotation_accounts(&workspace, &mission_work_dir, &config.working_dir);
-                if !rotation_accounts.accounts.is_empty() {
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        total_accounts = rotation_accounts.total_accounts,
-                        alternate_accounts = rotation_accounts.accounts.len(),
-                        skipped_current = rotation_accounts.skipped_current,
-                        ?rotation_reason,
-                        "Primary Anthropic credential failed; trying alternate credentials"
-                    );
-                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        rotated_anthropic_account = true;
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            rotation_attempt = idx + 1,
-                            auth_type = match &alt_auth {
-                                super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
-                                super::ai_providers::ClaudeCodeAuth::OAuthToken(_) => "oauth_token",
-                            },
-                            "Rotating to alternate Anthropic account"
-                        );
-                        result = run_claudecode_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            &effective_msg,
-                            config.default_model.as_deref(),
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            secrets.clone(),
-                            &config.working_dir,
-                            effective_sid.as_deref(),
-                            is_continuation,
-                            Some(Arc::clone(&tool_hub)),
-                            Some(Arc::clone(&status)),
-                            Some(alt_auth),
-                        )
-                        .await;
-                        // Continue rotating on account-specific failures.
-                        // Other LLM errors (model errors, context limit, etc.)
-                        // would fail on every account, so stop early to avoid
-                        // masking the real failure.
-                        match result.terminal_reason {
-                            Some(TerminalReason::RateLimited | TerminalReason::AuthError) => {
-                                tracing::info!(
-                                    mission_id = %mission_id,
-                                    rotation_attempt = idx + 1,
-                                    ?result.terminal_reason,
-                                    "Anthropic credential failed; rotating to next account"
-                                );
-                                continue;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-
-            // If an alternate OAuth credential is revoked, rotation returns
-            // AuthError. Refresh stale Claude credentials and retry once with
-            // freshly resolved auth instead of surfacing a raw 401.
-            if rotated_anthropic_account
-                && result.terminal_reason == Some(TerminalReason::AuthError)
-                && !cancel.is_cancelled()
-            {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
-                );
-
-                refresh_claude_credentials_after_auth_error(
-                    &mission_work_dir,
-                    "mission_runner_rotated_auth_error",
-                )
-                .await;
-
-                result = run_claudecode_turn(
-                    &workspace,
-                    &mission_work_dir,
-                    &effective_msg,
-                    config.default_model.as_deref(),
-                    model_effort.as_deref(),
-                    effective_agent.as_deref(),
-                    mission_id,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    secrets.clone(),
-                    &config.working_dir,
-                    effective_sid.as_deref(),
-                    is_continuation,
-                    Some(Arc::clone(&tool_hub)),
-                    Some(Arc::clone(&status)),
-                    None,
-                )
-                .await;
-            }
-
-            result
+                    events_tx: events_tx.clone(),
+                    cancel: cancel.clone(),
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: turn_is_continuation,
+                    extras,
+                })
+                .await
         }
-        "opencode" => {
-            // Use per-workspace CLI execution for all workspace types to ensure
-            // native bash + correct filesystem scope.
-            // Same prompt-selection + session-resume rule as the `control`
-            // arm above: if we have a stored OpenCode-format session_id
-            // (starts with `ses_`, with or without an in-memory assistant
-            // history) the opencode CLI will load prior history from its
-            // per-mission XDG storage, so:
-            //   - pass bare `user_message` (not the history-framed `convo`,
-            //     which would duplicate the context the CLI is about to
-            //     load), AND
-            //   - pass `--session <id>` (preferred) or `--continue` (safe
-            //     fallback when history was lost but storage still has the
-            //     most-recent session for this mission) so we never start a
-            //     brand-new session and lose context (Bugbot e8dd69f8).
-            // Only use `convo` and no-resume for a brand-new mission with no
-            // OpenCode session_id yet. Mission-creation pre-assigns a UUID
-            // for Claude Code persistence — that is NOT an OpenCode session
-            // id, so we ignore it and treat the mission as fresh.
-            let is_goal_mode = user_message.trim_start().starts_with("/goal ");
-            let has_opencode_session = session_id
-                .as_deref()
-                .map(is_opencode_session_id)
-                .unwrap_or(false);
-            let opencode_message_owned: String = if is_goal_mode || has_opencode_session {
-                user_message.clone()
-            } else {
-                convo.clone()
-            };
-            run_opencode_turn(
-                &workspace,
-                &mission_work_dir,
-                &opencode_message_owned,
-                config.default_model.as_deref(),
-                model_effort.as_deref(),
-                effective_agent.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-                // Always treat a stored OpenCode session_id as a
-                // continuation: even if the in-memory history doesn't have
-                // an assistant message (e.g. server restart, mission
-                // resume, history rebuild), the per-mission XDG storage
-                // has the prior session, and we want --session/--continue
-                // to fire so we don't lose it.
-                is_continuation || has_opencode_session,
-            )
-            .await
-        }
-        "grok" => {
-            // Goal-mode missions drive a /goal <objective> loop and need the
-            // raw message preserved verbatim. For normal Grok turns we pass
-            // the history-framed `convo` so the model sees the prior
-            // conversation and the standard turn-instructions scaffolding —
-            // same rule as the `control` arm above (Bugbot 67883f8c). Without
-            // this, queued Grok missions miss conversation history.
-            let grok_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
-                user_message.clone()
-            } else {
-                convo.clone()
-            };
-            run_grok_turn(
-                &workspace,
-                &mission_work_dir,
-                &grok_message_owned,
-                config.default_model.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-                is_continuation,
-            )
-            .await
-        }
-        "codex" => {
-            let requested_model = config.default_model.as_deref();
-            // Goal-mode missions (`/goal <objective>`) need to reach the
-            // codex backend with the prefix intact so its app-server driver
-            // can route via `thread/goal/set` instead of a plain
-            // `turn/start`. The "User:\n... Instructions: ..." convo
-            // wrapper buries the prefix and breaks detection; for goal
-            // missions we send the raw user message instead. Non-goal
-            // codex missions keep the wrapped convo so they retain the
-            // history/deliverable scaffolding the model relies on.
-            let codex_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
-                user_message.clone()
-            } else {
-                convo.clone()
-            };
-            let codex_message: &str = codex_message_owned.as_str();
-            // Unified credential pool + rotation + cooldown handling lives in
-            // run_codex_turn_with_rotation so the control-channel follow-up
-            // path gets identical account-rotation behaviour.
-            run_codex_turn_with_rotation(
-                &workspace,
-                &mission_work_dir,
-                codex_message,
-                requested_model,
-                model_effort.as_deref(),
-                effective_agent.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel.clone(),
-                &config.working_dir,
-                session_id.as_deref(),
-            )
-            .await
-        }
-        "gemini" => {
-            run_gemini_turn(
-                &workspace,
-                &mission_work_dir,
-                &convo,
-                config.default_model.as_deref(),
-                effective_agent.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel.clone(),
-                &config.working_dir,
-                session_id.as_deref(),
-            )
-            .await
-        }
-        _ => {
-            // Don't send Error event - the failure will be emitted as an AssistantMessage
-            // with success=false by the caller (control.rs), avoiding duplicate messages.
+        None => {
+            // Don't send Error event - the failure will be emitted as an
+            // AssistantMessage with success=false by the caller (control.rs),
+            // avoiding duplicate messages.
             AgentResult::failure(format!("Unsupported backend: {}", backend_id), 0)
                 .with_terminal_reason(TerminalReason::LlmError)
         }
