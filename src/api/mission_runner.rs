@@ -3718,10 +3718,21 @@ async fn run_mission_turn(
             .await
         }
         "grok" => {
+            // Goal-mode missions drive a /goal <objective> loop and need the
+            // raw message preserved verbatim. For normal Grok turns we pass
+            // the history-framed `convo` so the model sees the prior
+            // conversation and the standard turn-instructions scaffolding —
+            // same rule as the `control` arm above (Bugbot 67883f8c). Without
+            // this, queued Grok missions miss conversation history.
+            let grok_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
             run_grok_turn(
                 &workspace,
                 &mission_work_dir,
-                &user_message,
+                &grok_message_owned,
                 config.default_model.as_deref(),
                 mission_id,
                 events_tx.clone(),
