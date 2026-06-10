@@ -7,4 +7,5 @@
 
 pub(crate) mod codex;
 pub(crate) mod errors;
+pub(crate) mod gemini;
 pub(crate) mod grok;
