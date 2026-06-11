@@ -4839,6 +4839,10 @@ pub(crate) fn ensure_opencode_provider_for_model(
     // proxy on 127.0.0.1 — pointing builtin/* there made OpenCode exit
     // banner-only until the 120s inactivity watchdog SIGKILLed it.
     host_ip: &str,
+    // Mission id sent as a header on builtin proxy requests so runner
+    // watchdogs can see "this mission's LLM call is still streaming"
+    // (proxy_liveness). None for non-mission contexts.
+    mission_id: Option<&str>,
 ) {
     let model_override = model_override.trim();
     if model_override.is_empty() {
@@ -4922,16 +4926,22 @@ pub(crate) fn ensure_opencode_provider_for_model(
                     tracing::error!("SANDBOXED_PROXY_SECRET not set; builtin proxy auth will fail");
                     String::new()
                 });
+            let mut options = serde_json::json!({
+                "baseURL": format!("http://{}:{}/v1", host_ip, port),
+                "apiKey": proxy_key
+            });
+            if let Some(mid) = mission_id {
+                options["headers"] = serde_json::json!({
+                    crate::api::proxy_liveness::MISSION_ID_HEADER: mid
+                });
+            }
             Some(serde_json::json!({
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Builtin",
                 "models": {
                     model_id: { "name": model_id }
                 },
-                "options": {
-                    "baseURL": format!("http://{}:{}/v1", host_ip, port),
-                    "apiKey": proxy_key
-                }
+                "options": options
             }))
         }
         _ => custom_opencode_provider_definition(app_working_dir, provider_id),
@@ -9144,6 +9154,7 @@ mod tests {
             &app_dir,
             "spark/qwen3.5-397b",
             "127.0.0.1",
+            None,
         );
 
         let opencode_json: serde_json::Value = serde_json::from_str(
@@ -9197,7 +9208,13 @@ mod tests {
 
         // Private-network container case: the proxy must be addressed via
         // the veth gateway, not the container's own loopback.
-        ensure_opencode_provider_for_model(&config_dir, &app_dir, "builtin/smart", "10.88.0.1");
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "builtin/smart",
+            "10.88.0.1",
+            Some("00000000-0000-0000-0000-000000000123"),
+        );
 
         let opencode_json: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
@@ -9210,6 +9227,11 @@ mod tests {
             base_url.starts_with("http://10.88.0.1:"),
             "expected veth gateway baseURL, got {base_url}"
         );
+        let mission_header = opencode_json["provider"]["builtin"]["options"]["headers"]
+            [crate::api::proxy_liveness::MISSION_ID_HEADER]
+            .as_str()
+            .expect("mission id header");
+        assert_eq!(mission_header, "00000000-0000-0000-0000-000000000123");
     }
 
     // ── extract_part_text tests ───────────────────────────────────────

@@ -18,6 +18,20 @@ use crate::opencode::{extract_reasoning, extract_text};
 use crate::workspace::Workspace;
 use crate::workspace_exec::WorkspaceExec;
 
+/// Hard inactivity threshold when neither heartbeats nor proxy streaming are
+/// observed. Thinking models routinely spend 2–5 minutes inside a reasoning
+/// segment with zero harness output, so 120s produced false stall kills
+/// (mission f9ba703a: MiniMax-M3 killed mid-reasoning after exactly 120s).
+const GLOBAL_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Inactivity threshold while OpenCode server heartbeats are still arriving.
+const HEARTBEAT_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(420);
+/// A builtin-proxy chunk within this window counts as "the LLM call is alive".
+const PROXY_STREAM_RECENT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Absolute cap on the proxy-stream grace: even with live upstream chunks,
+/// kill after this much harness silence (protects against a wedged CLI that
+/// stopped consuming its own LLM stream).
+const PROXY_STREAM_INACTIVITY_CAP: std::time::Duration = std::time::Duration::from_secs(1800);
+
 /// Execute a turn using OpenCode CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
@@ -253,6 +267,7 @@ pub async fn run_opencode_turn(
             app_working_dir,
             model_override,
             &workspace_host_ip,
+            Some(&mission_id.to_string()),
         );
     }
     if let Some(ref am) = agent_model {
@@ -262,6 +277,7 @@ pub async fn run_opencode_turn(
                 app_working_dir,
                 am,
                 &workspace_host_ip,
+                Some(&mission_id.to_string()),
             );
         }
     }
@@ -327,6 +343,7 @@ pub async fn run_opencode_turn(
             app_working_dir,
             opencode_model,
             &workspace_host_ip,
+            Some(&mission_id.to_string()),
         );
     }
 
@@ -1147,7 +1164,16 @@ pub async fn run_opencode_turn(
                             .ok()
                             .map(|g| g.elapsed() < std::time::Duration::from_secs(opencode_text_idle_timeout_secs))
                             .unwrap_or(false);
-                        if !recent_activity && !tools_active {
+                        // Proxy-stream grace: thinking models can spend minutes
+                        // inside a reasoning segment with no OpenCode events at
+                        // all, while the builtin proxy sees upstream chunks
+                        // streaming the whole time. Don't kill while the
+                        // mission's own LLM call is demonstrably alive.
+                        let proxy_streaming =
+                            crate::api::proxy_liveness::time_since_activity(mission_id)
+                                .map(|d| d <= PROXY_STREAM_RECENT)
+                                .unwrap_or(false);
+                        if !recent_activity && !tools_active && !proxy_streaming {
                             tracing::info!(
                                 mission_id = %mission_id,
                                 "OpenCode output idle timeout reached; terminating CLI process"
@@ -1159,8 +1185,8 @@ pub async fn run_opencode_turn(
                     }
                 }
                 // Global inactivity timeout: if nothing at all has happened
-                // for 120s (no SSE events, no stdout, no stderr), the process
-                // is likely stuck.  Kill it and let the fallback recovery
+                // (no SSE events, no stdout, no stderr), the process is
+                // likely stuck.  Kill it and let the fallback recovery
                 // logic read the result from OpenCode storage.
                 // Skip this check while tools are actively running — long
                 // commands (builds, tests) may produce no SSE events for
@@ -1184,26 +1210,36 @@ pub async fn run_opencode_turn(
                     .and_then(|g| *g)
                     .map(|ts| ts.elapsed() <= std::time::Duration::from_secs(45))
                     .unwrap_or(false);
-                if !tools_active && inactivity_elapsed >= std::time::Duration::from_secs(120) {
-                    // Heartbeat-only grace: avoid killing while the OpenCode server is
-                    // still alive and sending heartbeats. This especially affects smart
-                    // routing chains (e.g. GLM/Minimax fallbacks) that can take longer
-                    // to produce non-heartbeat events.
-                    if recent_heartbeat {
-                        if inactivity_elapsed >= std::time::Duration::from_secs(420) {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                inactivity_secs = inactivity_elapsed.as_secs(),
-                                "Heartbeat-only inactivity timeout (420s); terminating stuck CLI process"
-                            );
-                            killed_by_idle_timeout = true;
-                            let _ = child.kill().await;
-                            break;
-                        }
+                if !tools_active && inactivity_elapsed >= GLOBAL_INACTIVITY_TIMEOUT {
+                    // Proxy-stream grace: the mission's own LLM call is still
+                    // streaming chunks through the builtin proxy (long
+                    // reasoning segments emit no OpenCode events). Defer the
+                    // kill up to a hard cap in case OpenCode itself wedged
+                    // while the proxy keeps receiving.
+                    let proxy_streaming =
+                        crate::api::proxy_liveness::time_since_activity(mission_id)
+                            .map(|d| d <= PROXY_STREAM_RECENT)
+                            .unwrap_or(false);
+                    if proxy_streaming && inactivity_elapsed < PROXY_STREAM_INACTIVITY_CAP {
+                        tracing::debug!(
+                            mission_id = %mission_id,
+                            inactivity_secs = inactivity_elapsed.as_secs(),
+                            "No harness output but builtin proxy stream is active; deferring inactivity kill"
+                        );
+                    } else if recent_heartbeat
+                        && inactivity_elapsed < HEARTBEAT_INACTIVITY_TIMEOUT
+                    {
+                        // Heartbeat-only grace: avoid killing while the OpenCode server is
+                        // still alive and sending heartbeats. This especially affects smart
+                        // routing chains (e.g. GLM/Minimax fallbacks) that can take longer
+                        // to produce non-heartbeat events.
                     } else {
                         tracing::warn!(
                             mission_id = %mission_id,
-                            "Global inactivity timeout (120s); terminating stuck CLI process"
+                            inactivity_secs = inactivity_elapsed.as_secs(),
+                            recent_heartbeat = recent_heartbeat,
+                            proxy_streaming = proxy_streaming,
+                            "Global inactivity timeout; terminating stuck CLI process"
                         );
                         killed_by_idle_timeout = true;
                         let _ = child.kill().await;
