@@ -1333,6 +1333,10 @@ async fn run_grok_acp_turn(
     )
     .await
     {
+        // Prompt never reached the agent — kill the CLI before handing the
+        // turn back to the fallback path (same orphan hazard as handshake).
+        let _ = child.kill().await;
+        let _ = child.wait().await;
         return Err(e);
     }
 
