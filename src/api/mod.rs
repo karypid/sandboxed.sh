@@ -48,6 +48,7 @@ mod provider_usage_cache;
 mod providers;
 pub(crate) mod proxy;
 mod proxy_keys;
+pub(crate) mod proxy_liveness;
 mod routes;
 pub(crate) mod runners;
 pub mod secrets;

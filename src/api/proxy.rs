@@ -481,6 +481,17 @@ pub(crate) async fn chat_completions_inner(
     }
     let requested_model = req.model.clone();
 
+    // Mission attribution for runner watchdogs: the per-workspace builtin
+    // provider sends this header so the proxy can report "this mission's LLM
+    // call is still streaming" while the harness CLI emits nothing.
+    let liveness_mission_id = headers
+        .get(crate::api::proxy_liveness::MISSION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| uuid::Uuid::parse_str(v.trim()).ok());
+    if let Some(id) = liveness_mission_id {
+        crate::api::proxy_liveness::note_activity(id);
+    }
+
     // 2. Resolve the requested model to chain entries:
     //    (a) A known chain id — exact, or "builtin/{model}" (the
     //        @ai-sdk/openai-compatible adapter strips the provider prefix, so
@@ -949,6 +960,7 @@ pub(crate) async fn chat_completions_inner(
                     None,
                     entry.subscription_key.clone(),
                     Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
+                    liveness_mission_id,
                 );
 
                 let success_provider = entry.provider_id.clone();
@@ -1189,6 +1201,7 @@ pub(crate) async fn chat_completions_inner(
                     None,
                     entry.subscription_key.clone(),
                     Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
+                    liveness_mission_id,
                 );
 
                 let success_provider = entry.provider_id.clone();
@@ -1692,6 +1705,7 @@ pub(crate) async fn chat_completions_inner(
                 rate_limit_snapshot,
                 entry.subscription_key.clone(),
                 Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
+                liveness_mission_id,
             );
 
             return (status, response_headers, Body::from_stream(tracked_stream)).into_response();
@@ -2968,6 +2982,7 @@ fn track_stream_health(
     rate_limit_snapshot: Option<crate::provider_health::RateLimitSnapshot>,
     subscription_key: Option<crate::provider_health::SubscriptionKey>,
     usage_sink: Option<Box<dyn FnOnce(u64, u64) + Send>>,
+    liveness_mission_id: Option<uuid::Uuid>,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut stream = std::pin::pin!(inner);
@@ -3000,6 +3015,9 @@ fn track_stream_health(
                     received_any = true;
                     match &item {
                         Ok(chunk) => {
+                            if let Some(id) = liveness_mission_id {
+                                crate::api::proxy_liveness::note_activity(id);
+                            }
                             // Scan SSE data lines for usage in the final chunk.
                             // OpenAI-compatible providers include a `usage` object
                             // in the last `data:` event of the stream.
@@ -5647,7 +5665,8 @@ mod tests {
             yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from("never sent"));
         };
 
-        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None, None);
+        let tracked =
+            track_stream_health(inner, tracker.clone(), account_id, None, None, None, None);
         let mut tracked = std::pin::pin!(tracked);
 
         // First chunk should pass through immediately.
@@ -5686,7 +5705,8 @@ mod tests {
             }
         };
 
-        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None, None);
+        let tracked =
+            track_stream_health(inner, tracker.clone(), account_id, None, None, None, None);
         let mut tracked = std::pin::pin!(tracked);
         let mut count = 0;
         while let Some(item) = tracked.next().await {
