@@ -11811,11 +11811,67 @@ pub async fn create_automation(
         driver: mission_store::AutomationDriver::Scheduler,
     };
 
+    // One pending built-in wakeup per mission: a new ScheduleWakeup
+    // supersedes any earlier un-fired one. Without this, a turn that starts
+    // before the previous wakeup fires (user message, other automation)
+    // schedules a second wakeup, and the leftovers pile up into overlapping
+    // re-triggers (observed: 5 concurrent pending wakeups on one mission,
+    // all firing within two minutes).
+    let is_builtin_wakeup = automation
+        .variables
+        .get("__wakeup_source")
+        .map(String::as_str)
+        == Some("claude-builtin");
+    let mut wakeup_iteration: u32 = 1;
+    if is_builtin_wakeup {
+        if let Ok(existing) = control
+            .mission_store
+            .get_mission_automations(mission_id)
+            .await
+        {
+            let priors: Vec<_> = existing
+                .into_iter()
+                .filter(|a| {
+                    a.variables.get("__wakeup_source").map(String::as_str) == Some("claude-builtin")
+                })
+                .collect();
+            wakeup_iteration = (priors.len() as u32).saturating_add(1);
+            for prior in priors.into_iter().filter(|a| a.active) {
+                if let Err(e) = control
+                    .mission_store
+                    .update_automation_active(prior.id, false)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to deactivate superseded wakeup automation {}: {}",
+                        prior.id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     let mut automation = control
         .mission_store
         .create_automation(automation)
         .await
         .map_err(internal_error)?;
+
+    // Persist a goal-iteration marker for self-paced loops so the dashboard
+    // and assistant can see loop progress after a reload — previously this
+    // state lived only in the (transient) wakeup automations.
+    if is_builtin_wakeup {
+        let _ = control.events_tx.send(AgentEvent::GoalIteration {
+            iteration: wakeup_iteration,
+            objective: automation
+                .variables
+                .get("__wakeup_reason")
+                .cloned()
+                .unwrap_or_default(),
+            mission_id: Some(mission_id),
+        });
+    }
 
     // If start_immediately is requested for agent_finished triggers, fire the
     // first execution right away by resolving the command and sending it as a
