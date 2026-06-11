@@ -395,6 +395,34 @@ impl PtyChild {
         }
     }
 
+    /// Disable canonical mode and echo on the PTY line discipline.
+    ///
+    /// Needed when feeding structured input (stream-json) through the PTY:
+    /// canonical mode truncates lines at 4096 bytes and echo would reflect
+    /// every injected line back into the child's stdout stream that we parse.
+    #[cfg(unix)]
+    pub fn set_raw_input_mode(&self) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let fd = match &self.master {
+            PtyMasterHandle::PortablePty(m) => m
+                .as_raw_fd()
+                .ok_or_else(|| std::io::Error::other("PTY master has no raw fd"))?,
+            PtyMasterHandle::Unix(fd) => fd.as_raw_fd(),
+        };
+        // SAFETY: fd is a valid open PTY master descriptor owned by self.
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut termios) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            termios.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ECHONL);
+            if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
     /// Wait for the child process to exit. Must be called from a blocking context.
     pub fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
         match &mut self.child {

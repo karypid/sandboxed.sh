@@ -882,13 +882,24 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        // Provide the prompt as a positional argument (instead of stdin).
-        //
-        // In production we have observed cases where piping stdin from the backend results in
-        // Claude Code producing no stdout events (even though it creates the session files),
-        // leaving missions stuck "Agent is working..." indefinitely.
-        args.push("--".to_string());
-        args.push(effective_message.clone());
+        // Stream-input mode (opt-in): deliver the prompt over stdin as
+        // stream-json and keep stdin open so messages can be injected
+        // MID-TURN (picked up after the current tool call completes, like
+        // typing in the interactive CLI). The positional prompt is ignored
+        // by the CLI in this mode, so it is not added.
+        let stream_input = crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false);
+        if stream_input {
+            args.push("--input-format".to_string());
+            args.push("stream-json".to_string());
+        } else {
+            // Provide the prompt as a positional argument (instead of stdin).
+            //
+            // In production we have observed cases where piping stdin from the backend results in
+            // Claude Code producing no stdout events (even though it creates the session files),
+            // leaving missions stuck "Agent is working..." indefinitely.
+            args.push("--".to_string());
+            args.push(effective_message.clone());
+        }
 
         // Build environment variables
         let mut env: HashMap<String, String> = HashMap::new();
@@ -1176,9 +1187,27 @@ pub fn run_claudecode_turn<'a>(
         };
 
         // Keep stdin open - dropping the writer (closing stdin) can cause some Claude CLI
-        // agent modes to hang. We pass the prompt via argv so stdin is not needed, but the
-        // CLI may check if stdin is open during initialization.
-        let _stdin_writer = pty.take_writer();
+        // agent modes to hang. In argv mode stdin is unused but must stay open;
+        // in stream-input mode it carries the prompt and mid-turn injections.
+        let mut stdin_writer = pty.take_writer().ok();
+        if stream_input {
+            #[cfg(unix)]
+            if let Err(e) = pty.set_raw_input_mode() {
+                tracing::warn!(mission_id = %mission_id, "Failed to set PTY raw input mode: {e}");
+            }
+            if let Some(w) = stdin_writer.as_mut() {
+                let init = serde_json::json!({
+                    "type": "user",
+                    "message": { "role": "user", "content": [{ "type": "text", "text": effective_message }] }
+                });
+                use std::io::Write as _;
+                if let Err(e) = writeln!(w, "{}", init).and_then(|_| w.flush()) {
+                    tracing::error!(mission_id = %mission_id, "Failed to write initial stream-json prompt: {e}");
+                }
+            }
+        }
+        // Poll cadence for mid-turn operator-note injection (stream-input mode).
+        let mut last_note_poll = Instant::now();
         tracing::debug!(mission_id = %mission_id, "PTY writer taken (kept alive)");
 
         let reader = match pty.try_clone_reader() {
@@ -1507,6 +1536,49 @@ pub fn run_claudecode_turn<'a>(
                 // immediately leaves the turn in AwaitingTerminalResult/
                 // AwaitingClaude (not this state), so those stalls remain subject
                 // to the watchdog as before.
+                _ = tokio::time::sleep_until(last_note_poll + Duration::from_secs(5)), if stream_input && stdin_writer.is_some() => {
+                    last_note_poll = Instant::now();
+                    if let Some(store) = crate::api::ask::ask_store_if_initialized() {
+                        match store.take_pending_operator_notes(mission_id).await {
+                            Ok(notes) if !notes.is_empty() => {
+                                let mut block = String::from("<operator-note>\n");
+                                for note in &notes {
+                                    block.push_str(&note.body);
+                                    block.push('\n');
+                                }
+                                block.push_str("</operator-note>");
+                                let msg = serde_json::json!({
+                                    "type": "user",
+                                    "message": { "role": "user", "content": [{ "type": "text", "text": block }] }
+                                });
+                                let mut delivered = false;
+                                if let Some(w) = stdin_writer.as_mut() {
+                                    use std::io::Write as _;
+                                    delivered = writeln!(w, "{}", msg).and_then(|_| w.flush()).is_ok();
+                                }
+                                if delivered {
+                                    tracing::info!(
+                                        mission_id = %mission_id,
+                                        notes = notes.len(),
+                                        "Injected operator notes mid-turn via stream-json stdin"
+                                    );
+                                    let _ = events_tx.send(AgentEvent::UserMessage {
+                                        id: Uuid::new_v4(),
+                                        content: block,
+                                        queued: false,
+                                        mission_id: Some(mission_id),
+                                    });
+                                } else {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        "Mid-turn note injection failed; notes will not be re-queued this turn"
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 _ = tokio::time::sleep_until(last_heartbeat_at + heartbeat_interval),
                     if saw_non_init_event
                         && matches!(turn_wait_state, ClaudeTurnWaitState::AwaitingToolResults) => {
@@ -2168,6 +2240,9 @@ pub fn run_claudecode_turn<'a>(
         // the mission until the 900s supervision watchdog force-aborts it
         // (observed on orchestrator missions 832725c5/5daaa900). Bound the
         // wait and kill the leftover process tree on expiry.
+        // In stream-input mode the CLI waits for more stdin after the result;
+        // close it so the process exits instead of hitting the kill grace.
+        drop(stdin_writer.take());
         const CLI_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
         let child_pid = pty.process_id();
         let mut wait_handle = tokio::task::spawn_blocking(move || {

@@ -64,6 +64,13 @@ pub async fn ask_store(config: &crate::config::Config) -> Result<Arc<AskStore>, 
         .map(Arc::clone)
 }
 
+/// Non-initializing accessor for runners: returns the store only if some Ask
+/// interaction already opened it this process lifetime. Runners use this for
+/// best-effort mid-turn note injection without needing a `Config`.
+pub fn ask_store_if_initialized() -> Option<Arc<AskStore>> {
+    ASK_STORE.get().cloned()
+}
+
 /// Everything the Ask loop needs for one turn.
 pub struct AskTurn {
     pub ask_store: Arc<AskStore>,
