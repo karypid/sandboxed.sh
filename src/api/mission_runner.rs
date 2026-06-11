@@ -5694,13 +5694,32 @@ pub(crate) async fn command_available(
         } else {
             args.push(format!("command -v {} 2>/dev/null", program));
         }
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
+        // Probe timeout: generous by default. Under heavy host load a
+        // systemd-run + nsenter + login-shell round trip can take >10s;
+        // with the old 8s budget every probe "failed" and a fully
+        // provisioned container was misreported as "Claude Code CLI not
+        // found and neither npm nor bun is available" (prod, 2026-06-11,
+        // load ~60 from a memory-throttled lean build).
+        let probe_timeout = std::env::var("SANDBOXED_SH_EXEC_PROBE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(probe_timeout),
             workspace_exec.output(cwd, "/bin/sh", &args, HashMap::new()),
         )
         .await
-        .ok()?
-        .ok()?;
+        {
+            Ok(result) => result.ok()?,
+            Err(_) => {
+                tracing::warn!(
+                    program = %program,
+                    timeout_secs = probe_timeout,
+                    "Workspace command probe timed out — host overloaded? Treating as unavailable"
+                );
+                return None;
+            }
+        };
         if !output.status.success() {
             return Some(false);
         }
@@ -6450,10 +6469,24 @@ async fn claude_cli_matches_desired_version(
     desired_version: &str,
 ) -> bool {
     let args = vec!["-lc".to_string(), format!("{} --version", cli_path)];
-    match workspace_exec
-        .output(cwd, "/bin/sh", &args, HashMap::new())
-        .await
+    // Bounded: an unbounded version probe was observed wedged for 51
+    // minutes on an overloaded host, stalling CLI discovery entirely.
+    let result = match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        workspace_exec.output(cwd, "/bin/sh", &args, HashMap::new()),
+    )
+    .await
     {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                cli_path,
+                "Claude CLI version probe timed out after 120s; treating as mismatch"
+            );
+            return false;
+        }
+    };
+    match result {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
