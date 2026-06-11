@@ -216,6 +216,12 @@ export function eventsToItemsImpl(
   // Without this, narration the agent emits between tool calls ("Now
   // regenerating artifacts...") was silently dropped — only the trailing
   // run after the last tool call ever rendered.
+  // Stream items flushed since the last assistant message. A flushed run can
+  // turn out to duplicate the *next* assistant message of the same turn (the
+  // final text often repeats earlier narration); those are removed
+  // retroactively when that assistant message arrives.
+  let flushedStreamIds: string[] = [];
+
   const flushTextDelta = (endTime: number) => {
     if (!lastTextDelta) return;
     if (!streamDuplicatesAssistant(lastTextDelta.content, lastAssistantContent)) {
@@ -227,8 +233,26 @@ export function eventsToItemsImpl(
         startTime: lastTextDelta.timestamp,
         endTime,
       });
+      flushedStreamIds.push(lastTextDelta.id);
     }
     lastTextDelta = null;
+  };
+
+  const dropStreamsDuplicatedBy = (assistantContent: string) => {
+    if (flushedStreamIds.length > 0) {
+      const ids = new Set(flushedStreamIds);
+      for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        if (
+          it.kind === "stream" &&
+          ids.has(it.id) &&
+          streamDuplicatesAssistant(it.content, assistantContent)
+        ) {
+          items.splice(i, 1);
+        }
+      }
+    }
+    flushedStreamIds = [];
   };
 
   const pushGoalDeliverable = (event: StoredEvent, timestamp: number) => {
@@ -276,6 +300,7 @@ export function eventsToItemsImpl(
       case "assistant_message":
       case "assistant_message_canonical": {
         finalizePendingThinking(timestamp);
+        dropStreamsDuplicatedBy(event.content);
         const meta = event.metadata || {};
         const isFailure = meta.success === false;
         const { costCents, costSource } = parseCostMetadata(meta);

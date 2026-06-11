@@ -128,6 +128,25 @@ describe("eventsToItemsImpl text_delta replay", () => {
     const toolIdx = items.findIndex((item) => item.kind === "tool");
     expect(streamIdx).toBeLessThan(toolIdx);
   });
+
+  it("removes a flushed narration that duplicates the later assistant reply", () => {
+    const answer =
+      "All checks passed and the branch is pushed; the PR is ready for review now.";
+    const items = eventsToItemsImpl(
+      [
+        storedEvent(1, "text_delta", answer),
+        { ...storedEvent(2, "tool_call", '{"command":"true"}'), tool_call_id: "t1", tool_name: "Bash" },
+        { ...storedEvent(3, "tool_result", '{"content":"ok"}'), tool_call_id: "t1", tool_name: "Bash" },
+        storedEvent(4, "assistant_message", answer, undefined, {
+          success: true,
+        }),
+      ],
+      { status: "awaiting_user" } as Mission,
+    );
+
+    expect(items.filter((item) => item.kind === "stream")).toHaveLength(0);
+    expect(items.filter((item) => item.kind === "assistant")).toHaveLength(1);
+  });
 });
 
 describe("eventsToItemsImpl thinking replay", () => {
