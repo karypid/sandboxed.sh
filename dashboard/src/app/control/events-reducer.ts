@@ -212,6 +212,25 @@ export function eventsToItemsImpl(
     }
   };
 
+  // Materialize the pending text-delta run as a finished stream bubble.
+  // Without this, narration the agent emits between tool calls ("Now
+  // regenerating artifacts...") was silently dropped — only the trailing
+  // run after the last tool call ever rendered.
+  const flushTextDelta = (endTime: number) => {
+    if (!lastTextDelta) return;
+    if (!streamDuplicatesAssistant(lastTextDelta.content, lastAssistantContent)) {
+      items.push({
+        kind: "stream",
+        id: lastTextDelta.id,
+        content: lastTextDelta.content,
+        done: true,
+        startTime: lastTextDelta.timestamp,
+        endTime,
+      });
+    }
+    lastTextDelta = null;
+  };
+
   const pushGoalDeliverable = (event: StoredEvent, timestamp: number) => {
     const content = event.content.trim();
     if (!content) return;
@@ -458,7 +477,7 @@ export function eventsToItemsImpl(
 
       case "tool_call": {
         finalizePendingThinking(timestamp);
-        lastTextDelta = null;
+        flushTextDelta(timestamp);
         const toolCallId = event.tool_call_id || `unknown-${event.id}`;
         const name = event.tool_name || "unknown";
         const isUiTool =
@@ -489,7 +508,7 @@ export function eventsToItemsImpl(
 
       case "tool_stub": {
         finalizePendingThinking(timestamp);
-        lastTextDelta = null;
+        flushTextDelta(timestamp);
         const toolCallId = event.tool_call_id || `unknown-${event.id}`;
         const name = event.tool_name || "unknown";
         const isUiTool =
