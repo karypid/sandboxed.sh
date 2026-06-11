@@ -901,6 +901,9 @@ pub async fn destroy_container(path: &Path) -> NspawnResult<()> {
             "Container path {} does not exist, nothing to destroy",
             path.display()
         );
+        // Still reap the sibling build log: a partially removed workspace
+        // (rootfs gone, log left) should not orphan it forever.
+        let _ = tokio::fs::remove_file(build_log_path_for(path)).await;
         return Ok(());
     }
 
