@@ -11811,17 +11811,31 @@ pub async fn create_automation(
         driver: mission_store::AutomationDriver::Scheduler,
     };
 
+    let is_builtin_wakeup = automation
+        .variables
+        .get("__wakeup_source")
+        .map(String::as_str)
+        == Some("claude-builtin");
+
+    let mut automation = control
+        .mission_store
+        .create_automation(automation)
+        .await
+        .map_err(internal_error)?;
+
     // One pending built-in wakeup per mission: a new ScheduleWakeup
     // supersedes any earlier un-fired one. Without this, a turn that starts
     // before the previous wakeup fires (user message, other automation)
     // schedules a second wakeup, and the leftovers pile up into overlapping
     // re-triggers (observed: 5 concurrent pending wakeups on one mission,
     // all firing within two minutes).
-    let is_builtin_wakeup = automation
-        .variables
-        .get("__wakeup_source")
-        .map(String::as_str)
-        == Some("claude-builtin");
+    //
+    // Ordering: the new wakeup is created *first*, then older ones are
+    // deactivated — if creation fails the mission keeps its previous wakeup
+    // instead of losing all of them. Only automations strictly older than
+    // the new row are deactivated ((created_at, id) tie-break), so two
+    // overlapping creates converge on exactly the newest wakeup instead of
+    // deactivating each other.
     let mut wakeup_iteration: u32 = 1;
     if is_builtin_wakeup {
         if let Ok(existing) = control
@@ -11829,14 +11843,20 @@ pub async fn create_automation(
             .get_mission_automations(mission_id)
             .await
         {
+            let new_key = (automation.created_at.clone(), automation.id.to_string());
             let priors: Vec<_> = existing
                 .into_iter()
                 .filter(|a| {
-                    a.variables.get("__wakeup_source").map(String::as_str) == Some("claude-builtin")
+                    a.id != automation.id
+                        && a.variables.get("__wakeup_source").map(String::as_str)
+                            == Some("claude-builtin")
                 })
                 .collect();
             wakeup_iteration = (priors.len() as u32).saturating_add(1);
-            for prior in priors.into_iter().filter(|a| a.active) {
+            for prior in priors
+                .into_iter()
+                .filter(|a| a.active && (a.created_at.clone(), a.id.to_string()) < new_key)
+            {
                 if let Err(e) = control
                     .mission_store
                     .update_automation_active(prior.id, false)
@@ -11851,12 +11871,6 @@ pub async fn create_automation(
             }
         }
     }
-
-    let mut automation = control
-        .mission_store
-        .create_automation(automation)
-        .await
-        .map_err(internal_error)?;
 
     // Persist a goal-iteration marker for self-paced loops so the dashboard
     // and assistant can see loop progress after a reload — previously this
