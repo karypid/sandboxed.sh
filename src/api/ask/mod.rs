@@ -505,6 +505,11 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
          operator decide. When you do steer, make the message self-contained and \
          bounded (what to stop, what to do instead, when to stop doing it) — the \
          working agent has no access to this conversation.\n\n\
+         You are strictly reactive: you run only when the operator sends a \
+         message, and you cannot watch, poll, or follow up on your own. Never \
+         promise to \"keep an eye on\" or \"let you know when\" something \
+         happens — instead tell the operator what to ask about next time, or \
+         queue a steering note for the working agent.\n\n\
          Be concise and concrete. Cite event sequence numbers or file paths when \
          relevant. When you identify a blocker the operator could fix through \
          configuration (missing env var, unused key), propose the concrete fix — \
