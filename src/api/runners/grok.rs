@@ -615,13 +615,37 @@ pub async fn run_grok_turn(
         .await
         {
             Ok(result) => return result,
-            Err(reason) => {
+            Err(fallback) => {
                 tracing::warn!(
                     mission_id = %mission_id,
-                    reason = %reason,
+                    reason = %fallback.reason,
+                    drop_session_id = fallback.drop_session_id,
                     "Grok ACP handshake failed before the prompt was sent; \
                      falling back to streaming-json mode"
                 );
+                // An unloadable session must not be passed as --session-id:
+                // its upsert semantics would create a fresh EMPTY session
+                // under that id. Omitting it makes the legacy path use
+                // --continue, which resumes the last session in this
+                // mission directory and preserves context.
+                let fallback_session_id = if fallback.drop_session_id {
+                    None
+                } else {
+                    session_id
+                };
+                return run_grok_streaming_json_turn(
+                    workspace,
+                    work_dir,
+                    message,
+                    model,
+                    mission_id,
+                    events_tx,
+                    cancel,
+                    app_working_dir,
+                    fallback_session_id,
+                    is_continuation,
+                )
+                .await;
             }
         }
     }
@@ -1052,6 +1076,31 @@ const GROK_ACP_SESSION_NEW_ID: u64 = 3;
 const GROK_ACP_SET_MODEL_ID: u64 = 4;
 const GROK_ACP_PROMPT_ID: u64 = 5;
 
+/// Marker embedded in handshake errors that mean "the stored session can't
+/// be resumed over ACP — the legacy path must use --continue, not
+/// --session-id". Matched by the dispatcher to set `drop_session_id`.
+const GROK_ACP_DEFER_TO_CONTINUE: &str = "deferring to --continue";
+
+/// Why the ACP path handed the turn back to the streaming-json fallback.
+pub(crate) struct GrokAcpFallback {
+    reason: String,
+    /// True when the stored session id is not loadable over ACP: the
+    /// fallback must NOT pass it as `--session-id` (upsert semantics would
+    /// create a fresh empty session under that id) — omitting it makes the
+    /// legacy path use `--continue`, which resumes the CLI's last session
+    /// in the mission directory and preserves context.
+    drop_session_id: bool,
+}
+
+impl From<String> for GrokAcpFallback {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            drop_session_id: false,
+        }
+    }
+}
+
 /// Per-call state for an in-flight grok ACP tool call.
 #[derive(Default, Clone)]
 struct GrokAcpToolCall {
@@ -1084,7 +1133,7 @@ async fn run_grok_acp_turn(
     app_working_dir: &std::path::Path,
     session_id: Option<&str>,
     is_continuation: bool,
-) -> Result<AgentResult, String> {
+) -> Result<AgentResult, GrokAcpFallback> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
@@ -1235,7 +1284,7 @@ async fn run_grok_acp_turn(
                     // defer to it instead of silently dropping context.
                     return Err(format!(
                         "stored session {sid} not loadable over ACP on a continuation \
-                         turn ({err}); deferring to --continue"
+                         turn ({err}); {GROK_ACP_DEFER_TO_CONTINUE}"
                     ));
                 }
                 Err(err) => {
@@ -1250,10 +1299,9 @@ async fn run_grok_acp_turn(
         } else if is_continuation {
             // Continuation with no stored session id at all: only the
             // streaming path's `--continue` can recover the prior session.
-            return Err(
-                "continuation turn without a stored session id; deferring to --continue"
-                    .to_string(),
-            );
+            return Err(format!(
+                "continuation turn without a stored session id; {GROK_ACP_DEFER_TO_CONTINUE}"
+            ));
         }
         if acp_session_id.is_none() {
             send(
@@ -1287,7 +1335,11 @@ async fn run_grok_acp_turn(
         Err(err) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(err);
+            let drop_session_id = err.contains(GROK_ACP_DEFER_TO_CONTINUE);
+            return Err(GrokAcpFallback {
+                reason: err,
+                drop_session_id,
+            });
         }
     };
 
@@ -1337,7 +1389,7 @@ async fn run_grok_acp_turn(
         // turn back to the fallback path (same orphan hazard as handshake).
         let _ = child.kill().await;
         let _ = child.wait().await;
-        return Err(e);
+        return Err(GrokAcpFallback::from(e));
     }
 
     let mut thinking_buffer = String::new();
