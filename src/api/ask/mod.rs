@@ -200,6 +200,12 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
         }
     }
 
+    // Reasoning models (MiniMax, GLM) can leak <think>/<mm:think> blocks into
+    // the visible answer; strip them like the mission path does.
+    final_answer = crate::api::mission_runner::strip_think_tags(&final_answer)
+        .trim()
+        .to_string();
+
     turn.ask_store
         .append_message(
             turn.thread_id,
@@ -381,6 +387,12 @@ async fn run_ask_turn_streaming_inner(
                 "(The assistant reached the tool-call limit without a final answer.)".to_string();
         }
     }
+
+    // Reasoning models (MiniMax, GLM) can leak <think>/<mm:think> blocks into
+    // the visible answer; strip them like the mission path does.
+    final_answer = crate::api::mission_runner::strip_think_tags(&final_answer)
+        .trim()
+        .to_string();
 
     turn.ask_store
         .append_message(
