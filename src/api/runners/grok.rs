@@ -1249,7 +1249,17 @@ async fn run_grok_acp_turn(
     }
     let acp_session_id = acp_session_id.expect("session id established above");
 
-    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+    // The ACP session default is the non-reasoning chat model
+    // (grok-4.20-*-non-reasoning), which emits no thought chunks. The legacy
+    // `grok -p` path defaulted to grok-build (a reasoning model), so missions
+    // without an explicit model keep that behavior — and a populated thoughts
+    // panel — here too. Override via backend setting `default_model`.
+    let effective_model = model
+        .filter(|m| !m.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| get_backend_string_setting("grok", "default_model"))
+        .or_else(|| Some("grok-build-0.1".to_string()));
+    if let Some(model) = effective_model.as_deref() {
         // Best-effort: an unknown model shouldn't kill the turn.
         send(
             &mut stdin,
@@ -1288,7 +1298,7 @@ async fn run_grok_acp_turn(
     let mut thinking_done_emitted = false;
     let mut text_buffer = String::new();
     let mut tool_calls: HashMap<String, GrokAcpToolCall> = HashMap::new();
-    let mut model_used: Option<String> = Some(model.unwrap_or("grok-build").to_string());
+    let mut model_used: Option<String> = effective_model.clone();
     let mut usage = crate::cost::TokenUsage::default();
     let mut stop_reason: Option<String> = None;
     let mut transport_error: Option<String> = None;
