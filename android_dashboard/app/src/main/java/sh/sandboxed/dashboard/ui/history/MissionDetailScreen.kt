@@ -119,8 +119,13 @@ private class MissionDetailViewModel(
         }
     }
 
+    private var searchGen = 0
+
     fun setQuery(q: String) {
         _state.update { it.copy(query = q) }
+        // Generation fence: each keystroke supersedes in-flight searches, so
+        // a slow older response can't overwrite a newer one's results.
+        val gen = ++searchGen
         if (q.isBlank()) {
             _state.update { it.copy(moments = emptyList(), searching = false) }
             return
@@ -128,7 +133,9 @@ private class MissionDetailViewModel(
         viewModelScope.launch {
             _state.update { it.copy(searching = true) }
             val moments = runCatching { container.api.searchMoments(q, missionId = missionId) }.getOrNull().orEmpty()
-            _state.update { it.copy(moments = moments, searching = false) }
+            if (gen == searchGen) {
+                _state.update { it.copy(moments = moments, searching = false) }
+            }
         }
     }
 }

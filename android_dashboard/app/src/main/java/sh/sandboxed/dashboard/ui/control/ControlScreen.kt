@@ -1112,10 +1112,14 @@ private fun AssistantBubble(
 private fun SharedInlineImage(f: SharedFile, resolveUrl: (String) -> String, authToken: String?) {
     val ctx = LocalContext.current
     val url = resolveUrl(f.url)
-    val request = remember(url, authToken) {
+    // Only attach the dashboard JWT to our own backend (relative paths that
+    // resolveUrl rebased onto baseUrl). Absolute third-party URLs must not
+    // receive the token — that would leak the session to an external host.
+    val tokenForHost = if (f.url.startsWith("http")) null else authToken
+    val request = remember(url, tokenForHost) {
         ImageRequest.Builder(ctx)
             .data(url)
-            .apply { authToken?.let { setHeader("Authorization", "Bearer $it") } }
+            .apply { tokenForHost?.let { setHeader("Authorization", "Bearer $it") } }
             .crossfade(true)
             .build()
     }
