@@ -75,8 +75,16 @@ class ApiService(
         val call = client.newCall(req)
         cont.invokeOnCancellation { call.cancel() }
         call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = cont.resumeWithException(e)
-            override fun onResponse(call: Call, response: Response) = cont.resume(response)
+            // Guard against resuming a continuation that has already been
+            // cancelled (e.g. ViewModel cleared while the request was in
+            // flight). Without the check, an uncaught IllegalStateException
+            // on the OkHttp dispatcher thread crashes the process.
+            override fun onFailure(call: Call, e: IOException) {
+                if (cont.isActive) cont.resumeWithException(e)
+            }
+            override fun onResponse(call: Call, response: Response) {
+                if (cont.isActive) cont.resume(response) else response.close()
+            }
         })
     }
 
@@ -247,6 +255,19 @@ class ApiService(
 
     suspend fun deleteAutomation(id: String) = withContext(Dispatchers.IO) {
         val req = newRequestBuilder(urlOf("/api/control/automations/$id")).delete().build()
+        executeText(req)
+    }
+
+    // ---- Ask (non-interrupting sidecar co-pilot) ----
+    // Thread list/detail/delete are plain JSON; the streamed turn lives in AskClient.
+    suspend fun listAskThreads(missionId: String): List<sh.sandboxed.dashboard.data.AskThread> =
+        getList("/api/control/missions/$missionId/ask/threads")
+
+    suspend fun getAskThread(missionId: String, threadId: String): sh.sandboxed.dashboard.data.AskThreadDetail =
+        getJson("/api/control/missions/$missionId/ask/threads/$threadId")
+
+    suspend fun deleteAskThread(missionId: String, threadId: String) = withContext(Dispatchers.IO) {
+        val req = newRequestBuilder(urlOf("/api/control/missions/$missionId/ask/threads/$threadId")).delete().build()
         executeText(req)
     }
 }
