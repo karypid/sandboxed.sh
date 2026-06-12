@@ -247,3 +247,37 @@ describe("eventsToItemsImpl lazy tool stubs", () => {
     ]);
   });
 });
+
+describe("extractMissionState", () => {
+  it("derives plan and up-next from harness tool items", async () => {
+    const { extractMissionState } = await import("./events-reducer");
+    const items = eventsToItemsImpl([
+      {
+        ...storedEvent(1, "tool_call", JSON.stringify({
+          todos: [
+            { content: "merge PR", status: "completed" },
+            { content: "port Frames", status: "in_progress" },
+          ],
+        })),
+        tool_call_id: "t1",
+        tool_name: "TodoWrite",
+      },
+      {
+        ...storedEvent(2, "tool_call", JSON.stringify({
+          delaySeconds: 1500,
+          reason: "review foundry shard 3 then merge",
+          prompt: "Wakeup: ...",
+        })),
+        tool_call_id: "t2",
+        tool_name: "ScheduleWakeup",
+      },
+    ]);
+    const state = extractMissionState(items);
+    expect(state.plan?.items).toEqual([
+      { content: "merge PR", status: "completed" },
+      { content: "port Frames", status: "in_progress" },
+    ]);
+    expect(state.upNext?.reason).toBe("review foundry shard 3 then merge");
+    expect(state.upNext?.delaySeconds).toBe(1500);
+  });
+});

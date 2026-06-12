@@ -32,6 +32,7 @@ import {
 } from "@/lib/stream-continuation";
 import {
   eventsToItemsImpl,
+  extractMissionState,
   isRecord,
   parseCostMetadata,
   type ChatItem,
@@ -1180,7 +1181,7 @@ function QuestionToolItem({
       data-chat-item-id={item.id}
       className="flex justify-start gap-3"
     >
-      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+      <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
         <Bot className="h-4 w-4 text-indigo-400" />
       </div>
       <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
@@ -2660,7 +2661,7 @@ const ChatItemRow = memo(function ChatItemRow({
             </span>
           </div>
         </div>
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
+        <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
           <User className="h-4 w-4 text-white/60" />
         </div>
       </div>
@@ -2689,7 +2690,7 @@ const ChatItemRow = memo(function ChatItemRow({
           highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10",
         )}
       >
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+        <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
           <Bot className="h-4 w-4 text-indigo-400" />
         </div>
         <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
@@ -2852,7 +2853,7 @@ const ChatItemRow = memo(function ChatItemRow({
             data-chat-item-id={item.id}
             className="flex justify-start gap-3"
           >
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+            <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
               <Bot className="h-4 w-4 text-indigo-400" />
             </div>
             <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
@@ -2899,7 +2900,7 @@ const ChatItemRow = memo(function ChatItemRow({
             data-chat-item-id={item.id}
             className="flex justify-start gap-3"
           >
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+            <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
               <Bot className="h-4 w-4 text-indigo-400" />
             </div>
             <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
@@ -3014,6 +3015,9 @@ export default function ControlClient() {
   const showPerfOverlay = searchParams.get("debug") === "perf";
 
   const [items, setItems] = useControlItemsStore();
+  // Agent task board + next-wakeup marker for the Workbench panel, derived
+  // from the same chat items the transcript renders (single source of truth).
+  const workbenchMissionState = useMemo(() => extractMissionState(items), [items]);
   const itemsRef = useRef<ChatItem[]>([]);
   const [input, setInput] = useState(() => loadControlDraftForMission(null));
   const [canSubmitInput, setCanSubmitInput] = useState(false);
@@ -9837,7 +9841,7 @@ export default function ControlClient() {
                   </div>
                 </div>
               ) : (
-                <div className="mx-auto max-w-3xl space-y-6">
+                <div className="@container mx-auto max-w-3xl space-y-6">
                   <div
                     className="relative w-full"
                     style={{ height: `${chatVirtualizer.getTotalSize()}px` }}
@@ -10232,6 +10236,7 @@ export default function ControlClient() {
                   isRunning={viewingMissionIsRunning}
                   childMissions={childMissions}
                   queueLen={viewingQueueLen}
+                  missionState={workbenchMissionState}
                   onClose={() => setShowWorkbenchPanel(false)}
                   onResume={handleResumeMission}
                   onCancel={handleCancelMission}

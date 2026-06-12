@@ -454,6 +454,35 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
                 truncate(&goal.content, 600)
             ));
         }
+        // Latest plan snapshot (Claude Code TodoWrite / Codex update_plan /
+        // OpenCode todowrite): the working agent's own task board is the
+        // single best "where are we" signal — surface the newest one.
+        if let Some(plan) = events.iter().rev().find(|ev| {
+            ev.event_type == "tool_call"
+                && matches!(
+                    ev.tool_name.as_deref(),
+                    Some("TodoWrite") | Some("update_plan") | Some("todowrite")
+                )
+        }) {
+            seed.push_str(&format!(
+                "\nWorking agent's latest task board [{} {}]:\n{}\n",
+                plan.sequence,
+                plan.timestamp,
+                truncate(&plan.content, 1500)
+            ));
+        }
+        if let Some(iter_ev) = events
+            .iter()
+            .rev()
+            .find(|ev| ev.event_type == "goal_iteration")
+        {
+            seed.push_str(&format!(
+                "\nLatest loop/wakeup marker [{} {}]: {}\n",
+                iter_ev.sequence,
+                iter_ev.timestamp,
+                truncate(&iter_ev.content, 400)
+            ));
+        }
         let start = events.len().saturating_sub(SEED_EVENT_COUNT);
         seed.push_str("\nRecent mission events (newest last):\n");
         for ev in &events[start..] {
@@ -469,6 +498,37 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
                 ev.event_type,
                 tool,
                 truncate(&ev.content, 300)
+            ));
+        }
+    }
+
+    // Worker fleet: for orchestrator missions, list child missions so the
+    // co-pilot can answer "what is running right now" without grepping.
+    if let Ok(children) = turn.mission_store.get_child_missions(turn.mission_id).await {
+        if !children.is_empty() {
+            seed.push_str("\nWorker missions (children):\n");
+            for c in children.iter().rev().take(12) {
+                seed.push_str(&format!(
+                    "- {} [{} {}] {:?} {}\n",
+                    c.id,
+                    c.backend,
+                    c.model_override.as_deref().unwrap_or("-"),
+                    c.status,
+                    truncate(c.title.as_deref().unwrap_or("untitled"), 80)
+                ));
+            }
+        }
+    }
+    // Pending wakeups: when the next scheduled turn fires and why.
+    if let Ok(autos) = turn
+        .mission_store
+        .get_mission_automations(turn.mission_id)
+        .await
+    {
+        for a in autos.iter().filter(|a| a.active) {
+            seed.push_str(&format!(
+                "\nPending automation: trigger={:?} last_triggered={:?}\n",
+                a.trigger, a.last_triggered_at
             ));
         }
     }
