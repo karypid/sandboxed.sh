@@ -104,10 +104,6 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
     // Some deployments lack /api/control/parallel/config; remember the 404
     // instead of re-probing it on every poll tick.
     private var parallelConfigSupported = true
-    // Contents of messages sent from this client that haven't been echoed back
-    // by the server yet. Lets the live `user_message` event confirm the local
-    // bubble instead of appending a duplicate.
-    private val pendingEchoes = ArrayDeque<String>()
 
     init {
         viewModelScope.launch {
@@ -208,10 +204,6 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 container.settings.setLastMission(mission.id)
                 missionId = mission.id
             }
-            synchronized(pendingEchoes) {
-                pendingEchoes.addLast(text)
-                while (pendingEchoes.size > 8) pendingEchoes.removeFirst()
-            }
             // mission_id pins the send to the conversation on screen;
             // client_message_id lets the server dedupe retries.
             container.api.sendMessage(text, missionId = missionId, clientMessageId = messageId)
@@ -219,7 +211,6 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         }.onSuccess {
             markSendState(messageId, SendState.SENT)
         }.onFailure { e ->
-            synchronized(pendingEchoes) { pendingEchoes.remove(text) }
             markSendState(messageId, SendState.FAILED)
             _state.update { it.copy(error = e.message) }
         }
@@ -229,6 +220,25 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
     private fun markSendState(id: String, sendState: SendState) {
         _state.update { st ->
             st.copy(messages = st.messages.map { if (it.id == id) it.copy(sendState = sendState) else it })
+        }
+    }
+
+    /// Resolve a `user_message` event by id. The optimistic bubble already
+    /// uses `client_message_id` as its id, so a live echo confirms it instead
+    /// of duplicating; a failed bubble whose POST actually reached the server
+    /// is healed to SENT when the echo arrives.
+    private fun confirmUserMessage(id: String, content: String) {
+        _state.update { st ->
+            val idx = st.messages.indexOfFirst { it.id == id }
+            if (idx >= 0) {
+                st.copy(
+                    messages = st.messages.mapIndexed { i, m ->
+                        if (i == idx) m.copy(content = content, sendState = SendState.SENT) else m
+                    },
+                )
+            } else {
+                st.copy(messages = st.messages + ChatMessage(id = id, kind = ChatMessageKind.User, content = content))
+            }
         }
     }
 
@@ -536,12 +546,9 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         when (evt.type) {
             "user_message" -> {
                 val content = s("content") ?: return
-                // A live echo of a message this client just sent confirms the
-                // local bubble instead of duplicating it.
-                val isLocalEcho = live && synchronized(pendingEchoes) { pendingEchoes.remove(content) }
-                if (isLocalEcho) {
-                    _state.value.messages.lastOrNull { it.kind is ChatMessageKind.User && it.content == content }
-                        ?.let { markSendState(it.id, SendState.SENT) }
+                val id = s("id")
+                if (id != null) {
+                    confirmUserMessage(id, content)
                 } else {
                     appendMessage(ChatMessage(kind = ChatMessageKind.User, content = content))
                 }
@@ -757,6 +764,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         val data = ev.metadata.toMutableMap()
         data["mission_id"] = JsonPrimitive(ev.missionId)
         if (ev.content.isNotBlank()) data["content"] = JsonPrimitive(ev.content)
+        ev.eventId?.let { data["id"] = JsonPrimitive(it) }
         ev.toolCallId?.let { data["tool_call_id"] = JsonPrimitive(it) }
         ev.toolName?.let { data["name"] = JsonPrimitive(it) }
         when (ev.eventType) {
