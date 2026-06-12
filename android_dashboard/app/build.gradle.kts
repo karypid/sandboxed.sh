@@ -97,6 +97,9 @@ dependencies {
 
     implementation("io.coil-kt:coil-compose:2.7.0")
 
+    //noinspection GradleDependency -- newer versions need Kotlin 2.1 metadata; this app builds with Kotlin 2.0.
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.26.0")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 
