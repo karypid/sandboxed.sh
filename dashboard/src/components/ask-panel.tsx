@@ -59,13 +59,13 @@ export function AskPanel({
   const [messages, setMessages] = useState<AskMessage[]>([]);
   const [input, setInput] = useState("");
   // Resizable: persisted so the chat/co-pilot split survives reloads.
-  const [panelWidth, setPanelWidthRaw] = useState(380);
-  useEffect(() => {
-    const saved = Number(localStorage.getItem("ask-panel-width"));
-    if (Number.isFinite(saved) && saved >= 300 && saved <= 760) {
-      setPanelWidthRaw(saved);
-    }
-  }, []);
+  // Lazy initializer reads the saved width on first render so the panel never
+  // mounts at the default and then jumps to the stored value.
+  const [panelWidth, setPanelWidthRaw] = useState(() => {
+    if (typeof window === "undefined") return 380;
+    const saved = Number(window.localStorage.getItem("ask-panel-width"));
+    return Number.isFinite(saved) && saved >= 300 && saved <= 760 ? saved : 380;
+  });
   const setPanelWidth = useCallback((w: number) => {
     setPanelWidthRaw(w);
   }, []);
