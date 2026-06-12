@@ -689,9 +689,9 @@ export function extractMissionState(items: ChatItem[]): MissionStateSummary {
           if (!content) continue;
           parsed.push({ content, status: normalizePlanStatus(entry["status"]) });
         }
-        if (parsed.length > 0) {
-          plan = { items: parsed, timestamp: item.startTime };
-        }
+        // An empty/unparseable board still supersedes the previous one —
+        // keeping the old snapshot would present stale state as current.
+        plan = parsed.length > 0 ? { items: parsed, timestamp: item.startTime } : null;
       }
     } else if (name === "ScheduleWakeup") {
       const args = item.args as Record<string, unknown>;
@@ -701,7 +701,13 @@ export function extractMissionState(items: ChatItem[]): MissionStateSummary {
           : typeof args["prompt"] === "string"
             ? args["prompt"]
             : "";
-      if (reason) {
+      // A wakeup without usable text still replaces (clears) the previous
+      // marker — the old "up next" is no longer what happens next.
+      if (!reason) {
+        upNext = null;
+        continue;
+      }
+      {
         upNext = {
           reason,
           delaySeconds:
