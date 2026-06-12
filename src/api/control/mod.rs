@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 // Control event/command types (Phase 6 of the decomposition).
+pub mod board;
 pub mod events;
 pub use events::*;
 
@@ -54,8 +55,8 @@ use super::auth::AuthUser;
 use super::desktop;
 use super::library::SharedLibrary;
 use super::mission_store::{
-    self, create_mission_store, now_string, Mission, MissionHistoryEntry, MissionStore,
-    MissionStoreType,
+    self, create_mission_store, now_string, BoardTask, BoardTaskStatus, Mission,
+    MissionHistoryEntry, MissionStore, MissionStoreType, NewBoardTask,
 };
 use super::routes::AppState;
 
@@ -3166,6 +3167,284 @@ pub async fn post_message(
     Ok(Json(ControlMessageResponse { id, queued }))
 }
 
+// ---------------------------------------------------------------------------
+// Task board API (see `board` module for the scheduler).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BoardUpsertRequest {
+    pub tasks: Vec<NewBoardTask>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BoardUtilization {
+    pub pending: usize,
+    pub running: usize,
+    pub settled: usize,
+    pub accepted: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub total: usize,
+    pub max_parallel: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BoardResponse {
+    pub tasks: Vec<BoardTask>,
+    pub utilization: BoardUtilization,
+}
+
+fn board_utilization(tasks: &[BoardTask], max_parallel: usize) -> BoardUtilization {
+    let count = |s: BoardTaskStatus| tasks.iter().filter(|t| t.status == s).count();
+    BoardUtilization {
+        pending: count(BoardTaskStatus::Pending),
+        running: count(BoardTaskStatus::Running),
+        settled: count(BoardTaskStatus::Settled),
+        accepted: count(BoardTaskStatus::Accepted),
+        failed: count(BoardTaskStatus::Failed),
+        cancelled: count(BoardTaskStatus::Cancelled),
+        total: tasks.len(),
+        max_parallel,
+    }
+}
+
+/// GET /api/control/missions/:id/board — full board for a boss mission.
+pub async fn get_mission_board(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<BoardResponse>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let tasks = control
+        .mission_store
+        .list_board_tasks(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
+    Ok(Json(BoardResponse {
+        utilization: board_utilization(&tasks, max_parallel),
+        tasks,
+    }))
+}
+
+/// POST /api/control/missions/:id/board/tasks — register/update tasks.
+/// The scheduler picks up ready tasks within one pass (~3s).
+pub async fn upsert_mission_board_tasks(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<BoardUpsertRequest>,
+) -> Result<Json<BoardResponse>, (StatusCode, String)> {
+    if req.tasks.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "tasks is required".to_string()));
+    }
+    for t in &req.tasks {
+        if t.task_key.trim().is_empty() || t.prompt.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "every task needs a non-empty task_key and prompt".to_string(),
+            ));
+        }
+        // Same operator policy as the orchestrator MCP: worker missions never
+        // burn Claude tokens. Enforced here too so the API can't be used to
+        // bypass the MCP-level check.
+        let claude_allowed = std::env::var("SANDBOXED_SH_ALLOW_CLAUDE_WORKERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let is_claude = t.backend.eq_ignore_ascii_case("claudecode")
+            || t.model_override
+                .as_deref()
+                .map(|m| m.to_ascii_lowercase().contains("claude"))
+                .unwrap_or(false);
+        if t.backend.trim().is_empty() || (is_claude && !claude_allowed) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "task `{}`: workers need an explicit non-Claude backend (got `{}`)",
+                    t.task_key, t.backend
+                ),
+            ));
+        }
+    }
+
+    let control = control_for_user(&state, &user).await;
+    // The boss mission must exist — tasks attached to a typo'd uuid would
+    // never be scheduled against the right workspace.
+    let boss = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, format!("mission {} not found", id)))?;
+
+    control
+        .mission_store
+        .upsert_board_tasks(boss.id, req.tasks)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let tasks = control
+        .mission_store
+        .list_board_tasks(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
+    Ok(Json(BoardResponse {
+        utilization: board_utilization(&tasks, max_parallel),
+        tasks,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BoardVerdictRequest {
+    /// "accept" or "reject".
+    pub action: String,
+    /// Required for reject: feedback delivered to the worker.
+    #[serde(default)]
+    pub feedback: Option<String>,
+}
+
+/// POST /api/control/board/tasks/:task_id/verdict — boss judgment on a
+/// settled task. Accept is terminal; reject resumes the worker with feedback
+/// (or re-queues the task if the worker mission is gone).
+pub async fn board_task_verdict(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(task_id): Path<Uuid>,
+    Json(req): Json<BoardVerdictRequest>,
+) -> Result<Json<BoardTask>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut task = control
+        .mission_store
+        .get_board_task(task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
+
+    match req.action.as_str() {
+        "accept" => {
+            if task.status != BoardTaskStatus::Settled && task.status != BoardTaskStatus::Failed {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("task `{}` is {}, not settled", task.task_key, task.status),
+                ));
+            }
+            task.status = BoardTaskStatus::Accepted;
+        }
+        "reject" => {
+            let feedback = req
+                .feedback
+                .as_deref()
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "reject requires non-empty feedback".to_string(),
+                ))?;
+            if task.status.is_terminal() && task.status != BoardTaskStatus::Failed {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("task `{}` is already {}", task.task_key, task.status),
+                ));
+            }
+            task.notes = {
+                let stamp = now_string();
+                Some(match &task.notes {
+                    Some(n) => format!("{n}\n[{stamp}] rejected: {feedback}"),
+                    None => format!("[{stamp}] rejected: {feedback}"),
+                })
+            };
+            // Prefer resuming the existing worker (it has the context); fall
+            // back to a fresh spawn via the scheduler when the worker is gone.
+            let resumed = if let Some(worker_id) = task.worker_mission_id {
+                let (tx, _rx) = oneshot::channel();
+                control
+                    .cmd_tx
+                    .send(ControlCommand::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: format!(
+                            "[task-board] The boss rejected your result for task `{}`. \
+                             Address this feedback, then end your turn with the same \
+                             done/BLOCKED contract as before:\n\n{}",
+                            task.task_key, feedback
+                        ),
+                        agent: None,
+                        target_mission_id: Some(worker_id),
+                        respond: tx,
+                    })
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            if resumed {
+                task.status = BoardTaskStatus::Running;
+                // A rejection grants a fresh retry budget: the boss explicitly
+                // asked for another attempt.
+                task.attempts = 1;
+            } else {
+                task.status = BoardTaskStatus::Pending;
+                task.attempts = 0;
+                task.worker_mission_id = None;
+                task.prompt = format!(
+                    "{}\n\n[task-board] Previous attempt was rejected with feedback:\n{}",
+                    task.prompt, feedback
+                );
+            }
+            task.outcome = None;
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown action `{}` (use accept|reject)", other),
+            ));
+        }
+    }
+
+    control
+        .mission_store
+        .save_board_task(&task)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(task))
+}
+
+/// POST /api/control/board/tasks/:task_id/cancel — mark a task cancelled.
+/// A running worker is left to finish its current turn; its settle is ignored.
+pub async fn cancel_board_task(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<BoardTask>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut task = control
+        .mission_store
+        .get_board_task(task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
+    if task.status.is_terminal() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("task `{}` is already {}", task.task_key, task.status),
+        ));
+    }
+    task.status = BoardTaskStatus::Cancelled;
+    task.notes = {
+        let stamp = now_string();
+        Some(match &task.notes {
+            Some(n) => format!("{n}\n[{stamp}] cancelled"),
+            None => format!("[{stamp}] cancelled"),
+        })
+    };
+    control
+        .mission_store
+        .save_board_task(&task)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(task))
+}
+
 /// Submit a frontend tool result to resume the running agent.
 pub async fn post_tool_result(
     State(state): State<Arc<AppState>>,
@@ -6261,6 +6540,7 @@ fn spawn_control_session(
         cmd_rx,
         mission_cmd_rx,
         mission_cmd_tx,
+        state.cmd_tx.clone(),
         events_tx.clone(),
         events_rx,
         tool_hub.clone(),
@@ -8131,6 +8411,10 @@ async fn control_actor_loop(
     mut cmd_rx: mpsc::Receiver<ControlCommand>,
     mut mission_cmd_rx: mpsc::Receiver<crate::tools::mission::MissionControlCommand>,
     mission_cmd_tx: mpsc::Sender<crate::tools::mission::MissionControlCommand>,
+    // Clone of the actor's own command sender, used by the task-board
+    // scheduler to spawn workers and deliver digests through the normal
+    // message-routing path (always try_send, never await — see board.rs).
+    self_cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut events_rx: broadcast::Receiver<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
@@ -8185,6 +8469,12 @@ async fn control_actor_loop(
         Uuid,
         super::mission_runner::MissionRunner,
     > = std::collections::HashMap::new();
+
+    // Task-board scheduler cadence: the 100ms tick is far too hot for store
+    // scans, so passes run every few seconds (and a settle triggers work via
+    // the digest message rather than a faster pass).
+    const BOARD_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    let mut last_board_pass = tokio::time::Instant::now();
 
     // Helper to extract file paths from text (for mission summaries)
     fn extract_file_paths(text: &str) -> Vec<String> {
@@ -10763,6 +11053,18 @@ async fn control_actor_loop(
                                         "parallel turn finished with no follow-up queued",
                                     )
                                     .await;
+                                    // Task-board settle hook: if this mission is a
+                                    // board worker, persist the outcome and notify
+                                    // the boss. No-op otherwise.
+                                    board::on_worker_settled(
+                                        &mission_store,
+                                        &self_cmd_tx,
+                                        *mission_id,
+                                        &result.output,
+                                        result.terminal_reason,
+                                        result.success,
+                                    )
+                                    .await;
                                     completed_missions.push(*mission_id);
                                 }
                             }
@@ -10780,6 +11082,31 @@ async fn control_actor_loop(
                     )
                     .await;
                     tracing::info!("Parallel mission {} removed from runners", mid);
+                }
+
+                // Task-board scheduler: spawn workers for ready tasks and
+                // sweep zombies. Throttled — store scans on every 100ms tick
+                // would hammer sqlite for nothing.
+                if last_board_pass.elapsed() >= BOARD_PASS_INTERVAL {
+                    last_board_pass = tokio::time::Instant::now();
+                    let snapshot = board::RunnerSnapshot {
+                        present: parallel_runners.keys().copied().collect(),
+                        running_count: parallel_runners
+                            .values()
+                            .filter(|r| r.is_running())
+                            .count(),
+                        main_running: running.is_some(),
+                    };
+                    let max_parallel = crate::settings::max_parallel_missions_cached_or(
+                        config.max_parallel_missions,
+                    );
+                    board::scheduler_pass(
+                        &mission_store,
+                        &self_cmd_tx,
+                        &snapshot,
+                        max_parallel,
+                    )
+                    .await;
                 }
             }
             // Force-reap a runner whose cancel was fired but whose

@@ -695,6 +695,22 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .route("/api/control/missions/:id", get(control::get_mission))
         .route(
+            "/api/control/missions/:id/board",
+            get(control::get_mission_board),
+        )
+        .route(
+            "/api/control/missions/:id/board/tasks",
+            post(control::upsert_mission_board_tasks),
+        )
+        .route(
+            "/api/control/board/tasks/:task_id/verdict",
+            post(control::board_task_verdict),
+        )
+        .route(
+            "/api/control/board/tasks/:task_id/cancel",
+            post(control::cancel_board_task),
+        )
+        .route(
             "/api/control/missions/:id/tree",
             get(control::get_mission_tree),
         )
