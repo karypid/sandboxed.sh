@@ -32,6 +32,7 @@ import {
 } from "@/lib/stream-continuation";
 import {
   eventsToItemsImpl,
+  extractMissionState,
   isRecord,
   parseCostMetadata,
   type ChatItem,
@@ -3014,6 +3015,9 @@ export default function ControlClient() {
   const showPerfOverlay = searchParams.get("debug") === "perf";
 
   const [items, setItems] = useControlItemsStore();
+  // Agent task board + next-wakeup marker for the Workbench panel, derived
+  // from the same chat items the transcript renders (single source of truth).
+  const workbenchMissionState = useMemo(() => extractMissionState(items), [items]);
   const itemsRef = useRef<ChatItem[]>([]);
   const [input, setInput] = useState(() => loadControlDraftForMission(null));
   const [canSubmitInput, setCanSubmitInput] = useState(false);
@@ -10232,6 +10236,7 @@ export default function ControlClient() {
                   isRunning={viewingMissionIsRunning}
                   childMissions={childMissions}
                   queueLen={viewingQueueLen}
+                  missionState={workbenchMissionState}
                   onClose={() => setShowWorkbenchPanel(false)}
                   onResume={handleResumeMission}
                   onCancel={handleCancelMission}

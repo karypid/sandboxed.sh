@@ -627,3 +627,76 @@ export function eventsToItemsImpl(
 
   return items;
 }
+
+// ── Mission state extraction (Workbench panel) ──────────────────────
+
+export type PlanItem = {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+};
+
+export type MissionStateSummary = {
+  /** Latest task-board snapshot from the harness's native plan tool. */
+  plan: { items: PlanItem[]; timestamp: number } | null;
+  /** Latest self-scheduled wakeup: what the agent said it will do next. */
+  upNext: { reason: string; delaySeconds: number | null; timestamp: number } | null;
+};
+
+function normalizePlanStatus(raw: unknown): PlanItem["status"] {
+  if (raw === "completed" || raw === "in_progress" || raw === "pending") return raw;
+  if (raw === "done" || raw === "complete") return "completed";
+  return "pending";
+}
+
+/**
+ * Derive the agent's task board and "up next" marker from already-rendered
+ * chat items. Reads the harness's own plan tools (Claude Code `TodoWrite`,
+ * Codex `update_plan`, OpenCode `todowrite`) and the last `ScheduleWakeup`
+ * call — no new agent behavior or events required, so it stays truthful.
+ */
+export function extractMissionState(items: ChatItem[]): MissionStateSummary {
+  let plan: MissionStateSummary["plan"] = null;
+  let upNext: MissionStateSummary["upNext"] = null;
+  for (const item of items) {
+    if (item.kind !== "tool" || !isRecord(item.args)) continue;
+    const name = item.name;
+    if (name === "TodoWrite" || name === "todowrite" || name === "update_plan") {
+      const raw = (item.args as Record<string, unknown>)["todos"] ??
+        (item.args as Record<string, unknown>)["plan"];
+      if (Array.isArray(raw)) {
+        const parsed: PlanItem[] = [];
+        for (const entry of raw) {
+          if (!isRecord(entry)) continue;
+          const content =
+            typeof entry["content"] === "string"
+              ? entry["content"]
+              : typeof entry["step"] === "string"
+                ? entry["step"]
+                : null;
+          if (!content) continue;
+          parsed.push({ content, status: normalizePlanStatus(entry["status"]) });
+        }
+        if (parsed.length > 0) {
+          plan = { items: parsed, timestamp: item.startTime };
+        }
+      }
+    } else if (name === "ScheduleWakeup") {
+      const args = item.args as Record<string, unknown>;
+      const reason =
+        typeof args["reason"] === "string" && args["reason"].trim()
+          ? args["reason"]
+          : typeof args["prompt"] === "string"
+            ? args["prompt"]
+            : "";
+      if (reason) {
+        upNext = {
+          reason,
+          delaySeconds:
+            typeof args["delaySeconds"] === "number" ? args["delaySeconds"] : null,
+          timestamp: item.startTime,
+        };
+      }
+    }
+  }
+  return { plan, upNext };
+}
