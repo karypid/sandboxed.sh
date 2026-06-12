@@ -1195,15 +1195,30 @@ pub fn run_claudecode_turn<'a>(
             if let Err(e) = pty.set_raw_input_mode() {
                 tracing::warn!(mission_id = %mission_id, "Failed to set PTY raw input mode: {e}");
             }
+            let mut initial_prompt_delivered = false;
             if let Some(w) = stdin_writer.as_mut() {
                 let init = serde_json::json!({
                     "type": "user",
                     "message": { "role": "user", "content": [{ "type": "text", "text": effective_message }] }
                 });
                 use std::io::Write as _;
-                if let Err(e) = writeln!(w, "{}", init).and_then(|_| w.flush()) {
-                    tracing::error!(mission_id = %mission_id, "Failed to write initial stream-json prompt: {e}");
+                match writeln!(w, "{}", init).and_then(|_| w.flush()) {
+                    Ok(()) => initial_prompt_delivered = true,
+                    Err(e) => tracing::error!(
+                        mission_id = %mission_id,
+                        "Failed to write initial stream-json prompt: {e}"
+                    ),
                 }
+            }
+            if !initial_prompt_delivered {
+                // Without the prompt the CLI would idle on an empty session —
+                // a silent no-op turn. Fail loudly instead.
+                pty.kill();
+                return AgentResult::failure(
+                    "Stream-input mode could not deliver the initial prompt over stdin".to_string(),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::LlmError);
             }
         }
         // Poll cadence for mid-turn operator-note injection (stream-input mode).
@@ -1569,9 +1584,28 @@ pub fn run_claudecode_turn<'a>(
                                         mission_id: Some(mission_id),
                                     });
                                 } else {
+                                    // take_pending_operator_notes already marked them
+                                    // flushed — re-enqueue so they deliver at the next
+                                    // poll or the next turn-prep instead of being lost.
+                                    for note in &notes {
+                                        if let Err(e) = store
+                                            .enqueue_operator_note(
+                                                mission_id,
+                                                &note.body,
+                                                note.source_thread_id,
+                                            )
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                mission_id = %mission_id,
+                                                "Failed to re-enqueue operator note after injection failure: {e}"
+                                            );
+                                        }
+                                    }
                                     tracing::warn!(
                                         mission_id = %mission_id,
-                                        "Mid-turn note injection failed; notes will not be re-queued this turn"
+                                        notes = notes.len(),
+                                        "Mid-turn note injection failed; notes re-enqueued for next delivery"
                                     );
                                 }
                             }
@@ -2242,7 +2276,11 @@ pub fn run_claudecode_turn<'a>(
         // wait and kill the leftover process tree on expiry.
         // In stream-input mode the CLI waits for more stdin after the result;
         // close it so the process exits instead of hitting the kill grace.
-        drop(stdin_writer.take());
+        // In argv mode the writer must stay open through the wait — closing
+        // stdin early can change CLI exit behavior (see spawn-site comment).
+        if stream_input {
+            drop(stdin_writer.take());
+        }
         const CLI_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
         let child_pid = pty.process_id();
         let mut wait_handle = tokio::task::spawn_blocking(move || {
