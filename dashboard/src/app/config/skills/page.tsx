@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect, useCallback } from 'react';
+import YAML from "yaml";
 import {
   getLibrarySkill,
   getSkillReference,
@@ -131,36 +132,26 @@ function parseFrontmatter(content: string): { frontmatter: Frontmatter; body: st
   const yamlStr = content.substring(4, endIndex);
   const body = content.substring(endIndex + 4).trimStart();
 
-  // Simple YAML parsing for key: value pairs
+  // Real YAML parsing: block scalars (`description: >`), quoted strings,
+  // and escapes must round-trip. A previous hand-rolled line parser read a
+  // block-scalar description as the literal string ">" and saving then
+  // destroyed the real description.
   const frontmatter: Frontmatter = {};
-  for (const line of yamlStr.split('\n')) {
-    const match = line.match(/^(\w+):\s*(.*)$/);
-    if (match) {
-      frontmatter[match[1]] = match[2].replace(/^["']|["']$/g, '');
+  try {
+    const parsed = YAML.parse(yamlStr);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (v === null || v === undefined) continue;
+        frontmatter[k] = typeof v === 'string' ? v : YAML.stringify(v).trimEnd();
+      }
     }
+  } catch {
+    // Unparseable frontmatter: surface it untouched in the body rather than
+    // silently dropping fields.
+    return { frontmatter: {}, body: content };
   }
 
   return { frontmatter, body };
-}
-
-// YAML special characters that require quoting
-const YAML_SPECIAL_CHARS = [':', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', "'", '"', '%', '@', '`'];
-
-/**
- * Format a YAML value, quoting if it contains special characters.
- * This prevents YAML parsing errors when descriptions contain colons (e.g., "Triggers: foo, bar").
- */
-function formatYamlValue(value: string): string {
-  // Check if value needs quoting
-  const needsQuoting = YAML_SPECIAL_CHARS.some(char => value.includes(char));
-  
-  if (needsQuoting) {
-    // Escape backslashes and double quotes, then wrap in quotes
-    const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    return `"${escaped}"`;
-  }
-  
-  return value;
 }
 
 function buildContent(frontmatter: Frontmatter, body: string): string {
@@ -169,8 +160,9 @@ function buildContent(frontmatter: Frontmatter, body: string): string {
     return body;
   }
 
-  // Quote values that contain YAML special characters
-  const yaml = entries.map(([k, v]) => `${k}: ${formatYamlValue(v!)}`).join('\n');
+  // Serialize through the YAML library so quoting/escaping is always valid
+  // and round-trips with parseFrontmatter.
+  const yaml = YAML.stringify(Object.fromEntries(entries), { lineWidth: 0 }).trimEnd();
   return `---\n${yaml}\n---\n\n${body}`;
 }
 
@@ -285,9 +277,6 @@ function FrontmatterEditor({ frontmatter, onChange, disabled }: FrontmatterEdito
     onChange({ ...frontmatter, [key]: value || undefined });
   };
 
-  // Check if description contains special YAML characters
-  const descriptionHasSpecialChars = frontmatter.description && 
-    YAML_SPECIAL_CHARS.some(char => frontmatter.description?.includes(char));
 
   return (
     <div className="space-y-3 p-3 rounded-lg bg-white/[0.02] border border-white/[0.06]">
@@ -304,12 +293,6 @@ function FrontmatterEditor({ frontmatter, onChange, disabled }: FrontmatterEdito
             className="w-full px-3 py-1.5 text-xs rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50"
             disabled={disabled}
           />
-          {descriptionHasSpecialChars && (
-            <p className="text-xs text-blue-400/80 mt-1 flex items-center gap-1">
-              <Check className="h-3 w-3" />
-              Contains special characters. This will be auto-quoted for valid YAML
-            </p>
-          )}
         </div>
 
         <div className="grid grid-cols-2 gap-2">
