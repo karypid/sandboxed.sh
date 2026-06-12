@@ -8385,21 +8385,14 @@ async fn control_actor_loop(
 
                         // If no explicit target but current_mission differs from the
                         // running mission (i.e., CreateMission switched the pointer),
-                        // infer the target as current_mission so it auto-starts in parallel.
-                        let effective_target = target_mission_id.or_else(|| {
-                            if main_is_running {
-                                if let Some(cid) = current_mission_id {
-                                    if running_mid != Some(cid) {
-                                        tracing::info!(
-                                            "Inferred target mission {} (current differs from running {:?})",
-                                            cid, running_mid
-                                        );
-                                        return Some(cid);
-                                    }
-                                }
-                            }
-                            None
-                        });
+                        // No inference: a message without an explicit mission_id used to be
+                        // silently re-targeted to the actor's "current" mission when it
+                        // differed from the running one. In practice every legitimate caller
+                        // (dashboard, MCP) sends mission_id explicitly, and the fallback
+                        // mis-delivered API messages twice in one night (a worker diagnosis
+                        // and an oracle priming both landed in unrelated missions). Messages
+                        // without a target now follow the plain default-mission path.
+                        let effective_target = target_mission_id;
 
                         // Determine if target is already running somewhere
                         let target_in_parallel = effective_target
