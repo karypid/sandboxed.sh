@@ -893,6 +893,28 @@ impl OrchestratorMcp {
     }
 
     async fn create_worker(&self, params: CreateWorkerParams) -> Result<Value, String> {
+        // Worker model allowlist: Claude models are reserved for the boss and
+        // the oracle; spending them on workers defeats the budget the policy
+        // protects. Prompt-level policy proved insufficient (two violations in
+        // one campaign), so this is enforced here. Override with
+        // SANDBOXED_SH_ALLOW_CLAUDE_WORKERS=1 when the operator explicitly
+        // approves a Claude worker.
+        let claude_worker = params.backend.as_deref() == Some("claudecode")
+            || params
+                .model_override
+                .as_deref()
+                .map(|m| m.contains("claude"))
+                .unwrap_or(false);
+        let claude_allowed = std::env::var("SANDBOXED_SH_ALLOW_CLAUDE_WORKERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if claude_worker && !claude_allowed {
+            return Err(
+                "Refused: Claude models/backends are not allowed for worker missions                  (operator policy). Use opencode+builtin/smart, opencode+genius,                  codex+gpt-5.5, or grok instead. If the operator explicitly approved a                  Claude worker, set SANDBOXED_SH_ALLOW_CLAUDE_WORKERS=1."
+                    .to_string(),
+            );
+        }
+
         // Fail fast if working_directory points outside the boss's container
         // workspace mount: the worker container will not be able to see paths
         // outside the bind-mounted workspace root, so accepting the request
