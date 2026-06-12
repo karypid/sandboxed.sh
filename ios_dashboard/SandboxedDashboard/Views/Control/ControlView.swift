@@ -180,6 +180,10 @@ struct ControlView: View {
     /// such a flip rebuilds lazy geometry without a remount and can strand
     /// the viewport (Bugbot). A change remounts via the scroll view's .id.
     @State private var conversationUsesLazyLayout = false
+    /// Mission the lazy-layout decision was computed for, so revert paths
+    /// (which apply a different mission with scrollToBottom == false) still
+    /// get a correct decision instead of inheriting the attempted mission's.
+    @State private var lazyLayoutMissionId: String?
     @State private var isLoadingHistory = false  // Track when loading historical messages to prevent animated scroll
     @State private var pendingFocusedMessageId: String?
 
@@ -2161,8 +2165,15 @@ struct ControlView: View {
         restorePendingSends(for: mission.id)
         recomputeGroupedItems()
 
-        if scrollToBottom {
+        // Recompute the layout decision on fresh opens and whenever the
+        // applied mission differs from the one the flag was computed for
+        // (e.g. a failed-switch revert). In-place growth of the same
+        // mission (load earlier) deliberately never flips the structure.
+        if scrollToBottom || lazyLayoutMissionId != mission.id {
             conversationUsesLazyLayout = groupedItems.count > Self.lazyConversationThreshold
+            lazyLayoutMissionId = mission.id
+        }
+        if scrollToBottom {
             shouldScrollImmediately = true
             scrollToBottomTick += 1
         }
@@ -2308,8 +2319,15 @@ struct ControlView: View {
             recomputeGroupedItems()
         }
 
-        if scrollToBottom {
+        // Recompute the layout decision on fresh opens and whenever the
+        // applied mission differs from the one the flag was computed for
+        // (e.g. a failed-switch revert). In-place growth of the same
+        // mission (load earlier) deliberately never flips the structure.
+        if scrollToBottom || lazyLayoutMissionId != mission.id {
             conversationUsesLazyLayout = groupedItems.count > Self.lazyConversationThreshold
+            lazyLayoutMissionId = mission.id
+        }
+        if scrollToBottom {
             shouldScrollImmediately = true
             scrollToBottomTick += 1
         }
