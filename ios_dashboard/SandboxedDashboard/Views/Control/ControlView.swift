@@ -174,6 +174,12 @@ struct ControlView: View {
     /// after a failed mission switch) so the per-mission remount's rescue
     /// scroll doesn't stomp a deliberately preserved scroll position.
     @State private var preserveScrollOnNextAppear = false
+    /// Latched layout decision for the conversation stack. Decided only on
+    /// fresh-open applies (scrollToBottom == true) so the VStack/LazyVStack
+    /// structure can't silently flip mid-conversation as history grows —
+    /// such a flip rebuilds lazy geometry without a remount and can strand
+    /// the viewport (Bugbot). A change remounts via the scroll view's .id.
+    @State private var conversationUsesLazyLayout = false
     @State private var isLoadingHistory = false  // Track when loading historical messages to prevent animated scroll
     @State private var pendingFocusedMessageId: String?
 
@@ -1053,7 +1059,7 @@ struct ControlView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 ConditionallyLazyVStack(
-                    isLazy: groupedItems.count > Self.lazyConversationThreshold,
+                    isLazy: conversationUsesLazyLayout,
                     spacing: 20
                 ) {
                     // "Load earlier messages" button when history is truncated
@@ -1196,7 +1202,7 @@ struct ControlView: View {
         // rendering an unrecoverable blank conversation. A fresh mount also
         // re-arms `.defaultScrollAnchor(.bottom)` so each mission opens at
         // its latest message with no scroll chase.
-        .id(viewingMissionId ?? "global-conversation")
+        .id("\(viewingMissionId ?? "global-conversation")-lazy-\(conversationUsesLazyLayout)")
     }
 
     private var hasActiveStreamingItem: Bool {
@@ -2156,6 +2162,7 @@ struct ControlView: View {
         recomputeGroupedItems()
 
         if scrollToBottom {
+            conversationUsesLazyLayout = groupedItems.count > Self.lazyConversationThreshold
             shouldScrollImmediately = true
             scrollToBottomTick += 1
         }
@@ -2302,6 +2309,7 @@ struct ControlView: View {
         }
 
         if scrollToBottom {
+            conversationUsesLazyLayout = groupedItems.count > Self.lazyConversationThreshold
             shouldScrollImmediately = true
             scrollToBottomTick += 1
         }
