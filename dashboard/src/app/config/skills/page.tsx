@@ -146,9 +146,10 @@ function parseFrontmatter(content: string): { frontmatter: Frontmatter; body: st
       }
     }
   } catch {
-    // Unparseable frontmatter: surface it untouched in the body rather than
-    // silently dropping fields.
-    return { frontmatter: {}, body: content };
+    // Unparseable frontmatter: drop the (rare, machine-written) bad block and
+    // keep the post-delimiter body. Returning the whole file as body would
+    // duplicate the --- block once any field is added and re-saved.
+    return { frontmatter: {}, body };
   }
 
   return { frontmatter, body };
@@ -285,12 +286,12 @@ function FrontmatterEditor({ frontmatter, onChange, disabled }: FrontmatterEdito
       <div className="space-y-2">
         <div>
           <label className="block text-xs text-white/40 mb-1">Description *</label>
-          <input
-            type="text"
+          <textarea
+            rows={2}
             value={frontmatter.description || ''}
             onChange={(e) => updateField('description', e.target.value)}
             placeholder="Brief description of what this skill does"
-            className="w-full px-3 py-1.5 text-xs rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50"
+            className="w-full resize-y px-3 py-1.5 text-xs rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50"
             disabled={disabled}
           />
         </div>
