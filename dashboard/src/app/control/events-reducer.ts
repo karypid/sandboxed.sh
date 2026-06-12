@@ -627,3 +627,101 @@ export function eventsToItemsImpl(
 
   return items;
 }
+
+// ── Mission state extraction (Workbench panel) ──────────────────────
+
+export type PlanItem = {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+};
+
+export type MissionStateSummary = {
+  /** Latest task-board snapshot from the harness's native plan tool. */
+  plan: { items: PlanItem[]; timestamp: number } | null;
+  /** Latest self-scheduled wakeup: what the agent said it will do next. */
+  upNext: { reason: string; delaySeconds: number | null; timestamp: number } | null;
+};
+
+function normalizePlanStatus(raw: unknown): PlanItem["status"] {
+  if (raw === "completed" || raw === "in_progress" || raw === "pending") return raw;
+  if (raw === "done" || raw === "complete") return "completed";
+  return "pending";
+}
+
+/**
+ * Derive the agent's task board and "up next" marker from already-rendered
+ * chat items. Reads the harness's own plan tools (Claude Code `TodoWrite`,
+ * Codex `update_plan`, OpenCode `todowrite`) and the last `ScheduleWakeup`
+ * call — no new agent behavior or events required, so it stays truthful.
+ */
+export function extractMissionState(items: ChatItem[]): MissionStateSummary {
+  let plan: MissionStateSummary["plan"] = null;
+  let upNext: MissionStateSummary["upNext"] = null;
+  // Lazily-loaded history stubs carry no args; if a stub for one of these
+  // tools is NEWER than the last parsed snapshot, the parsed one is stale —
+  // drop it rather than present outdated state as current.
+  let stalePlanAfter = 0;
+  let staleUpNextAfter = 0;
+  for (const item of items) {
+    if (item.kind !== "tool") continue;
+    const name = item.name;
+    if (!isRecord(item.args)) {
+      if (name === "TodoWrite" || name === "todowrite" || name === "update_plan") {
+        stalePlanAfter = Math.max(stalePlanAfter, item.startTime);
+      } else if (name === "ScheduleWakeup") {
+        staleUpNextAfter = Math.max(staleUpNextAfter, item.startTime);
+      }
+      continue;
+    }
+    if (name === "TodoWrite" || name === "todowrite" || name === "update_plan") {
+      const raw = (item.args as Record<string, unknown>)["todos"] ??
+        (item.args as Record<string, unknown>)["plan"];
+      if (Array.isArray(raw)) {
+        const parsed: PlanItem[] = [];
+        for (const entry of raw) {
+          if (!isRecord(entry)) continue;
+          const content =
+            typeof entry["content"] === "string"
+              ? entry["content"]
+              : typeof entry["step"] === "string"
+                ? entry["step"]
+                : null;
+          if (!content) continue;
+          parsed.push({ content, status: normalizePlanStatus(entry["status"]) });
+        }
+        // An empty/unparseable board still supersedes the previous one —
+        // keeping the old snapshot would present stale state as current.
+        plan = parsed.length > 0 ? { items: parsed, timestamp: item.startTime } : null;
+      }
+    } else if (name === "ScheduleWakeup") {
+      const args = item.args as Record<string, unknown>;
+      const reason =
+        typeof args["reason"] === "string" && args["reason"].trim()
+          ? args["reason"]
+          : typeof args["prompt"] === "string"
+            ? args["prompt"]
+            : "";
+      // A wakeup without usable text still replaces (clears) the previous
+      // marker — the old "up next" is no longer what happens next.
+      if (!reason) {
+        upNext = null;
+        continue;
+      }
+      {
+        upNext = {
+          reason,
+          delaySeconds:
+            typeof args["delaySeconds"] === "number"
+              ? args["delaySeconds"]
+              : typeof args["delay_seconds"] === "number"
+                ? args["delay_seconds"]
+                : null,
+          timestamp: item.startTime,
+        };
+      }
+    }
+  }
+  if (plan && stalePlanAfter > plan.timestamp) plan = null;
+  if (upNext && staleUpNextAfter > upNext.timestamp) upNext = null;
+  return { plan, upNext };
+}
