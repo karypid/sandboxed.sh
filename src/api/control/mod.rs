@@ -8391,8 +8391,32 @@ async fn control_actor_loop(
                         // (dashboard, MCP) sends mission_id explicitly, and the fallback
                         // mis-delivered API messages twice in one night (a worker diagnosis
                         // and an oracle priming both landed in unrelated missions). Messages
-                        // without a target now follow the plain default-mission path.
+                        // without a target now follow the plain default-mission path —
+                        // and when even that is ambiguous (a runner busy on one mission
+                        // while the session pointer is on another), the message is
+                        // DROPPED LOUDLY instead of delivered somewhere surprising.
                         let effective_target = target_mission_id;
+                        if effective_target.is_none() && main_is_running {
+                            if let Some(cid) = current_mission_id {
+                                if running_mid != Some(cid) {
+                                    tracing::warn!(
+                                        running = ?running_mid,
+                                        current = %cid,
+                                        "Untargeted message rejected: ambiguous target; pass mission_id explicitly"
+                                    );
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: format!(
+                                            "Untargeted message rejected: running mission {:?} differs from current {}; pass mission_id explicitly",
+                                            running_mid, cid
+                                        ),
+                                        mission_id: Some(cid),
+                                        resumable: false,
+                                    });
+                                    let _ = respond.send(UserMessageAck::Dropped);
+                                    continue;
+                                }
+                            }
+                        }
 
                         // Determine if target is already running somewhere
                         let target_in_parallel = effective_target
