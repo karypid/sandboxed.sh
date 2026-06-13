@@ -159,6 +159,12 @@ pub struct ProvidersQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvidersResponse {
     pub providers: Vec<Provider>,
+    /// Provider ids that currently have working credentials for this account.
+    /// When `include_all` is set the `providers` list also contains
+    /// unconfigured catalog providers (so chains can be pre-built); clients use
+    /// this set to mark which are actually connected.
+    #[serde(default)]
+    pub configured_ids: Vec<String>,
 }
 
 /// Model option for a specific backend.
@@ -1404,7 +1410,10 @@ pub async fn list_providers(
     let store_providers = state.ai_providers.list().await;
     merge_store_provider_models(&mut providers, &store_providers, query.include_all);
 
-    Json(ProvidersResponse { providers })
+    Json(ProvidersResponse {
+        providers,
+        configured_ids: configured.into_iter().collect(),
+    })
 }
 
 /// Full catalog of every supported model across all providers — configured or

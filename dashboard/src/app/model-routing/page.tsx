@@ -183,10 +183,12 @@ function EntryEditor({
   entries,
   onChange,
   providers,
+  configuredProviderIds,
 }: {
   entries: ChainEntry[];
   onChange: (entries: ChainEntry[]) => void;
   providers: Provider[];
+  configuredProviderIds: Set<string> | null;
 }) {
   const addEntry = () => {
     onChange([...entries, { provider_id: '', model_id: '' }]);
@@ -256,9 +258,18 @@ function EntryEditor({
               }}
             >
               <option value="" className="bg-[#1a1a1a]">Select provider</option>
-              {providers.map((p) => (
-                <option key={p.id} value={p.id} className="bg-[#1a1a1a]">{p.name}</option>
-              ))}
+              {providers.map((p) => {
+                // When the set is null (older backend without this info) we
+                // can't tell, so don't mark anything.
+                const connected =
+                  !configuredProviderIds || configuredProviderIds.has(p.id);
+                return (
+                  <option key={p.id} value={p.id} className="bg-[#1a1a1a]">
+                    {p.name}
+                    {connected ? "" : " — not connected"}
+                  </option>
+                );
+              })}
             </select>
             <span className="text-white/20">/</span>
             <ModelDropdown
@@ -347,12 +358,14 @@ function ChainCard({
   onDelete,
   onSetDefault,
   providers,
+  configuredProviderIds,
 }: {
   chain: ModelChain;
   onUpdate: (id: string, data: { name?: string; entries?: ChainEntry[]; is_default?: boolean; strip_thinking?: boolean }) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
   onSetDefault: (id: string) => Promise<void>;
   providers: Provider[];
+  configuredProviderIds: Set<string> | null;
 }) {
   const [savingStrip, setSavingStrip] = useState(false);
 
@@ -489,7 +502,7 @@ function ChainCard({
                   className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
                 />
               </div>
-              <EntryEditor entries={editEntries} onChange={setEditEntries} providers={providers} />
+              <EntryEditor entries={editEntries} onChange={setEditEntries} providers={providers} configuredProviderIds={configuredProviderIds} />
               <div className="flex items-center justify-end gap-2 pt-1">
                 <button
                   onClick={() => setEditing(false)}
@@ -719,6 +732,19 @@ export default function ModelRoutingPage() {
   );
   const providers = useMemo(
     () => providersData?.providers ?? [],
+    [providersData]
+  );
+  // Providers with working credentials. With includeAll the list above also
+  // contains unconfigured catalog providers (e.g. Google when never connected),
+  // so the chain editor marks the rest as "not connected" rather than implying
+  // they're ready to use.
+  // null when the backend didn't report it (older build) — in that case we
+  // don't mark anything, to avoid labelling connected providers as not.
+  const configuredProviderIds = useMemo(
+    () =>
+      providersData?.configured_ids
+        ? new Set(providersData.configured_ids)
+        : null,
     [providersData]
   );
 
@@ -1034,6 +1060,7 @@ export default function ModelRoutingPage() {
                   setCreateForm({ ...createForm, entries })
                 }
                 providers={providers}
+                configuredProviderIds={configuredProviderIds}
               />
               <div className="flex items-center justify-between pt-1">
                 <div className="flex items-center gap-4">
@@ -1107,6 +1134,7 @@ export default function ModelRoutingPage() {
                   onDelete={handleDelete}
                   onSetDefault={handleSetDefault}
                   providers={providers}
+                  configuredProviderIds={configuredProviderIds}
                 />
               ))
             )}

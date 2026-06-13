@@ -136,6 +136,10 @@ export interface Provider {
 
 export interface ProvidersResponse {
   providers: Provider[];
+  /** Provider ids with working credentials. When `includeAll` is set, the
+   * `providers` list also includes unconfigured catalog providers; use this to
+   * tell which are actually connected. */
+  configured_ids?: string[];
 }
 
 /** A model in the full supported-models catalog (`/api/providers/catalog`). */
