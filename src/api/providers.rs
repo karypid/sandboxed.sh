@@ -1263,6 +1263,46 @@ pub async fn fetch_model_catalog(
         }));
     }
 
+    // Custom providers (self-hosted OpenAI-compatible routers, e.g. the
+    // dgx-spark-router) expose /v1/models. Fetch their live model list so the
+    // catalog reflects what the router actually serves instead of the
+    // operator's hardcoded `custom_models`, which drift out of date.
+    for provider in &providers_list {
+        if provider.provider_type != ProviderType::Custom || !provider.enabled {
+            continue;
+        }
+        let Some(base_url) = provider.base_url.clone().filter(|u| !u.trim().is_empty()) else {
+            continue;
+        };
+        let provider_id = sanitize_custom_provider_id(&provider.name);
+        // /v1/models is usually unauthenticated on these routers; send the key
+        // when present, empty otherwise.
+        let api_key = provider.api_key.clone().unwrap_or_default();
+        handles.push(tokio::spawn(async move {
+            match fetch_openai_compatible_models(&base_url, &api_key, &[]).await {
+                Ok(models) if !models.is_empty() => {
+                    tracing::info!(
+                        "Fetched {} models from custom provider {} ({})",
+                        models.len(),
+                        provider_id,
+                        base_url
+                    );
+                    Some((provider_id, models))
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to fetch custom provider {} models from {}: {}",
+                        provider_id,
+                        base_url,
+                        e
+                    );
+                    None
+                }
+            }
+        }));
+    }
+
     if let Ok(Some(public_catalog)) = models_dev_handle.await {
         for (provider_id, entries) in public_catalog {
             merge_catalog_entries(&mut result, &provider_id, entries);
@@ -1391,7 +1431,6 @@ pub async fn list_providers(
     // the defaults would hide valid choices such as newly released Claude Opus.
     let cached = state.model_catalog.read().await;
     merge_cached_provider_models(&mut config, &cached, query.include_unverified);
-    drop(cached);
 
     // Get the set of configured provider IDs
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
@@ -1409,6 +1448,33 @@ pub async fn list_providers(
 
     let store_providers = state.ai_providers.list().await;
     merge_store_provider_models(&mut providers, &store_providers, query.include_all);
+
+    // For custom providers (self-hosted OpenAI-compatible routers like the
+    // dgx-spark-router), the live model list fetched from /v1/models is the
+    // source of truth — replace the operator's hardcoded `custom_models` so
+    // stale entries don't linger. Built-in providers keep MERGE semantics
+    // (handled above) so subscription probes can't hide valid defaults.
+    let custom_provider_ids: HashSet<String> = store_providers
+        .iter()
+        .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
+        .map(|p| sanitize_custom_provider_id(&p.name))
+        .collect();
+    for provider in &mut providers {
+        if !custom_provider_ids.contains(&provider.id) {
+            continue;
+        }
+        if let Some(entries) = cached.get(&provider.id) {
+            let live: Vec<ProviderModel> = entries
+                .iter()
+                .filter(|e| query.include_unverified || e.is_selectable_by_default())
+                .map(CatalogEntry::to_provider_model)
+                .collect();
+            if !live.is_empty() {
+                provider.models = live;
+            }
+        }
+    }
+    drop(cached);
 
     Json(ProvidersResponse {
         providers,
