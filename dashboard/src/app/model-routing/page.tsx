@@ -26,7 +26,9 @@ import {
 } from '@/lib/api/proxy-keys';
 import {
   listProviders,
+  getModelCatalog,
   type Provider,
+  type CatalogModel,
 } from '@/lib/api/providers';
 import { getRuntimeApiBase } from '@/lib/settings';
 import {
@@ -51,6 +53,8 @@ import {
   Pencil,
   Sparkles,
   Eraser,
+  Library,
+  Search,
 } from 'lucide-react';
 import { cn, formatRelativeTime } from '@/lib/utils';
 
@@ -815,6 +819,34 @@ export default function ModelRoutingPage() {
     }
   };
 
+  // ── Supported models catalog (lazy: only fetched once expanded) ──
+  const [catalogOpen, setCatalogOpen] = useState(false);
+  const [catalogQuery, setCatalogQuery] = useState('');
+  const { data: catalog, isLoading: catalogLoading } = useSWR(
+    catalogOpen ? 'model-catalog' : null,
+    getModelCatalog,
+    { revalidateOnFocus: false },
+  );
+  const catalogByProvider = useMemo(() => {
+    const models = catalog?.models ?? [];
+    const q = catalogQuery.trim().toLowerCase();
+    const filtered = q
+      ? models.filter(
+          (m) =>
+            m.value.toLowerCase().includes(q) ||
+            m.name.toLowerCase().includes(q) ||
+            m.provider_name.toLowerCase().includes(q),
+        )
+      : models;
+    const groups = new Map<string, { name: string; models: CatalogModel[] }>();
+    for (const m of filtered) {
+      const g = groups.get(m.provider_id) ?? { name: m.provider_name, models: [] };
+      g.models.push(m);
+      groups.set(m.provider_id, g);
+    }
+    return Array.from(groups.entries()).sort((a, b) => a[1].name.localeCompare(b[1].name));
+  }, [catalog, catalogQuery]);
+
   // ── Proxy API Keys ──
   const {
     data: apiKeys = [],
@@ -1407,6 +1439,101 @@ export default function ModelRoutingPage() {
                   </button>
                 </div>
               ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Supported Models Catalog (collapsible) ── */}
+        <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 mt-6">
+          <button
+            onClick={() => setCatalogOpen((v) => !v)}
+            className="flex w-full items-center justify-between cursor-pointer"
+          >
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10">
+                <Library className="h-5 w-5 text-indigo-400" />
+              </div>
+              <div className="text-left">
+                <h2 className="text-sm font-medium text-white">Supported Models</h2>
+                <p className="text-xs text-white/40">
+                  Every <span className="font-mono">provider/model</span> id the router accepts —
+                  usable directly, no chain required
+                  {catalog ? ` · ${catalog.count} models` : ''}
+                </p>
+              </div>
+            </div>
+            {catalogOpen ? (
+              <ChevronDown className="h-4 w-4 text-white/40" />
+            ) : (
+              <ChevronRight className="h-4 w-4 text-white/40" />
+            )}
+          </button>
+
+          {catalogOpen && (
+            <div className="mt-4">
+              <div className="mb-3 flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-1.5">
+                <Search className="h-3.5 w-3.5 text-white/30 flex-shrink-0" />
+                <input
+                  value={catalogQuery}
+                  onChange={(e) => setCatalogQuery(e.target.value)}
+                  placeholder="Filter by model, provider, or id…"
+                  className="w-full bg-transparent text-xs text-white/80 placeholder:text-white/30 focus:outline-none"
+                />
+              </div>
+
+              {catalogLoading ? (
+                <div className="flex items-center justify-center py-6">
+                  <Loader className="h-4 w-4 animate-spin text-white/30" />
+                </div>
+              ) : catalogByProvider.length === 0 ? (
+                <p className="text-xs text-white/30 text-center py-4">
+                  {catalog ? 'No models match your filter.' : 'Failed to load catalog.'}
+                </p>
+              ) : (
+                <div className="space-y-4 max-h-[28rem] overflow-y-auto pr-1">
+                  {catalogByProvider.map(([providerId, group]) => (
+                    <div key={providerId}>
+                      <div className="mb-1.5 flex items-center gap-2">
+                        <span className="text-[10px] uppercase tracking-wider text-white/40">
+                          {group.name}
+                        </span>
+                        <span className="text-[10px] text-white/20 font-mono">{providerId}</span>
+                        <span className="text-[10px] text-white/20">{group.models.length}</span>
+                      </div>
+                      <div className="space-y-1">
+                        {group.models.map((m) => (
+                          <div
+                            key={m.value}
+                            className="group flex items-center gap-3 rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-1.5"
+                          >
+                            <span className="text-xs text-white/70 flex-shrink-0 w-40 truncate" title={m.name}>
+                              {m.name}
+                            </span>
+                            <code className="text-[11px] text-indigo-300/80 font-mono flex-1 min-w-0 truncate" title={m.value}>
+                              {m.value}
+                            </code>
+                            {!m.configured && (
+                              <span
+                                className="text-[10px] text-amber-400/70 flex-shrink-0"
+                                title="No credential configured for this provider yet"
+                              >
+                                no key
+                              </span>
+                            )}
+                            <button
+                              onClick={() => handleCopyKey(m.value)}
+                              className={`p-1.5 rounded-md transition-colors cursor-pointer flex-shrink-0 ${copiedText === m.value ? 'text-emerald-400' : 'text-white/20 hover:text-white/60 hover:bg-white/[0.04] opacity-0 group-hover:opacity-100'}`}
+                              title="Copy provider/model id"
+                            >
+                              {copiedText === m.value ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
