@@ -1419,6 +1419,40 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
 /// and descriptions. Only includes providers that are actually configured
 /// and authenticated. This endpoint is used by the frontend to render
 /// a grouped model selector.
+/// Replace each custom provider's operator-configured `custom_models` with the
+/// live model list fetched from its `/v1/models` (cached in `model_catalog`).
+/// Built-in providers are left untouched — they keep MERGE semantics so a
+/// subscription probe can't hide valid defaults. Custom providers (self-hosted
+/// OpenAI-compatible routers like the dgx-spark-router) instead treat the
+/// router's reported models as the source of truth.
+fn apply_live_custom_provider_models(
+    providers: &mut [Provider],
+    store_providers: &[crate::ai_providers::AIProvider],
+    cached: &HashMap<String, Vec<CatalogEntry>>,
+    include_unverified: bool,
+) {
+    let custom_provider_ids: HashSet<String> = store_providers
+        .iter()
+        .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
+        .map(|p| sanitize_custom_provider_id(&p.name))
+        .collect();
+    for provider in providers.iter_mut() {
+        if !custom_provider_ids.contains(&provider.id) {
+            continue;
+        }
+        if let Some(entries) = cached.get(&provider.id) {
+            let live: Vec<ProviderModel> = entries
+                .iter()
+                .filter(|e| include_unverified || e.is_selectable_by_default())
+                .map(CatalogEntry::to_provider_model)
+                .collect();
+            if !live.is_empty() {
+                provider.models = live;
+            }
+        }
+    }
+}
+
 pub async fn list_providers(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ProvidersQuery>,
@@ -1449,31 +1483,12 @@ pub async fn list_providers(
     let store_providers = state.ai_providers.list().await;
     merge_store_provider_models(&mut providers, &store_providers, query.include_all);
 
-    // For custom providers (self-hosted OpenAI-compatible routers like the
-    // dgx-spark-router), the live model list fetched from /v1/models is the
-    // source of truth — replace the operator's hardcoded `custom_models` so
-    // stale entries don't linger. Built-in providers keep MERGE semantics
-    // (handled above) so subscription probes can't hide valid defaults.
-    let custom_provider_ids: HashSet<String> = store_providers
-        .iter()
-        .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
-        .map(|p| sanitize_custom_provider_id(&p.name))
-        .collect();
-    for provider in &mut providers {
-        if !custom_provider_ids.contains(&provider.id) {
-            continue;
-        }
-        if let Some(entries) = cached.get(&provider.id) {
-            let live: Vec<ProviderModel> = entries
-                .iter()
-                .filter(|e| query.include_unverified || e.is_selectable_by_default())
-                .map(CatalogEntry::to_provider_model)
-                .collect();
-            if !live.is_empty() {
-                provider.models = live;
-            }
-        }
-    }
+    apply_live_custom_provider_models(
+        &mut providers,
+        &store_providers,
+        &cached,
+        query.include_unverified,
+    );
     drop(cached);
 
     Json(ProvidersResponse {
@@ -1499,13 +1514,14 @@ pub async fn list_full_model_catalog(
     // models and providers that aren't configured yet.
     let cached = state.model_catalog.read().await;
     merge_cached_provider_models(&mut config, &cached, true);
-    drop(cached);
 
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
 
     let mut providers = config.providers;
     let store_providers = state.ai_providers.list().await;
     merge_store_provider_models(&mut providers, &store_providers, true);
+    apply_live_custom_provider_models(&mut providers, &store_providers, &cached, true);
+    drop(cached);
 
     let mut models = Vec::new();
     for provider in &providers {
