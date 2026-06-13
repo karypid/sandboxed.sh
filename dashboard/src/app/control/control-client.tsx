@@ -1175,6 +1175,48 @@ function QuestionToolItem({
     }
   };
 
+  // An already-answered question that came back as a lazy history stub carries
+  // no args (the question text wasn't loaded), so `parseQuestionArgs` is empty.
+  // Without this guard it would render the misleading "reply below to continue"
+  // input for a question the user already answered. Show a compact answered
+  // state instead — the live, unanswered empty-args case still falls through to
+  // the input fallback below.
+  const answeredStub = isFallback && (hasResult || item.hasResult === true);
+  if (answeredStub) {
+    const answerText = (() => {
+      const r = item.result;
+      if (isRecord(r) && Array.isArray(r["answers"])) {
+        const flat = (r["answers"] as unknown[])
+          .flat()
+          .filter((a): a is string => typeof a === "string");
+        if (flat.length > 0) return flat.join(", ");
+      }
+      return null;
+    })();
+    return (
+      <div
+        id={`chat-item-${item.id}`}
+        data-chat-item-id={item.id}
+        className="flex justify-start gap-3"
+      >
+        <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+          <Bot className="h-4 w-4 text-indigo-400" />
+        </div>
+        <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+          <div className="text-xs text-white/40">
+            Tool: <span className="font-mono text-indigo-400">question</span>
+            <span className="ml-2 text-emerald-400/80">answered</span>
+          </div>
+          {answerText && (
+            <div className="mt-1 text-sm text-white/70">
+              Your answer: <span className="text-white/90">{answerText}</span>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       id={`chat-item-${item.id}`}

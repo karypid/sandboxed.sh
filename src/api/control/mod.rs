@@ -4788,6 +4788,13 @@ fn conversation_profile_enabled(profile: Option<&str>) -> bool {
     matches!(profile, Some("conversation"))
 }
 
+/// Interactive/frontend tools whose call args (the question payload) must
+/// survive history projection so the dashboard can render the item — even
+/// after it's answered. Mirrors the dashboard's `isUiTool` check.
+fn is_interactive_ui_tool(name: &str) -> bool {
+    name == "question" || name == "AskUserQuestion" || name.starts_with("ui_")
+}
+
 fn project_conversation_events(
     events: Vec<mission_store::StoredEvent>,
     keep_full_tool_call_ids: &HashSet<String>,
@@ -4838,6 +4845,19 @@ fn project_conversation_events(
             continue;
         };
         if keep_full_tool_call_ids.contains(&tool_call_id) {
+            projected.push(event);
+            continue;
+        }
+        // Interactive UI tools (question / AskUserQuestion / ui_*) carry the
+        // question payload the dashboard needs to render the item even after
+        // it's answered. Stubbing them drops the args, so an answered question
+        // would reload as an empty "reply below" prompt. Never stub them or
+        // their results, regardless of the recency window.
+        if event
+            .tool_name
+            .as_deref()
+            .is_some_and(is_interactive_ui_tool)
+        {
             projected.push(event);
             continue;
         }
@@ -14929,6 +14949,55 @@ mod tests {
             stub.metadata["call_content_bytes"],
             serde_json::json!("{\"cmd\":\"old\"}".len())
         );
+    }
+
+    #[test]
+    fn conversation_projection_keeps_interactive_ui_tools_full() {
+        // An old, answered AskUserQuestion must NOT be stubbed: the dashboard
+        // needs its args to render the question, otherwise it shows the
+        // misleading empty "reply below" prompt for an already-answered item.
+        let mission_id = Uuid::new_v4();
+        let mut call = stored_test_event(
+            mission_id,
+            1,
+            "tool_call",
+            Some("q-1"),
+            "{\"questions\":[{\"question\":\"Pick one\",\"options\":[]}]}",
+        );
+        call.tool_name = Some("AskUserQuestion".to_string());
+        let mut result = stored_test_event(
+            mission_id,
+            2,
+            "tool_result",
+            Some("q-1"),
+            "{\"answers\":[[\"A\"]]}",
+        );
+        result.tool_name = Some("AskUserQuestion".to_string());
+        // A newer ordinary tool pair that SHOULD still be stubbed.
+        let newer_call =
+            stored_test_event(mission_id, 3, "tool_call", Some("b-1"), "{\"cmd\":\"x\"}");
+        let newer_result =
+            stored_test_event(mission_id, 4, "tool_result", Some("b-1"), "{\"ok\":true}");
+
+        let projected = project_conversation_events(
+            vec![call, result, newer_call, newer_result],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+
+        // The question call + result survive intact.
+        let q_call = projected
+            .iter()
+            .find(|e| e.tool_call_id.as_deref() == Some("q-1") && e.event_type == "tool_call")
+            .expect("question tool_call kept full");
+        assert!(q_call.content.contains("Pick one"));
+        assert!(projected
+            .iter()
+            .any(|e| e.tool_call_id.as_deref() == Some("q-1") && e.event_type == "tool_result"));
+        // The ordinary newer pair is stubbed as usual.
+        assert!(projected
+            .iter()
+            .any(|e| e.tool_call_id.as_deref() == Some("b-1") && e.event_type == "tool_stub"));
     }
 
     #[test]
