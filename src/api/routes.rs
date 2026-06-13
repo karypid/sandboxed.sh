@@ -572,23 +572,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         });
     }
 
-    // Fetch model catalog from provider APIs in background
-    {
-        let catalog = Arc::clone(&state.model_catalog);
-        let ai_providers = Arc::clone(&state.ai_providers);
-        let working_dir = config.working_dir.clone();
-        tokio::spawn(async move {
-            let fetched = super::providers::fetch_model_catalog(&ai_providers, &working_dir).await;
-            let provider_count = fetched.len();
-            let model_count: usize = fetched.values().map(|v| v.len()).sum();
-            *catalog.write().await = fetched;
-            tracing::info!(
-                "Model catalog populated: {} models from {} providers",
-                model_count,
-                provider_count
-            );
-        });
-    }
+    // Keep the model catalog populated: initial fetch + periodic refresh so
+    // newly-added provider models appear without a backend restart.
+    super::providers::spawn_model_catalog_refresh(
+        Arc::clone(&state.model_catalog),
+        Arc::clone(&state.ai_providers),
+        config.working_dir.clone(),
+    );
 
     let public_routes = Router::new()
         .route("/api/health", get(health))
@@ -1037,6 +1027,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/providers/catalog",
             get(super::providers::list_full_model_catalog),
+        )
+        .route(
+            "/api/providers/catalog/refresh",
+            post(super::providers::refresh_model_catalog),
         )
         .route(
             "/api/monitoring/memory-health",

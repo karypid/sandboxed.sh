@@ -1127,6 +1127,85 @@ pub fn get_api_key_for_provider(
 ///
 /// Returns a map of provider ID -> fetched models. Providers that fail
 /// or lack credentials are simply omitted (hardcoded defaults will be used).
+/// Fetch the catalog once and replace the cached snapshot, returning
+/// `(provider_count, model_count)`.
+async fn refresh_catalog_once(
+    catalog: &ModelCatalog,
+    ai_providers: &AIProviderStore,
+    working_dir: &Path,
+) -> (usize, usize) {
+    let fetched = fetch_model_catalog(ai_providers, working_dir).await;
+    let provider_count = fetched.len();
+    let model_count: usize = fetched.values().map(|v| v.len()).sum();
+    *catalog.write().await = fetched;
+    (provider_count, model_count)
+}
+
+/// Spawn the background task that keeps the model catalog populated. Performs an
+/// initial fetch immediately, then refreshes on an interval so newly-added
+/// provider models (e.g. a custom router exposing a new model via `/v1/models`)
+/// appear without a backend restart.
+///
+/// The interval is controlled by `MODEL_CATALOG_REFRESH_SECS` (default 600s).
+/// Set it to `0` to disable periodic refresh and keep the startup-only snapshot.
+pub fn spawn_model_catalog_refresh(
+    catalog: ModelCatalog,
+    ai_providers: Arc<AIProviderStore>,
+    working_dir: std::path::PathBuf,
+) {
+    let refresh_secs = std::env::var("MODEL_CATALOG_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(600);
+
+    tokio::spawn(async move {
+        loop {
+            let (providers, models) =
+                refresh_catalog_once(&catalog, &ai_providers, &working_dir).await;
+            tracing::info!(
+                "Model catalog populated: {} models from {} providers (refresh every {}s)",
+                models,
+                providers,
+                refresh_secs
+            );
+
+            if refresh_secs == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
+        }
+    });
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefreshCatalogResponse {
+    pub refreshed: bool,
+    pub providers: usize,
+    pub models: usize,
+}
+
+/// Force an immediate refetch of the model catalog from all provider APIs and
+/// custom routers, replacing the cached snapshot. Useful right after adding a
+/// model to a custom provider's `/v1/models` without waiting for the periodic
+/// refresh.
+pub async fn refresh_model_catalog(
+    State(state): State<Arc<AppState>>,
+) -> Json<RefreshCatalogResponse> {
+    let working_dir = state.config.working_dir.clone();
+    let (providers, models) =
+        refresh_catalog_once(&state.model_catalog, &state.ai_providers, &working_dir).await;
+    tracing::info!(
+        "Model catalog manually refreshed: {} models from {} providers",
+        models,
+        providers
+    );
+    Json(RefreshCatalogResponse {
+        refreshed: true,
+        providers,
+        models,
+    })
+}
+
 pub async fn fetch_model_catalog(
     ai_providers: &AIProviderStore,
     _working_dir: &Path,
