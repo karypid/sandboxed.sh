@@ -385,6 +385,65 @@ fn parse_direct_model_entry(model: &str) -> Option<crate::provider_health::Chain
     })
 }
 
+/// Parse a direct `provider/model` id whose prefix is a **custom** provider
+/// referenced by its sanitized name (e.g. `spark/step3p7-flash-148b`) — the id
+/// the catalog and model-routing UI expose for self-hosted OpenAI-compatible
+/// routers. Built-in prefixes are handled by [`parse_direct_model_entry`]; this
+/// only matches when no built-in type owns the prefix.
+///
+/// Returns a synthetic entry only when a configured custom provider has that
+/// sanitized name **and** advertises the model — either in its stored
+/// `custom_models` or in its live `/v1/models` catalog (so models discovered
+/// after startup still route). Returning `None` for everything else keeps typos
+/// surfacing as `model_not_found` instead of a generic cooldown error.
+async fn parse_custom_direct_model_entry(
+    state: &super::routes::AppState,
+    model: &str,
+) -> Option<crate::provider_health::ChainEntry> {
+    let (provider, rest) = model.split_once('/')?;
+    if provider.is_empty() || rest.is_empty() {
+        return None;
+    }
+    // Built-in provider prefixes are the other branch's job.
+    if crate::ai_providers::ProviderType::from_id(provider).is_some() {
+        return None;
+    }
+
+    let accounts = state
+        .ai_providers
+        .get_all_by_type(crate::ai_providers::ProviderType::Custom)
+        .await;
+    let name_matches = accounts
+        .iter()
+        .any(|a| crate::api::providers::sanitize_custom_provider_id(&a.name) == provider);
+    if !name_matches {
+        return None;
+    }
+
+    let known_in_store = accounts.iter().any(|a| {
+        crate::api::providers::sanitize_custom_provider_id(&a.name) == provider
+            && a.custom_models
+                .as_ref()
+                .map(|ms| ms.iter().any(|m| m.id == rest))
+                .unwrap_or(false)
+    });
+    let known_in_catalog = {
+        let cached = state.model_catalog.read().await;
+        cached
+            .get(provider)
+            .map(|entries| entries.iter().any(|e| e.id == rest))
+            .unwrap_or(false)
+    };
+    if known_in_store || known_in_catalog {
+        Some(crate::provider_health::ChainEntry {
+            provider_id: provider.to_string(),
+            model_id: rest.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Usage accounting
 // ─────────────────────────────────────────────────────────────────────────────
@@ -500,6 +559,9 @@ pub(crate) async fn chat_completions_inner(
     //        passthrough to that provider's first healthy configured account,
     //        no stored chain required. This lets clients reach ANY supported
     //        model, not just the predefined fallback chains.
+    //    (c) A direct "<custom-provider>/model" id where the prefix is a custom
+    //        provider's sanitized name (e.g. "spark/step3p7-flash-148b") — the
+    //        same id the catalog exposes for self-hosted routers.
     //    Anything else errors — no silent fallback, so typos surface.
     let standard_accounts = super::ai_providers::read_standard_accounts(&state.config.working_dir);
 
@@ -525,8 +587,11 @@ pub(crate) async fn chat_completions_inner(
             )
             .await;
         (id, entries)
-    } else if let Some(direct) = parse_direct_model_entry(&requested_model) {
-        // Direct provider/model passthrough (single synthetic entry).
+    } else if let Some(direct) = parse_direct_model_entry(&requested_model)
+        .or(parse_custom_direct_model_entry(&state, &requested_model).await)
+    {
+        // Direct provider/model passthrough (single synthetic entry) — either a
+        // built-in provider prefix or a custom provider's sanitized name.
         let entries = state
             .chain_store
             .resolve_entries(
@@ -580,10 +645,11 @@ pub(crate) async fn chat_completions_inner(
 
     let chain_length = entries.len() as u32;
     for (entry_idx, entry) in entries.iter().enumerate() {
-        let provider_type = match ProviderType::from_id(&entry.provider_id) {
-            Some(pt) => pt,
-            None => continue,
-        };
+        // Non-builtin prefixes are custom providers referenced by their
+        // sanitized name (e.g. "spark"); they all route as `Custom` through the
+        // OpenAI-compatible path using the account's `base_url`.
+        let provider_type =
+            ProviderType::from_id(&entry.provider_id).unwrap_or(ProviderType::Custom);
 
         // Custom providers may work without an API key (base_url only).
         // Standard providers require credentials (API key or provider OAuth).

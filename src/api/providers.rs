@@ -338,7 +338,7 @@ fn merge_cached_provider_models(
     }
 }
 
-fn sanitize_custom_provider_id(name: &str) -> String {
+pub(crate) fn sanitize_custom_provider_id(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .collect::<String>()

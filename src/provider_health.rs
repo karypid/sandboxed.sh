@@ -1206,13 +1206,13 @@ impl ModelChainStore {
             let provider_type = match crate::ai_providers::ProviderType::from_id(&entry.provider_id)
             {
                 Some(pt) => pt,
-                None => {
-                    tracing::warn!(
-                        provider_id = %entry.provider_id,
-                        "Unknown provider type in chain, skipping"
-                    );
-                    continue;
-                }
+                // A non-builtin prefix is a custom provider referenced by its
+                // sanitized name (e.g. "spark") — the id the catalog/UI exposes.
+                // All custom providers share `ProviderType::Custom`; the account
+                // loop below filters to the specific account whose sanitized name
+                // matches `entry.provider_id`, so a bogus prefix simply resolves
+                // to no accounts rather than mis-routing.
+                None => crate::ai_providers::ProviderType::Custom,
             };
 
             // Collect account IDs we've already added to avoid duplicates
@@ -1237,17 +1237,29 @@ impl ModelChainStore {
                 if !account.has_credentials() {
                     continue;
                 }
-                // Custom providers are a shared type: an entry like
-                // "custom/claude-fable-5" must only resolve to the custom
-                // account(s) that actually declare that model, not every
-                // custom endpoint in the store.
+                // Custom providers are a shared type, so an entry must be tied to
+                // the right account. Entries reference a custom provider two ways:
+                //   - the generic "custom" type id, which matches any custom
+                //     account that declares the model (the model id disambiguates
+                //     which endpoint serves it), or
+                //   - the provider's sanitized name (e.g. "spark/<model>"), which
+                //     targets that specific account — the id the catalog exposes.
+                // A name-qualified entry already identifies the account, so the
+                // model need not appear in the stored `custom_models` list (it may
+                // be a model discovered live via the router's `/v1/models`).
                 if matches!(provider_type, crate::ai_providers::ProviderType::Custom) {
-                    let model_known = account
-                        .custom_models
-                        .as_ref()
-                        .map(|ms| ms.iter().any(|m| m.id == entry.model_id))
-                        .unwrap_or(false);
-                    if !model_known {
+                    if entry.provider_id == "custom" {
+                        let model_known = account
+                            .custom_models
+                            .as_ref()
+                            .map(|ms| ms.iter().any(|m| m.id == entry.model_id))
+                            .unwrap_or(false);
+                        if !model_known {
+                            continue;
+                        }
+                    } else if crate::api::providers::sanitize_custom_provider_id(&account.name)
+                        != entry.provider_id
+                    {
                         continue;
                     }
                 }
@@ -1693,6 +1705,107 @@ mod tests {
             "expired standard OAuth token should not be routed, got {:?}",
             resolved
         );
+    }
+
+    fn custom_account(name: &str, base_url: &str, models: &[&str]) -> AIProvider {
+        let mut p = AIProvider::new(ProviderType::Custom, name.to_string());
+        p.api_key = Some(format!("sk-{name}"));
+        p.base_url = Some(base_url.to_string());
+        p.custom_models = Some(
+            models
+                .iter()
+                .map(|m| crate::ai_providers::CustomModel {
+                    id: m.to_string(),
+                    name: None,
+                    context_limit: None,
+                    output_limit: None,
+                })
+                .collect(),
+        );
+        p.status = ProviderStatus::Connected;
+        p
+    }
+
+    #[tokio::test]
+    async fn resolve_entries_routes_custom_provider_by_sanitized_name() {
+        // "spark/<model>" — the id the catalog exposes — must resolve to the
+        // Spark custom account even though "spark" is not a built-in provider
+        // type. A non-matching name must resolve to nothing.
+        let store = store_with(vec![
+            custom_account("Spark", "https://spark.example/v1", &["step3p7-flash-148b"]),
+            custom_account("Other", "https://other.example/v1", &["other-model"]),
+        ])
+        .await;
+        let chains = store_with_chain("noop", vec![]).await;
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains
+            .resolve_entries(
+                &[ChainEntry {
+                    provider_id: "spark".to_string(),
+                    model_id: "step3p7-flash-148b".to_string(),
+                }],
+                &store,
+                &[],
+                &tracker,
+            )
+            .await;
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "should resolve exactly the Spark account"
+        );
+        assert_eq!(resolved[0].provider_id, "spark");
+        assert_eq!(resolved[0].model_id, "step3p7-flash-148b");
+        assert_eq!(
+            resolved[0].base_url.as_deref(),
+            Some("https://spark.example/v1")
+        );
+
+        // A name that matches no custom provider resolves to nothing.
+        let none = chains
+            .resolve_entries(
+                &[ChainEntry {
+                    provider_id: "ghost".to_string(),
+                    model_id: "step3p7-flash-148b".to_string(),
+                }],
+                &store,
+                &[],
+                &tracker,
+            )
+            .await;
+        assert!(none.is_empty(), "unknown custom name must not route");
+    }
+
+    #[tokio::test]
+    async fn resolve_entries_name_qualified_custom_allows_live_only_model() {
+        // A name-qualified entry identifies the account, so a model that is NOT
+        // in the stored custom_models (e.g. discovered live via /v1/models) must
+        // still route to that account.
+        let store = store_with(vec![custom_account(
+            "Spark",
+            "https://spark.example/v1",
+            &["already-known"],
+        )])
+        .await;
+        let chains = store_with_chain("noop", vec![]).await;
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains
+            .resolve_entries(
+                &[ChainEntry {
+                    provider_id: "spark".to_string(),
+                    model_id: "freshly-discovered".to_string(),
+                }],
+                &store,
+                &[],
+                &tracker,
+            )
+            .await;
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].model_id, "freshly-discovered");
     }
 
     #[tokio::test]
