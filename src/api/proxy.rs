@@ -798,8 +798,15 @@ pub(crate) async fn chat_completions_inner(
                 );
                 continue;
             };
-            // Build the upstream request body: replace model with the real model ID
-            let upstream_body = match rewrite_model(&body, &entry.model_id) {
+            // Build the upstream request body: replace model with the real model ID.
+            // Kimi additionally rejects any temperature other than 1, so normalize
+            // sampling params for it (see `rewrite_model_for_kimi`).
+            let rewrite_result = if provider_type == ProviderType::Kimi {
+                rewrite_model_for_kimi(&body, &entry.model_id)
+            } else {
+                rewrite_model(&body, &entry.model_id)
+            };
+            let upstream_body = match rewrite_result {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("Failed to rewrite model in request body: {}", e);
@@ -2106,6 +2113,28 @@ fn strip_thinking_blocks(messages: &mut [serde_json::Value]) {
             }));
         }
     }
+}
+
+/// Rewrite the model id and normalize sampling params for Kimi's coding endpoint.
+///
+/// `kimi-for-coding` rejects any temperature other than 1 with
+/// `400 invalid temperature: only 1 is allowed for this model`. Clients that
+/// send `temperature: 0` (e.g. deterministic benchmark harnesses) would
+/// therefore 400 on every request. Force the only accepted value when the
+/// caller specified a temperature; leave it absent otherwise so Kimi's own
+/// default applies.
+fn rewrite_model_for_kimi(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+    value["model"] = serde_json::Value::String(new_model.to_string());
+    if let Some(obj) = value.as_object_mut() {
+        if obj.contains_key("temperature") {
+            obj.insert("temperature".to_string(), serde_json::json!(1));
+        }
+    }
+    serde_json::to_vec(&value)
+        .map(bytes::Bytes::from)
+        .map_err(|e| format!("Failed to serialize: {}", e))
 }
 
 fn rewrite_model_for_anthropic_cli_proxy(
