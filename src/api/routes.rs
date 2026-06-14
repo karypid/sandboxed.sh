@@ -529,6 +529,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // dashboard always reads a fresh-enough cache.
     super::ai_providers::spawn_usage_refresh_loop(Arc::clone(&state));
 
+    // Keep short-lived Kimi OAuth access tokens fresh for the chain resolver.
+    super::ai_providers::spawn_kimi_oauth_refresh_loop(Arc::clone(&state));
+
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
     {
         super::metadata_llm::init_metadata_llm(state.http_client.clone());

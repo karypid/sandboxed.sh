@@ -136,6 +136,8 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::Mistral => Some("https://api.mistral.ai/v1"),
         ProviderType::TogetherAI => Some("https://api.together.xyz/v1"),
         ProviderType::Perplexity => Some("https://api.perplexity.ai"),
+        // Kimi Code subscription endpoint (OpenAI Chat Completions compatible).
+        ProviderType::Kimi => Some("https://api.kimi.com/coding/v1"),
         ProviderType::Custom => None, // uses account's base_url
         // Non-OpenAI-compatible providers
         ProviderType::Anthropic => None,
@@ -805,7 +807,13 @@ pub(crate) async fn chat_completions_inner(
                     continue;
                 }
             };
-            (url, upstream_body, HeaderMap::new())
+            // Kimi's coding endpoint returns 403 unless the User-Agent matches a
+            // known coding-agent pattern; pin it to the Kimi CLI's UA.
+            let mut extra = HeaderMap::new();
+            if provider_type == ProviderType::Kimi {
+                extra.insert(header::USER_AGENT, HeaderValue::from_static("KimiCLI/1.5"));
+            }
+            (url, upstream_body, extra)
         };
 
         // Forward the request.

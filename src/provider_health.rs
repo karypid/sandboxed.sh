@@ -1275,6 +1275,8 @@ impl ModelChainStore {
                 //     `oauth-2025-04-20` beta header), and
                 //   - xAI/Grok: `api.x.ai/v1/chat/completions` accepts the
                 //     Grok-Build OAuth token as a Bearer (scope `api:access`).
+                //   - Kimi: `api.kimi.com/coding/v1/chat/completions` accepts the
+                //     Kimi Code subscription OAuth access token as a Bearer.
                 // OpenAI (Codex) JWTs do NOT work at
                 // `api.openai.com/v1/chat/completions`; those accounts keep
                 // `api_key = None, has_oauth = true` and route through the
@@ -1284,6 +1286,7 @@ impl ModelChainStore {
                         provider_type,
                         crate::ai_providers::ProviderType::Anthropic
                             | crate::ai_providers::ProviderType::Xai
+                            | crate::ai_providers::ProviderType::Kimi
                     ) {
                         return None;
                     }

@@ -1877,15 +1877,20 @@ fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
         if let Ok(contents) = std::fs::read_to_string(path) {
             match serde_json::from_str::<Vec<AIProvider>>(&contents) {
                 Ok(providers) => {
+                    // Include Custom providers and Kimi (which, like Custom, needs
+                    // an explicit OpenCode provider block — it is not a built-in).
                     let custom: Vec<AIProvider> = providers
                         .into_iter()
-                        .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
+                        .filter(|p| {
+                            matches!(p.provider_type, ProviderType::Custom | ProviderType::Kimi)
+                                && p.enabled
+                        })
                         .collect();
                     if !custom.is_empty() {
                         tracing::debug!(
                             path = %path.display(),
                             count = custom.len(),
-                            "Loaded custom providers from file"
+                            "Loaded custom/Kimi providers from file"
                         );
                         return custom;
                     }
