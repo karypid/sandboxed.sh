@@ -2124,14 +2124,19 @@ const ToolCallItem = memo(function ToolCallItem({
   workspaceId,
   missionId,
   onLoadDetails,
+  defaultExpanded = false,
 }: {
   item: Extract<ChatItem, { kind: "tool" }>;
   highlighted?: boolean;
   workspaceId?: string;
   missionId?: string;
   onLoadDetails?: (toolCallId: string) => Promise<void>;
+  /** Last transcript row opens by default; collapses again once superseded. */
+  defaultExpanded?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  // `null` follows `defaultExpanded`; a click pins the user's explicit choice.
+  const [manualExpanded, setManualExpanded] = useState<boolean | null>(null);
+  const expanded = manualExpanded ?? defaultExpanded;
   const isLazy = item.lazy === true;
   const isDone = !isLazy && item.result !== undefined;
 
@@ -2157,7 +2162,7 @@ const ToolCallItem = memo(function ToolCallItem({
   const [resultExpanded, setResultExpanded] = useState(false);
   const handleToggleExpanded = useCallback(() => {
     const nextExpanded = !expanded;
-    setExpanded(nextExpanded);
+    setManualExpanded(nextExpanded);
     if (nextExpanded && isLazy && !item.loading) {
       void onLoadDetails?.(item.toolCallId);
     }
@@ -2434,6 +2439,7 @@ function CollapsedToolGroup({
   workspaceId,
   missionId,
   onLoadToolDetails,
+  isLast = false,
 }: {
   tools: Extract<ChatItem, { kind: "tool" }>[];
   isExpanded: boolean;
@@ -2445,6 +2451,10 @@ function CollapsedToolGroup({
   workspaceId?: string;
   missionId?: string;
   onLoadToolDetails?: (toolCallId: string) => Promise<void>;
+  /** True when this group is the last transcript row: its newest (always
+      shown) tool then opens by default. The hidden "previous" tools stay
+      collapsed regardless. */
+  isLast?: boolean;
 }) {
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
@@ -2489,8 +2499,12 @@ function CollapsedToolGroup({
     return () => cancelAnimationFrame(raf);
   }, [isExpanded, measureRow]);
 
-  // Helper to render appropriate tool component
-  const renderTool = (tool: Extract<ChatItem, { kind: "tool" }>) => {
+  // Helper to render appropriate tool component. `isLastTool` only applies to
+  // the newest tool of the group when the group itself is the transcript tail.
+  const renderTool = (
+    tool: Extract<ChatItem, { kind: "tool" }>,
+    isLastTool = false,
+  ) => {
     if (isSubagentTool(tool.name)) {
       return <SubagentToolItem key={tool.id} item={tool} />;
     }
@@ -2501,6 +2515,7 @@ function CollapsedToolGroup({
         workspaceId={workspaceId}
         missionId={missionId}
         onLoadDetails={onLoadToolDetails}
+        defaultExpanded={isLastTool}
       />
     );
   };
@@ -2530,7 +2545,7 @@ function CollapsedToolGroup({
             Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
           </span>
         </button>
-        {renderTool(lastTool)}
+        {renderTool(lastTool, isLast)}
       </div>
     );
   }
@@ -2553,7 +2568,7 @@ function CollapsedToolGroup({
           Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
         </span>
       </button>
-      {renderTool(lastTool)}
+      {renderTool(lastTool, isLast)}
     </div>
   );
 }
@@ -2564,6 +2579,8 @@ type ChatItemRowProps = {
   workspaceId: string | undefined;
   missionId: string | undefined;
   basePath: string | undefined;
+  /** This row is the transcript tail: its collapsible content opens by default. */
+  isLast: boolean;
   isToolGroupExpanded: boolean;
   onToggleToolGroup: (groupId: string) => void;
   measureRow?: (el: HTMLElement) => void;
@@ -2595,6 +2612,7 @@ const ChatItemRow = memo(function ChatItemRow({
   workspaceId,
   missionId,
   basePath,
+  isLast,
   isToolGroupExpanded,
   onToggleToolGroup,
   measureRow,
@@ -2632,6 +2650,7 @@ const ChatItemRow = memo(function ChatItemRow({
           workspaceId={workspaceId}
           missionId={missionId}
           onLoadToolDetails={onLoadToolDetails}
+          isLast={isLast}
         />
       </div>
     );
@@ -2838,6 +2857,7 @@ const ChatItemRow = memo(function ChatItemRow({
         basePath={basePath}
         workspaceId={workspaceId}
         missionId={missionId}
+        defaultExpanded={isLast}
       />
     );
   }
@@ -2849,6 +2869,7 @@ const ChatItemRow = memo(function ChatItemRow({
         basePath={basePath}
         workspaceId={workspaceId}
         missionId={missionId}
+        defaultExpanded={isLast}
       />
     );
   }
@@ -2975,6 +2996,7 @@ const ChatItemRow = memo(function ChatItemRow({
           workspaceId={workspaceId}
           missionId={missionId}
           onLoadDetails={onLoadToolDetails}
+          defaultExpanded={isLast}
         />
       );
     }
@@ -3883,7 +3905,11 @@ export default function ControlClient() {
         .join("|"),
     [groupedItems],
   );
-  const { isAtBottom, scrollToBottom } = useVirtualTimelineAnchor({
+  const {
+    isAtBottom,
+    scrollToBottom,
+    registerContent: registerChatContent,
+  } = useVirtualTimelineAnchor({
     scrollElementRef: containerRef,
     virtualizer: chatVirtualizer,
     itemCount: groupedItems.length,
@@ -9886,6 +9912,7 @@ export default function ControlClient() {
               ) : (
                 <div className="@container mx-auto max-w-3xl space-y-6">
                   <div
+                    ref={registerChatContent}
                     className="relative w-full"
                     style={{ height: `${chatVirtualizer.getTotalSize()}px` }}
                   >
@@ -9893,6 +9920,8 @@ export default function ControlClient() {
                       const item = groupedItems[virtualRow.index];
                       if (!item) return null;
                       const key = getGroupedItemKey(item);
+                      const isLast =
+                        virtualRow.index === groupedItems.length - 1;
                       const isToolGroupExpanded =
                         item.kind === "tool_group"
                           ? expandedToolGroups.has(item.groupId)
@@ -9913,6 +9942,7 @@ export default function ControlClient() {
                             workspaceId={missionForDownloads?.workspace_id}
                             missionId={missionForDownloads?.id}
                             basePath={missionWorkingDirectory}
+                            isLast={isLast}
                             isToolGroupExpanded={isToolGroupExpanded}
                             onToggleToolGroup={handleToggleToolGroup}
                             measureRow={measureRowSync}
