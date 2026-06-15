@@ -22,6 +22,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::routes::AppState;
 
@@ -29,8 +30,57 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/offload", post(offload_build))
 }
 
+/// Secret used to sign the per-mission spark-offload capability token. Reuses
+/// the same internal-action secret as Telegram action tokens.
+fn spark_offload_secret() -> Option<String> {
+    std::env::var("SANDBOXED_INTERNAL_ACTION_SECRET")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("JWT_SECRET")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+}
+
+/// Mint a per-mission, scope-bound capability token for spark offload. Unlike
+/// the master `SANDBOXED_PROXY_SECRET`, a leaked token only authorizes spark
+/// builds for THIS mission — it can't be replayed against the LLM proxy or any
+/// other proxy route, nor against another mission's workspace. Returns `None`
+/// when no signing secret is configured.
+pub fn build_spark_offload_token(mission_id: Uuid) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let secret = spark_offload_secret()?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(b"spark-offload:");
+    mac.update(mission_id.as_bytes());
+    Some(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_spark_offload_token(mission_id: Uuid, token: &str) -> bool {
+    let Some(expected) = build_spark_offload_token(mission_id) else {
+        return false;
+    };
+    super::auth::constant_time_eq(&expected, token.trim())
+}
+
+/// Extract the bearer token from the `Authorization` header.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[derive(Deserialize)]
 struct OffloadRequest {
+    /// Mission this build belongs to. The bearer token must be the scoped
+    /// capability token minted for exactly this mission, and `host_dir` must
+    /// resolve to this mission's workspace directory.
+    mission_id: Uuid,
     /// Host filesystem path of the mission workspace root, injected as
     /// `SPARK_WORKSPACE_HOST_DIR` and echoed back by the wrapper.
     host_dir: String,
@@ -51,6 +101,41 @@ fn default_priority() -> String {
 struct OffloadResponse {
     exit_code: i64,
     log: String,
+}
+
+/// Validate and canonicalize a caller-supplied mission workspace path.
+///
+/// Returns the resolved absolute path only when it is a real directory shaped
+/// like `<root>/workspaces/mission-*` (the layout produced by
+/// `workspace::mission_workspace_dir_for_root`, for both container and host
+/// workspaces). `canonicalize` resolves symlinks and requires existence, so a
+/// symlink whose target escapes that layout — or any path merely *containing*
+/// the `/workspaces/mission-` substring — is rejected.
+fn canonical_mission_host_dir(raw: &str) -> Result<String, &'static str> {
+    // Cheap pre-filter before touching the filesystem.
+    if !raw.starts_with('/') || raw.contains("..") {
+        return Err("invalid host_dir");
+    }
+    let canon = std::fs::canonicalize(raw).map_err(|_| "invalid host_dir")?;
+    if !canon.is_dir() {
+        return Err("invalid host_dir");
+    }
+    let is_mission = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("mission-"));
+    let in_workspaces = canon
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "workspaces");
+    if !is_mission || !in_workspaces {
+        return Err("invalid host_dir");
+    }
+    canon
+        .to_str()
+        .map(|s| s.to_string())
+        .ok_or("invalid host_dir")
 }
 
 /// Run a host subprocess, returning (success, combined output).
@@ -74,8 +159,16 @@ async fn offload_build(
     headers: HeaderMap,
     Json(req): Json<OffloadRequest>,
 ) -> axum::response::Response {
-    if let Err(resp) = super::proxy::verify_proxy_auth(&headers, &state).await {
-        return resp;
+    // Host-privileged endpoint (rsyncs host paths, SSHes to the Spark). Auth is
+    // a per-mission, scope-bound capability token — NOT the master proxy secret
+    // — so a token leaked from a workspace can't be replayed against the LLM
+    // proxy or another mission. The legitimate caller is the in-workspace
+    // `spark-build` wrapper, handed the token minted for its own mission.
+    let Some(token_in) = bearer_token(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+    };
+    if !verify_spark_offload_token(req.mission_id, &token_in) {
+        return (StatusCode::UNAUTHORIZED, "invalid spark offload token").into_response();
     }
 
     // All three must be set, else tell the caller to build locally.
@@ -91,30 +184,34 @@ async fn offload_build(
             .into_response();
     };
 
-    // Security: only rsync real mission workspace dirs (the host_dir comes from a
-    // workspace-authenticated caller, but constrain it anyway). Require an
-    // absolute path containing the mission marker and no `..`. The leading-`/`
-    // anchor also guarantees host_dir can't start with `-`, which — combined
-    // with the `--` separator before the positional rsync paths below — closes
-    // the argv flag-smuggling vector (e.g. a `--rsync-path=<cmd>` value that
-    // still contains `/workspaces/mission-` would otherwise reach rsync as an
-    // option and run a command on the Spark host).
-    if !req.host_dir.starts_with('/')
-        || !req.host_dir.contains("/workspaces/mission-")
-        || req.host_dir.contains("..")
-    {
-        return (StatusCode::BAD_REQUEST, "invalid host_dir").into_response();
-    }
+    // Security: confine host_dir to a genuine mission workspace directory.
+    // A substring check (`contains("/workspaces/mission-")`) is not real
+    // containment — an attacker-controlled path or a symlink like
+    // `<workspace>/workspaces/mission-x -> /etc` would pass it, and the
+    // download rsync below WRITES into host_dir (arbitrary host write as root).
+    // So canonicalize (resolving symlinks, requiring existence) and assert the
+    // resolved path is `<root>/workspaces/mission-*` — the layout every
+    // container and host workspace uses. Using the canonical path for the rsync
+    // also removes the argv flag-smuggling surface (it can never start with `-`).
+    let host_dir = match canonical_mission_host_dir(&req.host_dir) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
     if req.cmd.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "cmd required").into_response();
     }
 
-    let host_dir = req.host_dir.trim_end_matches('/').to_string();
     let name = host_dir.rsplit('/').next().unwrap_or("build").to_string();
-    // Belt-and-suspenders: the derived `name` feeds remote paths; never let it
-    // look like a flag even if host_dir's last segment somehow began with `-`.
-    if name.starts_with('-') {
-        return (StatusCode::BAD_REQUEST, "invalid host_dir").into_response();
+    // The token authenticates a specific mission; the workspace dir is named
+    // `mission-<short>`. Reject any attempt to point a mission's token at a
+    // different mission's workspace (the rsync below WRITES into host_dir).
+    let expected_name = format!("mission-{}", &req.mission_id.to_string()[..8]);
+    if name != expected_name {
+        return (
+            StatusCode::FORBIDDEN,
+            "host_dir does not belong to this mission",
+        )
+            .into_response();
     }
     let user = ssh.split('@').next().unwrap_or("th0rgal");
     let remote_rel = format!(".spark-builds/{}", name);

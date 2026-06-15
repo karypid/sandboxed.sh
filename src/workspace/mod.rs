@@ -277,16 +277,16 @@ impl Workspace {
 
     /// Env vars that let the in-workspace `spark-build` wrapper offload a build
     /// for `mission_id` to the Spark via the host endpoint — or `None` when the
-    /// workspace hasn't opted in or the proxy secret isn't available. Only the
-    /// local endpoint URL + the proxy secret it already trusts are exposed;
-    /// Spark credentials stay on the host (see `src/api/spark.rs`).
+    /// workspace hasn't opted in or no signing secret is available. The token
+    /// exposed is a per-mission, scope-bound capability token (NOT the master
+    /// proxy secret): a leak only authorizes spark builds for this one mission,
+    /// never the LLM proxy or another mission. Spark credentials stay on the
+    /// host (see `src/api/spark.rs`).
     pub fn spark_offload_env(&self, mission_id: Uuid) -> Option<HashMap<String, String>> {
         if !self.spark_offload_enabled() {
             return None;
         }
-        let secret = std::env::var("SANDBOXED_PROXY_SECRET")
-            .ok()
-            .filter(|s| !s.trim().is_empty())?;
+        let token = crate::api::spark::build_spark_offload_token(mission_id)?;
         let port = std::env::var("PORT")
             .ok()
             .filter(|s| !s.trim().is_empty())?;
@@ -306,7 +306,11 @@ impl Workspace {
                 port
             ),
         );
-        m.insert("SPARK_OFFLOAD_TOKEN".to_string(), secret);
+        m.insert("SPARK_OFFLOAD_TOKEN".to_string(), token);
+        m.insert(
+            "SPARK_OFFLOAD_MISSION_ID".to_string(),
+            mission_id.to_string(),
+        );
         m.insert(
             "SPARK_WORKSPACE_HOST_DIR".to_string(),
             host_dir.to_string_lossy().to_string(),
