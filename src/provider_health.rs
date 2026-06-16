@@ -21,8 +21,14 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CooldownReason {
-    /// HTTP 429 rate limit
+    /// HTTP 429 rate limit (transient — short exponential cooldown)
     RateLimit,
+    /// Hard usage/quota exhaustion (e.g. a subscription's daily/period limit is
+    /// reached). Distinguished from a transient `RateLimit` so the account is
+    /// parked for a long fixed cooldown instead of being re-tried as a primary
+    /// chain entry every few seconds. Detected from upstream error bodies
+    /// ("usage limit reached", "insufficient_quota", …).
+    QuotaExhausted,
     /// HTTP 529 overloaded
     Overloaded,
     /// Connection timeout or network error
@@ -41,6 +47,7 @@ impl std::fmt::Display for CooldownReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RateLimit => write!(f, "rate_limit"),
+            Self::QuotaExhausted => write!(f, "quota_exhausted"),
             Self::Overloaded => write!(f, "overloaded"),
             Self::Timeout => write!(f, "timeout"),
             Self::ServerError => write!(f, "server_error"),
@@ -48,6 +55,19 @@ impl std::fmt::Display for CooldownReason {
             Self::ClientError => write!(f, "client_error"),
         }
     }
+}
+
+/// Fixed cooldown (seconds) applied when an account/subscription reports a hard
+/// usage/quota exhaustion. Defaults to 1 hour; override with
+/// `PROVIDER_QUOTA_COOLDOWN_SECS`. A hard quota won't recover within a caller's
+/// retry budget, so parking it long keeps the chain on healthy providers
+/// instead of flapping back to the exhausted one every few seconds.
+fn quota_cooldown_secs() -> u64 {
+    std::env::var("PROVIDER_QUOTA_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(3600)
 }
 
 /// Snapshot of rate-limit quota state from provider response headers.
@@ -403,7 +423,9 @@ impl ProviderHealthTracker {
 
         health.total_requests += 1;
         match &reason {
-            CooldownReason::RateLimit | CooldownReason::Overloaded => health.total_rate_limits += 1,
+            CooldownReason::RateLimit
+            | CooldownReason::QuotaExhausted
+            | CooldownReason::Overloaded => health.total_rate_limits += 1,
             _ => health.total_errors += 1,
         }
 
@@ -416,14 +438,23 @@ impl ProviderHealthTracker {
         // Auth errors (401/403) are almost always permanent (bad API key,
         // revoked credentials), so use a long fixed cooldown instead of
         // short exponential backoff that implies eventual recovery.
-        let cooldown = retry_after.unwrap_or_else(|| {
-            if is_auth_error {
-                std::time::Duration::from_secs(3600) // 1 hour
-            } else {
+        // QuotaExhausted (a subscription's hard usage limit) won't recover for
+        // hours/days, so park it for a long fixed window so the chain stops
+        // re-trying an exhausted subscription as a primary entry; honor a
+        // longer upstream retry_after when one is supplied.
+        let cooldown = match reason {
+            CooldownReason::QuotaExhausted => {
+                let base = std::time::Duration::from_secs(quota_cooldown_secs());
+                retry_after.map(|r| r.max(base)).unwrap_or(base)
+            }
+            CooldownReason::AuthError => {
+                retry_after.unwrap_or(std::time::Duration::from_secs(3600))
+            }
+            _ => retry_after.unwrap_or_else(|| {
                 self.backoff_config
                     .cooldown_for(health.consecutive_failures.saturating_sub(1))
-            }
-        });
+            }),
+        };
 
         health.cooldown_until = Some(std::time::Instant::now() + cooldown);
 

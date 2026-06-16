@@ -215,18 +215,43 @@ async fn offload_build(
     }
     let user = ssh.split('@').next().unwrap_or("th0rgal");
     let remote_rel = format!(".spark-builds/{}", name);
-    let remote_cwd = if req.rel.is_empty() {
+
+    // Confine the transfer to the build subtree (`rel`) rather than the whole
+    // mission workspace. A mega-mission can carry dozens of multi-GB Lean
+    // worktrees (84GB+), and rsyncing the entire root per build is
+    // impractical; the build only needs its own self-contained package dir.
+    // Reject path traversal so `rel` can't escape the (already mission-bound)
+    // host_dir.
+    let rel_clean = req.rel.trim_matches('/');
+    if rel_clean.split('/').any(|c| c == "..") {
+        return (StatusCode::BAD_REQUEST, "invalid rel").into_response();
+    }
+    let remote_cwd = if rel_clean.is_empty() {
         format!("/home/{}/{}", user, remote_rel)
     } else {
-        format!(
-            "/home/{}/{}/{}",
-            user,
-            remote_rel,
-            req.rel.trim_matches('/')
-        )
+        format!("/home/{}/{}/{}", user, remote_rel, rel_clean)
     };
+    // Local source + remote destination, both scoped to the build subtree.
+    let local_src = if rel_clean.is_empty() {
+        format!("{}/", host_dir)
+    } else {
+        format!("{}/{}/", host_dir, rel_clean)
+    };
+    let remote_dst = format!("{}:{}/", ssh, remote_cwd);
 
-    // 1. Sync the workspace up to the Spark.
+    // rsync won't create missing parent dirs; ensure the (possibly nested)
+    // remote build dir exists first.
+    let mk = run(&["ssh", "--", ssh, "mkdir", "-p", &remote_cwd]).await;
+    if !mk.0 {
+        tracing::warn!("spark offload: remote mkdir failed: {}", mk.1);
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("remote mkdir failed: {}", mk.1),
+        )
+            .into_response();
+    }
+
+    // 1. Sync the build subtree up to the Spark.
     let up = run(&[
         "rsync",
         "-az",
@@ -236,8 +261,8 @@ async fn offload_build(
         "-e",
         "ssh",
         "--",
-        &format!("{}/", host_dir),
-        &format!("{}:{}/", ssh, remote_rel),
+        &local_src,
+        &remote_dst,
     ])
     .await;
     if !up.0 {
@@ -312,15 +337,15 @@ async fn offload_build(
         return (StatusCode::GATEWAY_TIMEOUT, "build timed out on spark").into_response();
     }
 
-    // 4. Sync artifacts (.olean etc.) back into the workspace.
+    // 4. Sync artifacts (.olean etc.) back into the build subtree.
     let _back = run(&[
         "rsync",
         "-az",
         "-e",
         "ssh",
         "--",
-        &format!("{}:{}/", ssh, remote_rel),
-        &format!("{}/", host_dir),
+        &format!("{}:{}/", ssh, remote_cwd),
+        &local_src,
     ])
     .await;
 

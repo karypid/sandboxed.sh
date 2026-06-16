@@ -1129,6 +1129,8 @@ pub(crate) async fn chat_completions_inner(
                 let retry_after = parse_rate_limit_headers(&response_headers, provider_type);
                 let reason = if status.as_u16() == 529 {
                     CooldownReason::Overloaded
+                } else if body_is_quota_exhausted(&resp_body) {
+                    CooldownReason::QuotaExhausted
                 } else {
                     CooldownReason::RateLimit
                 };
@@ -1369,9 +1371,14 @@ pub(crate) async fn chat_completions_inner(
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
                 let retry_after = parse_google_retry_after(&response_headers, &resp_body)
                     .or_else(|| parse_rate_limit_headers(&response_headers, provider_type));
+                let reason = if body_is_quota_exhausted(&resp_body) {
+                    CooldownReason::QuotaExhausted
+                } else {
+                    CooldownReason::RateLimit
+                };
                 let cooldown = state
                     .health_tracker
-                    .record_entry_failure(entry, CooldownReason::RateLimit, retry_after)
+                    .record_entry_failure(entry, reason, retry_after)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1379,7 +1386,7 @@ pub(crate) async fn chat_completions_inner(
                     from_provider: entry.provider_id.clone(),
                     from_model: entry.model_id.clone(),
                     from_account_id: entry.account_id,
-                    reason: CooldownReason::RateLimit,
+                    reason,
                     cooldown_secs: Some(cooldown.as_secs_f64()),
                     to_provider: None,
                     latency_ms: Some(elapsed_ms),
@@ -1396,7 +1403,9 @@ pub(crate) async fn chat_completions_inner(
                 let reason = maybe_reason.unwrap_or(CooldownReason::AuthError);
                 let retry_after = if matches!(
                     reason,
-                    CooldownReason::RateLimit | CooldownReason::Overloaded
+                    CooldownReason::RateLimit
+                        | CooldownReason::QuotaExhausted
+                        | CooldownReason::Overloaded
                 ) {
                     parse_google_retry_after(&response_headers, &resp_body)
                         .or_else(|| parse_rate_limit_headers(&response_headers, provider_type))
@@ -1421,7 +1430,9 @@ pub(crate) async fn chat_completions_inner(
                     chain_length,
                 });
                 match reason {
-                    CooldownReason::RateLimit | CooldownReason::Overloaded => rate_limit_count += 1,
+                    CooldownReason::RateLimit
+                    | CooldownReason::QuotaExhausted
+                    | CooldownReason::Overloaded => rate_limit_count += 1,
                     CooldownReason::AuthError => client_error_count += 1,
                     _ => server_error_count += 1,
                 }
@@ -1536,20 +1547,24 @@ pub(crate) async fn chat_completions_inner(
             // the providers panel reflects "weekly limit reached" without a
             // probe. Keyed by entry.account_id == the provider UUID the usage
             // probe stores under. Only the codex path reads the body here.
+            // Read the 429 body once: used both for passive Codex cooldown
+            // capture and to distinguish a hard quota/usage-limit exhaustion
+            // (long cooldown) from a transient rate limit (short cooldown).
+            let err_body = upstream_resp.bytes().await.unwrap_or_default();
             if use_openai_oauth_cli_proxy_adapter {
                 let store_key = entry.account_id.to_string();
                 let codex_store = state.codex_usage.clone();
-                if let Ok(body) = upstream_resp.bytes().await {
-                    let now_unix = chrono::Utc::now().timestamp();
-                    if let Some(reset_at) =
-                        crate::api::codex_usage::parse_cooldown_reset(&body, now_unix)
-                    {
-                        codex_store.put_passive_cooldown(store_key, reset_at).await;
-                    }
+                let now_unix = chrono::Utc::now().timestamp();
+                if let Some(reset_at) =
+                    crate::api::codex_usage::parse_cooldown_reset(&err_body, now_unix)
+                {
+                    codex_store.put_passive_cooldown(store_key, reset_at).await;
                 }
             }
             let reason = if status.as_u16() == 529 {
                 CooldownReason::Overloaded
+            } else if body_is_quota_exhausted(&err_body) {
+                CooldownReason::QuotaExhausted
             } else {
                 CooldownReason::RateLimit
             };
@@ -1779,7 +1794,9 @@ pub(crate) async fn chat_completions_inner(
                     chain_length,
                 });
                 match reason {
-                    CooldownReason::RateLimit | CooldownReason::Overloaded => rate_limit_count += 1,
+                    CooldownReason::RateLimit
+                    | CooldownReason::QuotaExhausted
+                    | CooldownReason::Overloaded => rate_limit_count += 1,
                     CooldownReason::AuthError => client_error_count += 1,
                     _ => server_error_count += 1,
                 }
@@ -1876,9 +1893,9 @@ pub(crate) async fn chat_completions_inner(
                                 chain_length,
                             });
                             match reason {
-                                CooldownReason::RateLimit | CooldownReason::Overloaded => {
-                                    rate_limit_count += 1
-                                }
+                                CooldownReason::RateLimit
+                                | CooldownReason::QuotaExhausted
+                                | CooldownReason::Overloaded => rate_limit_count += 1,
                                 CooldownReason::AuthError => client_error_count += 1,
                                 _ => server_error_count += 1,
                             }
@@ -2682,6 +2699,25 @@ fn parse_rate_limit_duration(s: &str) -> Option<std::time::Duration> {
 /// Providers sometimes return HTTP 200 with an error payload.  This function
 /// inspects the parsed JSON to determine the appropriate cooldown reason
 /// instead of blindly treating every such error as a rate limit.
+/// Detect a hard quota/usage-limit exhaustion from a raw upstream error body
+/// (e.g. a 429 response payload). Used to park an exhausted subscription on a
+/// long cooldown instead of the short transient-rate-limit backoff.
+fn body_is_quota_exhausted(body: &[u8]) -> bool {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if matches!(classify_embedded_error(&v), CooldownReason::QuotaExhausted) {
+            return true;
+        }
+    }
+    // Fallback for non-JSON or unusually-shaped bodies: scan for unambiguous
+    // quota phrases only (avoid generic "rate limit" which is transient).
+    let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
+    lower.contains("usage limit")
+        || lower.contains("insufficient_quota")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("out of credits")
+        || lower.contains("insufficient balance")
+}
+
 fn classify_embedded_error(v: &serde_json::Value) -> CooldownReason {
     let error_obj = v.get("error");
 
@@ -2700,6 +2736,33 @@ fn classify_embedded_error(v: &serde_json::Value) -> CooldownReason {
         .unwrap_or("");
 
     let error_type_lower = error_type.to_ascii_lowercase();
+
+    // Free-text message, used to spot hard quota/usage-limit exhaustion that
+    // isn't distinguishable from the error type/code alone (e.g. z.ai returns
+    // a generic 429 whose body says "The usage limit has been reached").
+    let message_lower = error_obj
+        .and_then(|e| e.get("message"))
+        .or_else(|| v.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Hard quota exhaustion → long cooldown (parked, not flapped). Checked
+    // before the transient rate-limit branch since these are more specific.
+    // NOTE: Google's "resource_exhausted" is a *transient* per-minute limit, so
+    // it is deliberately NOT treated as quota exhaustion here.
+    if error_type_lower.contains("insufficient_quota")
+        || error_type_lower.contains("quota_exceeded")
+        || error_type_lower.contains("usage_limit")
+        || message_lower.contains("usage limit")
+        || message_lower.contains("insufficient_quota")
+        || message_lower.contains("quota exceeded")
+        || message_lower.contains("exceeded your current quota")
+        || message_lower.contains("out of credits")
+        || message_lower.contains("insufficient balance")
+    {
+        return CooldownReason::QuotaExhausted;
+    }
 
     if error_type_lower.contains("rate_limit")
         || error_type_lower.contains("rate-limit")
@@ -5222,6 +5285,61 @@ mod tests {
         let reason =
             classify_google_error_reason(serde_json::to_vec(&body).unwrap().as_slice()).unwrap();
         assert!(matches!(reason, CooldownReason::Overloaded));
+    }
+
+    #[test]
+    fn classify_embedded_quota_from_message() {
+        // z.ai-style: generic code, quota signalled only in the message text.
+        let v = serde_json::json!({
+            "error": {"code": "1113", "message": "The usage limit has been reached"}
+        });
+        assert!(matches!(
+            classify_embedded_error(&v),
+            CooldownReason::QuotaExhausted
+        ));
+    }
+
+    #[test]
+    fn classify_embedded_insufficient_quota_type() {
+        let v = serde_json::json!({
+            "error": {"type": "insufficient_quota", "message": "You exceeded your current quota"}
+        });
+        assert!(matches!(
+            classify_embedded_error(&v),
+            CooldownReason::QuotaExhausted
+        ));
+    }
+
+    #[test]
+    fn classify_embedded_transient_rate_limit_stays_rate_limit() {
+        // A transient rate limit must NOT be upgraded to the long quota cooldown.
+        let v = serde_json::json!({
+            "error": {"type": "rate_limit_error", "message": "slow down"}
+        });
+        assert!(matches!(
+            classify_embedded_error(&v),
+            CooldownReason::RateLimit
+        ));
+        // Google's per-minute RESOURCE_EXHAUSTED is also transient.
+        let g = serde_json::json!({"error": {"status": "RESOURCE_EXHAUSTED"}});
+        assert!(matches!(
+            classify_embedded_error(&g),
+            CooldownReason::RateLimit
+        ));
+    }
+
+    #[test]
+    fn body_quota_detector_matches_quota_bodies_only() {
+        assert!(body_is_quota_exhausted(
+            br#"{"error":{"message":"The usage limit has been reached"}}"#
+        ));
+        assert!(body_is_quota_exhausted(
+            br#"{"error":{"type":"insufficient_quota"}}"#
+        ));
+        assert!(!body_is_quota_exhausted(
+            br#"{"error":{"type":"rate_limit_error"}}"#
+        ));
+        assert!(!body_is_quota_exhausted(b"plain transient 429"));
     }
 
     #[test]
