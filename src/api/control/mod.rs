@@ -2479,6 +2479,34 @@ fn serialize_queue_snapshot(
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Persist the control queue snapshot iff it changed since `last_persisted`
+/// (debounced so unchanged iterations don't churn the DB).
+///
+/// Called both at the actor-loop top and immediately after every dequeue. The
+/// post-dequeue call is what prevents stale double-execution: without it, a
+/// popped message lingers in the persisted snapshot until the next loop pass, so
+/// a crash after the pop (during the potentially-awaiting work that starts the
+/// run) would restore and re-run a message that already started — bypassing the
+/// in-memory idempotency guard.
+async fn persist_control_queue_if_changed(
+    mission_store: &Arc<dyn MissionStore>,
+    session_user_id: &str,
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    last_persisted: &mut String,
+) {
+    let snapshot = serialize_queue_snapshot(queue);
+    if snapshot != *last_persisted {
+        if let Err(e) = mission_store
+            .save_control_queue(session_user_id, &snapshot)
+            .await
+        {
+            tracing::warn!("Failed to persist control queue: {e}");
+        } else {
+            *last_persisted = snapshot;
+        }
+    }
+}
+
 /// Tool result posted by the frontend for an interactive tool call.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlToolResultRequest {
@@ -8723,20 +8751,16 @@ async fn control_actor_loop(
         // Persist the pending queue whenever it changes so a restart doesn't
         // lose queued messages. Debounced by snapshot comparison — the DB is
         // written only when the queue actually changed (no per-iteration churn
-        // during streaming, where the queue is usually unchanged).
-        {
-            let snapshot = serialize_queue_snapshot(&queue);
-            if snapshot != last_persisted_queue {
-                if let Err(e) = mission_store
-                    .save_control_queue(&session_user_id, &snapshot)
-                    .await
-                {
-                    tracing::warn!("Failed to persist control queue: {e}");
-                } else {
-                    last_persisted_queue = snapshot;
-                }
-            }
-        }
+        // during streaming, where the queue is usually unchanged). Each dequeue
+        // site below also persists immediately so a popped message can't be
+        // re-run after a crash (see `persist_control_queue_if_changed`).
+        persist_control_queue_if_changed(
+            &mission_store,
+            &session_user_id,
+            &queue,
+            &mut last_persisted_queue,
+        )
+        .await;
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -9198,6 +9222,15 @@ async fn control_actor_loop(
                         }
                         if running.is_none() {
                             if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                                // Persist the dequeue before the awaits that start
+                                // the run, so a crash here can't restore + re-run it.
+                                persist_control_queue_if_changed(
+                                    &mission_store,
+                                    &session_user_id,
+                                    &queue,
+                                    &mut last_persisted_queue,
+                                )
+                                .await;
                                 set_and_emit_status(
                                     &status,
                                     &events_tx,
@@ -10094,6 +10127,16 @@ async fn control_actor_loop(
                                 // Start execution if not already running
                                 if running.is_none() {
                                     if let Some((mid, msg, _per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                                        // Persist the dequeue before the awaits that
+                                        // start the run, so a crash here can't
+                                        // restore + re-run it.
+                                        persist_control_queue_if_changed(
+                                            &mission_store,
+                                            &session_user_id,
+                                            &queue,
+                                            &mut last_persisted_queue,
+                                        )
+                                        .await;
                                         let target_mid = msg_target_mid.unwrap_or(mission_id);
                                         set_and_emit_status(
                                             &status,
@@ -10847,6 +10890,15 @@ async fn control_actor_loop(
 
                 // Start next queued message, if any.
                 if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                    // Persist the dequeue before the awaits that start the run, so
+                    // a crash here can't restore + re-run it.
+                    persist_control_queue_if_changed(
+                        &mission_store,
+                        &session_user_id,
+                        &queue,
+                        &mut last_persisted_queue,
+                    )
+                    .await;
                     set_and_emit_status(
                         &status,
                         &events_tx,
