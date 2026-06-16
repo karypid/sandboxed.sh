@@ -154,6 +154,21 @@ async fn run(args: &[&str]) -> (bool, String) {
     }
 }
 
+/// Whether a slash-trimmed `rel` is safe to interpolate into the remote build
+/// path. The path is re-parsed by the Spark's login shell (via `ssh`/rsync), so
+/// only `[A-Za-z0-9._-]` components are allowed — no shell metacharacters, no
+/// `..` traversal, no argv-flag-leading (`-`) component. Empty = workspace root.
+fn rel_path_is_safe(rel_clean: &str) -> bool {
+    rel_clean.is_empty()
+        || rel_clean.split('/').all(|c| {
+            !c.is_empty()
+                && c != ".."
+                && !c.starts_with('-')
+                && c.chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        })
+}
+
 async fn offload_build(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -223,7 +238,14 @@ async fn offload_build(
     // Reject path traversal so `rel` can't escape the (already mission-bound)
     // host_dir.
     let rel_clean = req.rel.trim_matches('/');
-    if rel_clean.split('/').any(|c| c == "..") {
+    // `rel` is interpolated into `remote_cwd`, which is re-parsed by the remote
+    // login shell (both `ssh … mkdir -p <remote_cwd>` and rsync's `host:path`
+    // spec). A scoped-token holder must NOT be able to smuggle shell
+    // metacharacters or argv flags onto the Spark (where the ssh user has
+    // sudo). Strict allowlist: each path component is non-empty, not `..`, not
+    // a flag (`-`-leading), and only `[A-Za-z0-9._-]`. Empty rel = build at the
+    // workspace root, which is allowed.
+    if !rel_path_is_safe(rel_clean) {
         return (StatusCode::BAD_REQUEST, "invalid rel").into_response();
     }
     let remote_cwd = if rel_clean.is_empty() {
@@ -350,4 +372,45 @@ async fn offload_build(
     .await;
 
     Json(OffloadResponse { exit_code, log }).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rel_path_is_safe;
+
+    #[test]
+    fn rel_allows_real_verity_worktrees() {
+        for ok in [
+            "",
+            "verity",
+            "morpho-verity",
+            "wt-c13-0x20-bridge/verity",
+            "wt-catalog-claude/verity",
+            "wk-2009",
+            "w-2005",
+            "a.b/c_d-e",
+        ] {
+            assert!(rel_path_is_safe(ok), "should allow {ok:?}");
+        }
+    }
+
+    #[test]
+    fn rel_rejects_injection_and_traversal() {
+        for bad in [
+            "verity; rm -rf ~",
+            "verity && reboot",
+            "$(touch /tmp/x)",
+            "`id`",
+            "a|b",
+            "a b",
+            "../etc",
+            "verity/../../root",
+            "-rf",          // argv flag smuggling
+            "verity/-e/sh", // flag in a later component
+            "a\nb",
+            "x>y",
+        ] {
+            assert!(!rel_path_is_safe(bad), "should reject {bad:?}");
+        }
+    }
 }
