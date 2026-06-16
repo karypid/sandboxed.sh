@@ -650,7 +650,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest(
             "/v1",
             proxy_api::routes().layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
-        );
+        )
+        // Spark build-offload endpoint authenticates with a per-mission scoped
+        // HMAC capability token verified inside the handler
+        // (verify_spark_offload_token), NOT the dashboard JWT — so it must
+        // bypass require_auth like the /v1 proxy, otherwise the in-workspace
+        // spark-build wrapper's token is rejected at the auth layer.
+        .nest("/api/spark", super::spark::routes());
 
     // File upload routes with increased body limit (10GB)
     let upload_route = Router::new()
@@ -1113,7 +1119,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/durable-jobs", durable_jobs::routes())
         // System component management endpoints
         .nest("/api/system", system_api::routes())
-        .nest("/api/spark", super::spark::routes())
         // Auth management endpoints
         .route("/api/auth/status", get(auth::auth_status))
         .route("/api/auth/change-password", post(auth::change_password))
