@@ -8022,10 +8022,19 @@ fn spawn_kimi_device_poll(key: String, dev: KimiDeviceAuthResponse) {
             600
         };
         let deadline = Instant::now() + Duration::from_secs(expires_in);
+        // Last transient poll error, surfaced only if we never get a definitive
+        // answer before the device code expires (see the `Err` arm below).
+        let mut last_transient_error: Option<String> = None;
 
         loop {
             if Instant::now() >= deadline {
-                set_kimi_device_status(&key, KimiDeviceStatus::Expired);
+                let status = match last_transient_error.take() {
+                    Some(e) => KimiDeviceStatus::Error(format!(
+                        "Kimi device login timed out after repeated polling errors: {e}"
+                    )),
+                    None => KimiDeviceStatus::Expired,
+                };
+                set_kimi_device_status(&key, status);
                 return;
             }
             tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -8064,8 +8073,13 @@ fn spawn_kimi_device_poll(key: String, dev: KimiDeviceAuthResponse) {
                     return;
                 }
                 Err(e) => {
-                    set_kimi_device_status(&key, KimiDeviceStatus::Error(e));
-                    return;
+                    // Transient transport/parse failure — a single network blip
+                    // must not permanently fail the flow. Keep polling until the
+                    // device code expires; the error is only surfaced at the
+                    // deadline if no definitive outcome ever arrives.
+                    tracing::warn!("Kimi device-token poll error (will retry until expiry): {e}");
+                    last_transient_error = Some(e);
+                    continue;
                 }
             }
         }

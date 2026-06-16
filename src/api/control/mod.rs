@@ -8510,6 +8510,13 @@ async fn control_actor_loop(
     // ignore repeated commands with the same id instead of queueing/running
     // the same user message twice.
     let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
+    // Seed the dedup guard with any messages restored from the persisted queue
+    // above. Without this, a client that retries a send after a restart (common
+    // when the connection dropped mid-request) would pass the idempotency check
+    // and get the same message queued — and executed — a second time.
+    for (id, _, _, _) in &queue {
+        accepted_user_message_ids.insert(*id);
+    }
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
     // Track number of in-flight tool calls on the main runner so the stall
