@@ -3018,6 +3018,7 @@ const ChatItemRow = memo(function ChatItemRow({
         workspaceId={workspaceId}
         missionId={missionId}
         onLoadDetails={onLoadToolDetails}
+        defaultExpanded={isLast}
       />
     );
   }

@@ -8497,21 +8497,39 @@ async fn control_actor_loop(
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
     let mut queue: VecDeque<(Uuid, String, Option<String>, Option<Uuid>)> = VecDeque::new();
-    // Restore any messages that were queued before the last restart. The queue
-    // is persisted as a JSON snapshot (see `persist_queue` at the loop top) so
-    // pending messages aren't lost when sandboxed.sh restarts.
+    // Re-drive any messages that were queued before the last restart. They are
+    // persisted as a JSON snapshot (see `persist_control_queue_if_changed`) so a
+    // restart doesn't lose pending work. We re-inject them through the normal
+    // command channel rather than pushing straight onto `queue`: an idle actor
+    // never dequeues a pre-filled `queue` on its own, so the work would
+    // otherwise sit forever. Routing them as commands also de-duplicates against
+    // a client retry of the same id via `accept_user_message_id` (whichever
+    // arrives first runs; the other is dropped), so nothing executes twice.
+    let mut restored_db_snapshot = String::new();
     if let Ok(payload) = mission_store.load_control_queue(&session_user_id).await {
         if !payload.trim().is_empty() {
             match serde_json::from_str::<Vec<QueuedMessage>>(&payload) {
                 Ok(items) => {
+                    let count = items.len();
                     for it in items {
-                        queue.push_back((it.id, it.content, it.agent, it.mission_id));
+                        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+                        if let Err(e) = self_cmd_tx.try_send(ControlCommand::UserMessage {
+                            id: it.id,
+                            content: it.content,
+                            agent: it.agent,
+                            target_mission_id: it.mission_id,
+                            strict: false,
+                            respond: ack_tx,
+                        }) {
+                            tracing::warn!("Failed to re-queue restored control message: {e}");
+                        }
                     }
-                    if !queue.is_empty() {
-                        tracing::info!(
-                            "Restored {} queued message(s) from the previous session",
-                            queue.len()
-                        );
+                    if count > 0 {
+                        // Remember the stale on-disk snapshot so the first
+                        // loop-top persist below rewrites the DB to the real
+                        // (re-injected) state instead of leaving it stale.
+                        restored_db_snapshot = payload;
+                        tracing::info!("Re-queued {count} message(s) from the previous session");
                     }
                 }
                 Err(e) => tracing::warn!("Failed to parse persisted control queue: {e}"),
@@ -8520,7 +8538,13 @@ async fn control_actor_loop(
     }
     // Snapshot of the queue as last written to the store; used to debounce
     // persistence so we only write to the DB when the queue actually changes.
-    let mut last_persisted_queue: String = serialize_queue_snapshot(&queue);
+    // When messages were restored, seed it with the stale on-disk snapshot so
+    // the first loop-top persist overwrites it with the live queue.
+    let mut last_persisted_queue: String = if restored_db_snapshot.is_empty() {
+        serialize_queue_snapshot(&queue)
+    } else {
+        restored_db_snapshot
+    };
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content) pairs (user/assistant)
     let mut running: Option<tokio::task::JoinHandle<(Uuid, String, crate::agents::AgentResult)>> =
         None;
@@ -8533,18 +8557,12 @@ async fn control_actor_loop(
     // Track current activity label for the main runner
     let mut main_runner_activity: Option<String> = None;
     // Idempotency guard for user sends. The dashboard may retry a POST if a
-    // weak connection drops after the command reached this actor but before
-    // the HTTP response got back. Since the client can now provide the UUID,
-    // ignore repeated commands with the same id instead of queueing/running
-    // the same user message twice.
+    // weak connection drops after the command reached this actor but before the
+    // HTTP response got back; since the client provides the UUID, repeated
+    // commands with the same id are ignored instead of running twice. Restored
+    // messages (re-injected as commands above) rely on this same guard: the
+    // first occurrence runs, any later duplicate is dropped.
     let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
-    // Seed the dedup guard with any messages restored from the persisted queue
-    // above. Without this, a client that retries a send after a restart (common
-    // when the connection dropped mid-request) would pass the idempotency check
-    // and get the same message queued — and executed — a second time.
-    for (id, _, _, _) in &queue {
-        accepted_user_message_ids.insert(*id);
-    }
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
     // Track number of in-flight tool calls on the main runner so the stall
