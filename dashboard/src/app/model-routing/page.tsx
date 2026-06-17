@@ -727,7 +727,13 @@ export default function ModelRoutingPage() {
 
   const { data: providersData } = useSWR(
     'routing-providers',
-    () => listProviders({ includeAll: true }),
+    // The routing page is a configuration surface: you choose which models to
+    // route to, which can include providers you haven't account-verified yet
+    // (e.g. OpenRouter before a key is set). `includeUnverified` deliberately
+    // surfaces the public catalog for every provider here. Per-provider volume
+    // is bounded server-side: prefix-filtered providers stay small, and
+    // OpenRouter is capped (live API + models.dev; see MAX_CATALOG_MODELS_PER_PROVIDER).
+    () => listProviders({ includeAll: true, includeUnverified: true }),
     { revalidateOnFocus: false }
   );
   const providers = useMemo(
