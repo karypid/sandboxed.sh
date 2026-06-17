@@ -425,6 +425,129 @@ const METADATA_SOURCE_USER: &str = "user";
 const METADATA_VERSION_V1: &str = "v1";
 static MISSION_TITLE_UPDATE_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
+
+/// Stall-guard: number of consecutive auto-armed fallback wakeups per mission,
+/// since the last real user message or self-armed automation. Bounds how many
+/// times the server will auto-resume an orchestrator that keeps parking without
+/// scheduling its own wakeup, so a genuinely-finished orchestrator isn't woken
+/// forever (after the cap it's left for a human).
+static STALL_GUARD_CONSECUTIVE_ARMS: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+const STALL_GUARD_MAX_CONSECUTIVE_ARMS: u32 = 3;
+const STALL_GUARD_WAKEUP_SECONDS: u64 = 1200;
+
+/// Clear a mission's stall-guard counter — called when a real user message
+/// arrives (the operator is steering it) so the guard's budget resets.
+pub(crate) fn reset_stall_guard(mission_id: Uuid) {
+    if let Ok(mut m) = STALL_GUARD_CONSECUTIVE_ARMS.lock() {
+        m.remove(&mission_id);
+    }
+}
+
+/// If an orchestrator mission (one that has spawned child missions) parks in
+/// `AwaitingUser` with no active automation, arm a one-shot fallback wakeup so
+/// it re-checks and continues instead of stalling on an auto-notification that
+/// won't arrive. Leaf missions (no children) are never touched, so a mission
+/// legitimately awaiting a human answer is never auto-resumed. Bounded per
+/// mission; a no-op when the agent already armed its own wakeup.
+/// Returns `true` when a fallback wakeup was armed (used by tests; callers may
+/// ignore it).
+async fn maybe_arm_stall_guard_wakeup(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+) -> bool {
+    // Only orchestrators are guarded — leaf missions awaiting a human are not.
+    let has_children = mission_store
+        .get_child_missions(mission_id)
+        .await
+        .map(|c| !c.is_empty())
+        .unwrap_or(false);
+    if !has_children {
+        return false;
+    }
+    // The agent self-armed a wakeup → it manages its own cadence; reset + skip.
+    if mission_has_active_automation(mission_store, mission_id).await {
+        reset_stall_guard(mission_id);
+        return false;
+    }
+    // Bound consecutive auto-arms.
+    let count = {
+        let Ok(mut m) = STALL_GUARD_CONSECUTIVE_ARMS.lock() else {
+            return false;
+        };
+        let c = m.entry(mission_id).or_insert(0);
+        if *c >= STALL_GUARD_MAX_CONSECUTIVE_ARMS {
+            return false;
+        }
+        *c += 1;
+        *c
+    };
+    tracing::info!(
+        mission_id = %mission_id,
+        arm = count,
+        max = STALL_GUARD_MAX_CONSECUTIVE_ARMS,
+        "Stall-guard: orchestrator parked in awaiting_user with no wakeup armed; arming fallback"
+    );
+    let prompt = "Auto-resume (stall-guard): your previous turn ended in awaiting_user \
+without scheduling a wakeup, but you are an orchestrator with work that may still be in \
+flight. Re-check your workers / board tasks / open PRs + CI and continue. If something is \
+genuinely async (CI, a long build), call ScheduleWakeup so you resume yourself. If \
+everything is truly done, report completion and stop."
+        .to_string();
+    let reason = format!(
+        "stall-guard auto-resume {}/{} (orchestrator parked with no wakeup armed)",
+        count, STALL_GUARD_MAX_CONSECUTIVE_ARMS
+    );
+    crate::api::mission_runner::spawn_claude_builtin_wakeup_automation(
+        mission_id,
+        STALL_GUARD_WAKEUP_SECONDS,
+        prompt,
+        reason,
+    );
+    true
+}
+
+#[cfg(test)]
+mod stall_guard_tests {
+    use super::*;
+
+    async fn mk(store: &Arc<dyn MissionStore>, parent: Option<Uuid>) -> Uuid {
+        store
+            .create_mission_with_parent(Some("m"), None, None, None, None, None, None, parent, None)
+            .await
+            .expect("create")
+            .id
+    }
+
+    #[tokio::test]
+    async fn leaf_mission_is_never_guarded() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let leaf = mk(&store, None).await;
+        // No children → never armed, regardless of how many times it parks.
+        for _ in 0..5 {
+            assert!(!maybe_arm_stall_guard_wakeup(&store, leaf).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_arms_then_caps_then_resets() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = mk(&store, None).await;
+        let _child = mk(&store, Some(boss)).await; // makes `boss` an orchestrator
+        reset_stall_guard(boss);
+        // Arms up to the cap, then stops (leaves it for a human).
+        for _ in 0..STALL_GUARD_MAX_CONSECUTIVE_ARMS {
+            assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
+        }
+        assert!(!maybe_arm_stall_guard_wakeup(&store, boss).await); // capped
+                                                                    // A real user message resets the budget.
+        reset_stall_guard(boss);
+        assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
+        reset_stall_guard(boss);
+    }
+}
+
 struct MetadataRefreshTaskEntry {
     handle: tokio::task::JoinHandle<()>,
     force_refresh: bool,
@@ -3177,6 +3300,11 @@ pub async fn post_message(
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
+    // A real user message means the operator is steering this mission — reset
+    // its stall-guard budget so future genuine stalls get the full allowance.
+    if let Some(mid) = target_mission_id {
+        reset_stall_guard(mid);
+    }
     let control = control_for_user(&state, &user).await;
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
@@ -8216,6 +8344,12 @@ async fn maybe_finalize_terminal_mission(
                     status: new_status,
                     summary: mission_status_summary_for_terminal_reason(reason),
                 });
+
+                // Stall-guard: orchestrators that park in awaiting_user with no
+                // wakeup armed can't resume themselves — arm a bounded fallback.
+                if new_status == MissionStatus::AwaitingUser {
+                    maybe_arm_stall_guard_wakeup(mission_store, mission_id).await;
+                }
             }
         }
         Ok(None) => {
@@ -19382,7 +19516,7 @@ Investigate <service/> failures.
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        lagged = lagged.saturating_add(n as u64);
+                        lagged = lagged.saturating_add(n);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
