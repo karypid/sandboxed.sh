@@ -538,7 +538,7 @@ function OverviewPageContent() {
   );
 
   return (
-    <div className="flex h-screen overflow-hidden">
+    <div className="flex flex-col lg:flex-row lg:h-screen lg:overflow-hidden">
       {/* Main content */}
       <div className="flex-1 flex flex-col p-6 min-h-0">
         {/* Header */}
@@ -571,14 +571,18 @@ function OverviewPageContent() {
           />
         </div>
 
-        {/* Compact Kanban Board - 3 columns, fills available space */}
-        <div className="flex-1 min-h-0 grid grid-cols-3 gap-4 mb-4">
+        {/* Compact Kanban Board - 3 columns on desktop; stacks on mobile.
+            Below lg the grid contributes no height, so the column's clip +
+            inner scroll are gated behind lg: as well — otherwise the
+            flex-1/overflow-hidden body collapses toward zero and clips cards.
+            On mobile columns grow to fit their cards and the page scrolls. */}
+        <div className="grid grid-cols-1 gap-4 mb-4 lg:flex-1 lg:min-h-0 lg:grid-cols-3">
           {columnData.map((col) => {
             const ColIcon = col.icon;
             return (
               <div
                 key={col.id}
-                className="flex flex-col min-h-0 rounded-xl bg-white/[0.01] border border-white/[0.04] overflow-hidden"
+                className="flex flex-col rounded-xl bg-white/[0.01] border border-white/[0.04] lg:min-h-0 lg:overflow-hidden"
               >
                 <div className="flex items-center justify-between px-3 py-2.5 border-b border-white/[0.04]">
                   <div className="flex items-center gap-2">
@@ -591,7 +595,7 @@ function OverviewPageContent() {
                     </span>
                   )}
                 </div>
-                <div className="flex-1 overflow-y-auto p-2 space-y-2">
+                <div className="p-2 space-y-2 lg:flex-1 lg:overflow-y-auto">
                   {col.missions.length === 0 ? (
                     <div className="flex flex-col items-center justify-center py-10 text-center">
                       <p className="text-[10px] text-white/20">
@@ -674,7 +678,7 @@ function OverviewPageContent() {
 
       {/* Right sidebar - no glass panel wrapper, just border. Flex column so
           the automations panel stretches into the remaining vertical space. */}
-      <div className="flex h-screen w-72 flex-col gap-4 overflow-y-auto border-l border-white/[0.06] p-4">
+      <div className="flex w-full flex-col gap-4 overflow-y-auto border-t border-white/[0.06] p-4 lg:h-screen lg:w-72 lg:border-t-0 lg:border-l">
         <div className="flex-shrink-0">
           <LastDaySummary
             missions={missions}

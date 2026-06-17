@@ -886,8 +886,8 @@ export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorPro
           height={200}
         />
 
-        {/* Memory, Disk and Network - Split bottom */}
-        <div className="grid grid-cols-3 gap-3 min-h-0">
+        {/* Memory, Disk and Network - 3-across on desktop; stacks on phones. */}
+        <div className="grid grid-cols-1 gap-3 min-h-0 sm:grid-cols-3">
           <MemoryChart
             data={memoryHistory}
             percent={metrics?.memory_percent ?? 0}
