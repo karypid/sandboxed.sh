@@ -111,11 +111,11 @@ impl Backend for CodexBackend {
         session: &Session,
         message: &str,
     ) -> Result<(mpsc::Receiver<ExecutionEvent>, JoinHandle<()>), Error> {
-        let config = self.config.read().await.clone();
         // All codex missions go through app-server now (Path A). The legacy
         // `codex exec` branch was removed because it can't parse slash
         // commands, never arms goals.rs, and the new path covers both
         // regular and goal missions.
+        let config = self.config.read().await.clone();
         send_message_streaming_app_server(config, session, message, self.workspace_exec.as_ref())
             .await
     }
