@@ -3,7 +3,7 @@
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, BoardTask, BoardTaskOutcome,
     BoardTaskStatus, CommandSource, DailyUsageStats, ExecutionStatus, FreshSession,
-    HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode, MissionStatus,
+    HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode, MissionScheduling, MissionStatus,
     MissionStatusCounts, MissionStore, ModelUsageStats, NewBoardTask, PalomaCooldownState,
     PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
     StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
@@ -491,7 +491,12 @@ CREATE TABLE IF NOT EXISTS missions (
     resumable INTEGER NOT NULL DEFAULT 0,
     desktop_sessions TEXT,
     terminal_reason TEXT,
-    first_viewed_at TEXT
+    first_viewed_at TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    not_before TEXT,
+    deadline TEXT,
+    deferred_goal TEXT,
+    paused_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -2017,6 +2022,72 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add first_viewed_at column: {}", e))?;
         }
 
+        // FLEET-001 scheduling columns: priority (dispatch ordering), not_before
+        // (earliest dispatch time), deadline (soft deadline for observability).
+        let has_priority_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'priority'")
+            .map_err(|e| format!("Failed to check for priority column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_priority_column {
+            tracing::info!("Running migration: adding 'priority' column to missions table");
+            conn.execute(
+                "ALTER TABLE missions ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("Failed to add priority column: {}", e))?;
+        }
+
+        let has_not_before_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'not_before'")
+            .map_err(|e| format!("Failed to check for not_before column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_not_before_column {
+            tracing::info!("Running migration: adding 'not_before' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN not_before TEXT", [])
+                .map_err(|e| format!("Failed to add not_before column: {}", e))?;
+        }
+
+        let has_deadline_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'deadline'")
+            .map_err(|e| format!("Failed to check for deadline column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_deadline_column {
+            tracing::info!("Running migration: adding 'deadline' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN deadline TEXT", [])
+                .map_err(|e| format!("Failed to add deadline column: {}", e))?;
+        }
+
+        // FLEET-001 scheduling dispatch: the goal a not_before-deferred mission
+        // will run once the scheduler dispatches it. Held here (rather than in
+        // mission history) so a Pending mission carries dispatchable work
+        // without prematurely appearing as a committed turn.
+        let has_deferred_goal_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'deferred_goal'")
+            .map_err(|e| format!("Failed to check for deferred_goal column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_deferred_goal_column {
+            tracing::info!("Running migration: adding 'deferred_goal' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN deferred_goal TEXT", [])
+                .map_err(|e| format!("Failed to add deferred_goal column: {}", e))?;
+        }
+
+        // FLEET-004: when a mission was last paused (status Paused). Drives pause
+        // age in the UI and future zombie-pause cleanup.
+        let has_paused_at_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'paused_at'")
+            .map_err(|e| format!("Failed to check for paused_at column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_paused_at_column {
+            tracing::info!("Running migration: adding 'paused_at' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN paused_at TEXT", [])
+                .map_err(|e| format!("Failed to add paused_at column: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -2279,6 +2350,7 @@ fn parse_status(s: &str) -> MissionStatus {
         "interrupted" => MissionStatus::Interrupted,
         "blocked" => MissionStatus::Blocked,
         "not_feasible" => MissionStatus::NotFeasible,
+        "paused" => MissionStatus::Paused,
         _ => MissionStatus::Pending,
     }
 }
@@ -2294,6 +2366,7 @@ fn status_to_string(status: MissionStatus) -> &'static str {
         MissionStatus::Interrupted => "interrupted",
         MissionStatus::Blocked => "blocked",
         MissionStatus::NotFeasible => "not_feasible",
+        MissionStatus::Paused => "paused",
     }
 }
 
@@ -2315,7 +2388,8 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode,
-                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at
+                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
+                            COALESCE(priority, 0) as priority, not_before, deadline, paused_at
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2354,6 +2428,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(13)?,
                         updated_at: row.get(14)?,
                         interrupted_at: row.get(15)?,
+                        paused_at: row.get(31).ok().flatten(),
                         resumable: row.get::<_, i32>(16)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -2368,6 +2443,11 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
                             first_viewed_at: row.get(27).ok().flatten(),
+                            scheduling: MissionScheduling {
+                                priority: row.get::<_, i32>(28).unwrap_or(0),
+                                not_before: row.get(29).ok().flatten(),
+                                deadline: row.get(30).ok().flatten(),
+                            },
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2427,7 +2507,8 @@ impl MissionStore for SqliteMissionStore {
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
-                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at FROM missions WHERE id = ?1",
+                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
+                            COALESCE(priority, 0) as priority, not_before, deadline, paused_at FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2463,6 +2544,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(13)?,
                         updated_at: row.get(14)?,
                         interrupted_at: row.get(15)?,
+                        paused_at: row.get(31).ok().flatten(),
                         resumable: row.get::<_, i32>(16)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -2477,6 +2559,11 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
                             first_viewed_at: row.get(27).ok().flatten(),
+                            scheduling: MissionScheduling {
+                                priority: row.get::<_, i32>(28).unwrap_or(0),
+                                not_before: row.get(29).ok().flatten(),
+                                deadline: row.get(30).ok().flatten(),
+                            },
                     })
                 })
                 .optional()
@@ -2586,6 +2673,7 @@ impl MissionStore for SqliteMissionStore {
             created_at: now.clone(),
             updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: Some(session_id.clone()),
@@ -2596,6 +2684,7 @@ impl MissionStore for SqliteMissionStore {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let m = mission.clone();
@@ -2673,6 +2762,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(14)?,
                         updated_at: row.get(15)?,
                         interrupted_at: row.get(16)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(17)? != 0,
                         desktop_sessions: Vec::new(),
                         session_id: row.get(18)?,
@@ -2685,6 +2775,7 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(23).unwrap_or(0) != 0,
                             goal_objective: row.get(24).ok().flatten(),
                             first_viewed_at: None,
+                            scheduling: Default::default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2699,6 +2790,29 @@ impl MissionStore for SqliteMissionStore {
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {
         self.update_mission_status_with_reason(id, status, None)
             .await
+    }
+
+    async fn set_mission_scheduling(
+        &self,
+        id: Uuid,
+        scheduling: &MissionScheduling,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let priority = scheduling.priority;
+        let not_before = scheduling.not_before.clone();
+        let deadline = scheduling.deadline.clone();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET priority = ?1, not_before = ?2, deadline = ?3, updated_at = ?4 WHERE id = ?5",
+                params![priority, not_before, deadline, now, id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     async fn update_mission_status_with_reason(
@@ -3329,6 +3443,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(7)?,
                         updated_at: row.get(8)?,
                         interrupted_at: row.get(9)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(10)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -3341,6 +3456,7 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: false,
                         goal_objective: None,
                         first_viewed_at: None,
+                        scheduling: Default::default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3400,6 +3516,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(7)?,
                         updated_at: row.get(8)?,
                         interrupted_at: row.get(9)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(10)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -3415,6 +3532,144 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
                         goal_objective: row.get(15).ok().flatten(),
                         first_viewed_at: None,
+                        scheduling: Default::default(),
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            Ok(missions)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn set_deferred_goal(
+        &self,
+        mission_id: Uuid,
+        goal: Option<String>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET deferred_goal = ?1 WHERE id = ?2",
+                params![goal, id],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_deferred_goal(&self, mission_id: Uuid) -> Result<Option<String>, String> {
+        let conn = self.conn.clone();
+        let id = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT deferred_goal FROM missions WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn set_mission_paused_at(
+        &self,
+        mission_id: Uuid,
+        paused_at: Option<String>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET paused_at = ?1 WHERE id = ?2",
+                params![paused_at, id],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
+                            created_at, updated_at, interrupted_at, resumable, desktop_sessions,
+                            COALESCE(backend, 'opencode') as backend,
+                            COALESCE(mission_mode, 'task') as mission_mode,
+                            COALESCE(goal_mode, 0) as goal_mode,
+                            goal_objective,
+                            COALESCE(priority, 0) as priority, not_before, deadline
+                     FROM missions
+                     WHERE status = 'pending' AND deferred_goal IS NOT NULL
+                     ORDER BY created_at ASC",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let missions = stmt
+                .query_map(params![], |row| {
+                    let id_str: String = row.get(0)?;
+                    let status_str: String = row.get(1)?;
+                    let workspace_id_str: String = row.get(3)?;
+                    let desktop_sessions_json: Option<String> = row.get(11)?;
+                    let backend: String = row.get(12)?;
+
+                    Ok(Mission {
+                        id: parse_uuid_or_nil(&id_str),
+                        status: parse_status(&status_str),
+                        title: row.get(2)?,
+                        short_description: None,
+                        metadata_updated_at: None,
+                        metadata_source: None,
+                        metadata_model: None,
+                        metadata_version: None,
+                        workspace_id: Uuid::parse_str(&workspace_id_str)
+                            .unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
+                        workspace_name: row.get(4)?,
+                        agent: row.get(5)?,
+                        model_override: row.get(6)?,
+                        model_effort: None,
+                        backend,
+                        config_profile: None,
+                        history: vec![],
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        interrupted_at: row.get(9)?,
+                        paused_at: None,
+                        resumable: row.get::<_, i32>(10)? != 0,
+                        desktop_sessions: desktop_sessions_json
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        session_id: None,
+                        terminal_reason: None,
+                        parent_mission_id: None,
+                        working_directory: None,
+                        mission_mode: row
+                            .get::<_, Option<String>>(13)?
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                            .unwrap_or_default(),
+                        goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
+                        goal_objective: row.get(15).ok().flatten(),
+                        first_viewed_at: None,
+                        scheduling: MissionScheduling {
+                            priority: row.get::<_, i32>(16).unwrap_or(0),
+                            not_before: row.get(17).ok().flatten(),
+                            deadline: row.get(18).ok().flatten(),
+                        },
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3636,6 +3891,7 @@ impl MissionStore for SqliteMissionStore {
                 id,
                 content,
                 queued,
+                source,
                 ..
             } => (
                 "user_message",
@@ -3643,7 +3899,17 @@ impl MissionStore for SqliteMissionStore {
                 None,
                 None,
                 content.clone(),
-                serde_json::json!({ "queued": queued }),
+                {
+                    // Always record `queued`; record `source` only when present so
+                    // the persisted metadata is the forensic record of who/what
+                    // posted this message (audit/attribution).
+                    let mut meta = serde_json::Map::new();
+                    meta.insert("queued".to_string(), serde_json::json!(queued));
+                    if let Some(src) = source {
+                        meta.insert("source".to_string(), serde_json::json!(src));
+                    }
+                    serde_json::Value::Object(meta)
+                },
             ),
             AgentEvent::AssistantMessage {
                 id,
@@ -5817,6 +6083,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(6).unwrap_or_default(),
                         updated_at: row.get(7).unwrap_or_default(),
                         interrupted_at: None,
+                        paused_at: None,
                         resumable: false,
                         desktop_sessions: vec![],
                         session_id: None,
@@ -5828,6 +6095,7 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: false,
                         goal_objective: None,
                         first_viewed_at: None,
+                        scheduling: Default::default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -11559,6 +11827,7 @@ mod tests {
                     content: "B".to_string(),
                     queued: true,
                     mission_id: Some(mission.id),
+                    source: None,
                 },
             )
             .await
@@ -11581,6 +11850,7 @@ mod tests {
                     content: "A".to_string(),
                     queued: false,
                     mission_id: Some(mission.id),
+                    source: None,
                 },
             )
             .await
@@ -11613,6 +11883,7 @@ mod tests {
                     content: "B".to_string(),
                     queued: false,
                     mission_id: Some(mission.id),
+                    source: None,
                 },
             )
             .await
@@ -11656,6 +11927,59 @@ mod tests {
                 ("user".to_string(), "B".to_string()),
                 ("assistant".to_string(), "reply B".to_string()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn user_message_source_is_persisted_in_metadata() {
+        use crate::api::control::AgentEvent;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(
+                Some("source attribution"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: "hello".to_string(),
+                    queued: false,
+                    mission_id: Some(mission.id),
+                    source: Some("api:user-123".to_string()),
+                },
+            )
+            .await
+            .expect("user message with source");
+
+        let events = store
+            .get_events(mission.id, None, None, None)
+            .await
+            .expect("events");
+        let user_event = events
+            .iter()
+            .find(|e| e.event_type == "user_message")
+            .expect("user_message row");
+        // The persisted metadata JSON is the forensic record of who/what posted
+        // this message — it must carry the attribution source.
+        assert_eq!(
+            user_event.metadata.get("source").and_then(|v| v.as_str()),
+            Some("api:user-123"),
+            "persisted metadata should contain the attribution source, got {}",
+            user_event.metadata
         );
     }
 
@@ -12750,6 +13074,7 @@ mod tests {
                         content: format!("msg {i}"),
                         queued: false,
                         mission_id: Some(mission.id),
+                        source: None,
                     },
                 )
                 .await
@@ -12849,6 +13174,7 @@ mod tests {
                         content: format!("msg {i}"),
                         queued: false,
                         mission_id: Some(mission.id),
+                        source: None,
                     },
                 )
                 .await
@@ -13533,5 +13859,81 @@ mod tests {
             .expect("get")
             .expect("some");
         assert_eq!(fetched.task_key, "t2");
+    }
+
+    /// FLEET-001: deferred goals round-trip and the scheduled-pending query
+    /// surfaces only Pending missions that carry a goal, with scheduling fields
+    /// populated (verifies the SELECT column indices).
+    #[tokio::test]
+    async fn deferred_goal_and_scheduled_pending_round_trip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Scheduled"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        store
+            .set_mission_scheduling(
+                mission.id,
+                &crate::api::mission_store::MissionScheduling {
+                    priority: 7,
+                    not_before: Some("2099-01-01T00:00:00Z".to_string()),
+                    deadline: Some("2099-02-01T00:00:00Z".to_string()),
+                },
+            )
+            .await
+            .expect("set scheduling");
+
+        // No goal yet -> not scheduled-pending.
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+
+        store
+            .set_deferred_goal(mission.id, Some("run the report".to_string()))
+            .await
+            .expect("set goal");
+        assert_eq!(
+            store
+                .get_deferred_goal(mission.id)
+                .await
+                .expect("get")
+                .as_deref(),
+            Some("run the report")
+        );
+
+        let pending = store.get_scheduled_pending_missions().await.expect("list");
+        assert_eq!(pending.len(), 1);
+        let m = &pending[0];
+        assert_eq!(m.id, mission.id);
+        assert_eq!(m.scheduling.priority, 7);
+        assert_eq!(
+            m.scheduling.not_before.as_deref(),
+            Some("2099-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            m.scheduling.deadline.as_deref(),
+            Some("2099-02-01T00:00:00Z")
+        );
+
+        // Clearing the goal removes it from the scheduled-pending set.
+        store
+            .set_deferred_goal(mission.id, None)
+            .await
+            .expect("clear");
+        assert!(store
+            .get_deferred_goal(mission.id)
+            .await
+            .expect("get")
+            .is_none());
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
     }
 }

@@ -997,6 +997,7 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     agent: None,
                     target_mission_id: Some(turn.mission_id),
                     strict: false,
+                    source: None,
                     respond: tx,
                 })
                 .await;
@@ -1101,6 +1102,7 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     config_profile: None,
                     parent_mission_id: None,
                     working_directory: None,
+                    scheduling: Default::default(),
                     respond: tx,
                 })
                 .await
@@ -1126,6 +1128,7 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     agent: None,
                     target_mission_id: Some(mission.id),
                     strict: false,
+                    source: None,
                     respond: tx2,
                 })
                 .await;

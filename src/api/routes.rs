@@ -770,8 +770,16 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::cancel_mission),
         )
         .route(
+            "/api/control/missions/:id/pause",
+            post(control::pause_mission),
+        )
+        .route(
             "/api/control/missions/:id/resume",
             post(control::resume_mission),
+        )
+        .route(
+            "/api/control/missions/:id/clone",
+            post(control::clone_mission),
         )
         .route(
             "/api/control/missions/:id/parallel",
@@ -1125,6 +1133,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // Backend management endpoints
         .route("/api/backends", get(backends_api::list_backends))
         .route("/api/backends/:id", get(backends_api::get_backend))
+        .route(
+            "/api/backends/:id/quota",
+            get(backends_api::get_backend_quota),
+        )
         .route(
             "/api/backends/:id/agents",
             get(backends_api::list_backend_agents),

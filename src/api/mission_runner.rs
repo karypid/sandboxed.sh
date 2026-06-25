@@ -2467,6 +2467,9 @@ pub struct QueuedMessage {
     pub content: String,
     /// Optional agent override for this specific message (e.g., from @agent mention)
     pub agent: Option<String>,
+    /// Origin of the message (e.g. `api:<user_id>`, `telegram`) for audit. None
+    /// for system-generated messages (resume prompts, board wakeups).
+    pub source: Option<String>,
 }
 
 /// Environment flag gating the background-task auto-resume feature.
@@ -2720,8 +2723,19 @@ impl MissionRunner {
     }
 
     /// Queue a message for this mission.
-    pub fn queue_message(&mut self, id: Uuid, content: String, agent: Option<String>) {
-        self.queue.push_back(QueuedMessage { id, content, agent });
+    pub fn queue_message(
+        &mut self,
+        id: Uuid,
+        content: String,
+        agent: Option<String>,
+        source: Option<String>,
+    ) {
+        self.queue.push_back(QueuedMessage {
+            id,
+            content,
+            agent,
+            source,
+        });
     }
 
     /// Cancel the current execution.
@@ -2795,6 +2809,7 @@ impl MissionRunner {
         let user_id = self.user_id.clone();
         let user_message = msg.content.clone();
         let msg_id = msg.id;
+        let msg_source = msg.source.clone();
         tracing::info!(
             mission_id = %mission_id,
             workspace_id = %workspace_id,
@@ -2810,12 +2825,14 @@ impl MissionRunner {
             cmd_tx: mission_cmd_tx,
         };
 
-        // Emit user message event with mission context
+        // Emit user message event with mission context, preserving the original
+        // attribution (api:/telegram/…) stored on the queued message.
         let _ = events_tx.send(AgentEvent::UserMessage {
             id: msg_id,
             content: user_message.clone(),
             queued: false,
             mission_id: Some(mission_id),
+            source: msg_source,
         });
 
         let handle = tokio::spawn(async move {

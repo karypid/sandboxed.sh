@@ -407,6 +407,7 @@ fn mission_rank(mission: &Mission, interest: TelegramMissionInterestLevel) -> i3
         MissionStatus::Active => 40,
         MissionStatus::Pending => 25,
         MissionStatus::Interrupted => 20,
+        MissionStatus::Paused => 10,
         MissionStatus::Acknowledged | MissionStatus::Completed | MissionStatus::NotFeasible => 0,
     };
     if mission.parent_mission_id.is_none() {
@@ -788,6 +789,7 @@ async fn send_user_message_to_mission(
             agent: None,
             target_mission_id: Some(mission.id),
             strict: false,
+            source: Some("telegram".to_string()),
             respond: queued_tx,
         })
         .await
@@ -3476,6 +3478,7 @@ async fn resolve_or_create_mission(
             config_profile: ctx.channel.default_config_profile.clone(),
             parent_mission_id: None,
             working_directory: None,
+            scheduling: Default::default(),
             respond: tx,
         })
         .await;
@@ -4221,6 +4224,7 @@ pub async fn process_webhook_message(
                     content: content.clone(),
                     queued: false,
                     mission_id: Some(target_mission_id),
+                    source: Some("telegram".to_string()),
                 },
             )
             .await;
@@ -4249,6 +4253,7 @@ pub async fn process_webhook_message(
             agent: None,
             target_mission_id: Some(target_mission_id),
             strict: false,
+            source: Some("telegram".to_string()),
             respond: queued_tx,
         })
         .await;
@@ -5554,6 +5559,7 @@ async fn relay_workflow_reply_to_origin(
             agent: None,
             target_mission_id: Some(origin_mission_id),
             strict: false,
+            source: Some("telegram".to_string()),
             respond: queued_tx,
         })
         .await;
@@ -6636,6 +6642,7 @@ mod tests {
             created_at: "2026-05-20T00:00:00Z".to_string(),
             updated_at: "2026-05-20T00:00:00Z".to_string(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: vec![],
             session_id: None,
@@ -6646,6 +6653,7 @@ mod tests {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         }
     }
 

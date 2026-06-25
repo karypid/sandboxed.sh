@@ -201,6 +201,7 @@ fn self_send_message(
         agent: None,
         target_mission_id: Some(target_mission_id),
         strict: true,
+        source: None,
         respond,
     }) {
         Ok(()) => true,
@@ -395,6 +396,10 @@ pub async fn scheduler_pass(
                 MissionStatus::Active => {
                     // Runner may exist in another control session or be mid-start;
                     // leave it alone.
+                }
+                MissionStatus::Paused => {
+                    // Operator-paused worker: leave it alone, the dispatcher will
+                    // resume it when unpaused.
                 }
             }
         }

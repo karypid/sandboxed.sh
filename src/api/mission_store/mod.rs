@@ -21,6 +21,28 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+/// FLEET-001 scheduling metadata for a mission. Flattened into [`Mission`] so
+/// the fields surface at the top level of API responses (the fleet watcher
+/// reads `priority`/`not_before`/`deadline` directly) while keeping the
+/// scheduler inputs grouped in one place.
+///
+/// Timestamps are stored as RFC3339 strings to match the rest of the mission
+/// row (`created_at`/`updated_at`) and the underlying TEXT columns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionScheduling {
+    /// Dispatch priority; higher wins. FIFO (by `created_at`) within a tier.
+    #[serde(default)]
+    pub priority: i32,
+    /// Do not dispatch before this RFC3339 timestamp. The scheduler holds the
+    /// mission's goal in `deferred_goal` and only dispatches once `now` passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    /// Deadline (RFC3339). The scheduler fails a still-undispatched scheduled
+    /// mission with reason `deadline_exceeded` once this passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<String>,
+}
+
 /// A mission (persistent goal-oriented session).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
@@ -64,6 +86,10 @@ pub struct Mission {
     /// When this mission was interrupted (if status is Interrupted)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interrupted_at: Option<String>,
+    /// FLEET-004: when this mission was last paused (if status is Paused). RFC3339.
+    /// Lets the UI show pause age and enables future zombie-pause cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
     /// Whether this mission can be resumed
     #[serde(default)]
     pub resumable: bool,
@@ -103,6 +129,10 @@ pub struct Mission {
     /// Active via a new user message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_viewed_at: Option<String>,
+    /// FLEET-001 scheduling metadata (priority, not_before, deadline).
+    /// Flattened so the fields appear top-level in serialized output.
+    #[serde(default, flatten)]
+    pub scheduling: MissionScheduling,
 }
 
 /// Aggregate mission counts by status.
@@ -120,6 +150,55 @@ fn default_backend() -> String {
 
 fn default_workspace_id() -> Uuid {
     crate::workspace::DEFAULT_WORKSPACE_ID
+}
+
+impl Mission {
+    /// True when the `not_before` constraint (if any) is satisfied at `now`.
+    /// An unset or unparseable timestamp never blocks dispatch.
+    pub fn is_dispatchable_at(&self, now: chrono::DateTime<Utc>) -> bool {
+        match self.scheduling.not_before.as_deref() {
+            Some(ts) => chrono::DateTime::parse_from_rfc3339(ts)
+                .map(|t| t.with_timezone(&Utc) <= now)
+                .unwrap_or(true),
+            None => true,
+        }
+    }
+
+    /// True when a `deadline` is set and has already elapsed at `now`.
+    pub fn is_past_deadline(&self, now: chrono::DateTime<Utc>) -> bool {
+        match self.scheduling.deadline.as_deref() {
+            Some(ts) => chrono::DateTime::parse_from_rfc3339(ts)
+                .map(|t| t.with_timezone(&Utc) < now)
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+}
+
+/// FLEET-001: select the next mission to dispatch from a candidate set.
+///
+/// A mission is *runnable* when it is `Pending` (which excludes `Paused`,
+/// terminal, and in-flight states) and its `not_before` constraint is
+/// satisfied at `now`. Among runnable missions the highest `priority` wins,
+/// with ties broken by oldest `created_at` (FIFO). Returns `None` when
+/// nothing is runnable.
+///
+/// This is a pure function so the dispatch ordering has a single, unit-tested
+/// source of truth independent of any storage backend.
+pub fn select_next_runnable_mission(
+    missions: &[Mission],
+    now: chrono::DateTime<Utc>,
+) -> Option<&Mission> {
+    missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::Pending)
+        .filter(|m| m.is_dispatchable_at(now))
+        .max_by(|a, b| {
+            a.scheduling
+                .priority
+                .cmp(&b.scheduling.priority)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        })
 }
 
 /// A single entry in the mission history.
@@ -1287,6 +1366,17 @@ pub trait MissionStore: Send + Sync {
     /// Update mission status.
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String>;
 
+    /// Persist FLEET-001 scheduling metadata (priority, not_before, deadline)
+    /// for a mission. Default is a no-op so non-persistent stores can ignore it;
+    /// the SQLite store overrides it to write the dedicated columns.
+    async fn set_mission_scheduling(
+        &self,
+        _id: Uuid,
+        _scheduling: &MissionScheduling,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Update mission status with terminal reason (for failed/completed missions).
     async fn update_mission_status_with_reason(
         &self,
@@ -1380,6 +1470,27 @@ pub trait MissionStore: Send + Sync {
 
     /// Get all missions currently in active status (for startup recovery).
     async fn get_all_active_missions(&self) -> Result<Vec<Mission>, String>;
+
+    /// FLEET-001 scheduling: persist (or clear, with `None`) the deferred goal a
+    /// `not_before`-scheduled mission will run once the dispatcher picks it up.
+    async fn set_deferred_goal(&self, mission_id: Uuid, goal: Option<String>)
+        -> Result<(), String>;
+
+    /// FLEET-001 scheduling: read the deferred goal for a mission, if any.
+    async fn get_deferred_goal(&self, mission_id: Uuid) -> Result<Option<String>, String>;
+
+    /// FLEET-001 scheduling: all `Pending` missions that carry a deferred goal
+    /// (i.e. are armed for scheduled dispatch). Scheduling fields are populated
+    /// so the dispatcher can order/expire them; history is not loaded.
+    async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String>;
+
+    /// FLEET-004: set (or clear, with `None`) the timestamp at which a mission
+    /// was paused. Set on pause, cleared on resume.
+    async fn set_mission_paused_at(
+        &self,
+        mission_id: Uuid,
+        paused_at: Option<String>,
+    ) -> Result<(), String>;
 
     /// Record the first time the user opened this mission, if not already set.
     /// Returns `Some(timestamp)` if the field was set by this call, or `None`
@@ -2806,6 +2917,111 @@ mod tests {
         );
     }
 
+    /// FLEET-001: a Pending mission appears in the scheduled-pending list only
+    /// while it carries a deferred goal, and disappears once dispatched (Active)
+    /// or the goal is cleared.
+    #[tokio::test]
+    async fn test_scheduled_pending_missions_track_deferred_goal() {
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("Scheduled"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+
+        // No goal yet -> not scheduled-pending.
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+
+        // Stash a goal -> appears, with the goal readable.
+        store
+            .set_deferred_goal(mission.id, Some("do the thing".to_string()))
+            .await
+            .expect("set goal");
+        assert_eq!(
+            store
+                .get_deferred_goal(mission.id)
+                .await
+                .expect("get goal")
+                .as_deref(),
+            Some("do the thing")
+        );
+        let pending = store.get_scheduled_pending_missions().await.expect("list");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, mission.id);
+
+        // Dispatched (Active) -> no longer scheduled-pending even with goal set.
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("activate");
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+
+        // Back to Pending but goal cleared -> still not scheduled-pending.
+        store
+            .update_mission_status(mission.id, MissionStatus::Pending)
+            .await
+            .expect("repend");
+        store
+            .set_deferred_goal(mission.id, None)
+            .await
+            .expect("clear goal");
+        assert!(store
+            .get_deferred_goal(mission.id)
+            .await
+            .expect("get goal")
+            .is_none());
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+    }
+
+    /// FLEET-004: paused_at round-trips through the store (set on pause, read
+    /// back on the mission, cleared on resume).
+    #[tokio::test]
+    async fn test_paused_at_round_trip() {
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("Pausable"), None, None, None, None, None, None)
+            .await
+            .expect("create");
+        assert!(mission.paused_at.is_none());
+
+        store
+            .set_mission_paused_at(mission.id, Some("2026-06-25T05:00:00+00:00".to_string()))
+            .await
+            .expect("set paused_at");
+        let loaded = store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(
+            loaded.paused_at.as_deref(),
+            Some("2026-06-25T05:00:00+00:00")
+        );
+
+        store
+            .set_mission_paused_at(mission.id, None)
+            .await
+            .expect("clear paused_at");
+        assert!(store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("some")
+            .paused_at
+            .is_none());
+    }
+
     /// Test that missions transition correctly from Pending to Active.
     #[tokio::test]
     async fn test_mission_status_transition_pending_to_active() {
@@ -2905,5 +3121,132 @@ mod tests {
         assert_eq!(format!("{}", MissionStatus::Active), "active");
         assert_eq!(format!("{}", MissionStatus::Completed), "completed");
         assert_eq!(format!("{}", MissionStatus::Interrupted), "interrupted");
+    }
+
+    // ---- FLEET-001 / FLEET-004 scheduling tests ----
+
+    /// Build a minimal Pending mission with the given scheduling inputs for
+    /// the dispatcher tests.
+    fn scheduling_mission(
+        created_at: &str,
+        priority: i32,
+        not_before: Option<&str>,
+        status: MissionStatus,
+    ) -> Mission {
+        Mission {
+            id: Uuid::new_v4(),
+            status,
+            title: None,
+            short_description: None,
+            metadata_updated_at: None,
+            metadata_source: None,
+            metadata_model: None,
+            metadata_version: None,
+            workspace_id: default_workspace_id(),
+            workspace_name: None,
+            agent: None,
+            model_override: None,
+            model_effort: None,
+            backend: default_backend(),
+            config_profile: None,
+            history: vec![],
+            created_at: created_at.to_string(),
+            updated_at: created_at.to_string(),
+            interrupted_at: None,
+            paused_at: None,
+            resumable: false,
+            desktop_sessions: Vec::new(),
+            session_id: None,
+            terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
+            mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
+            first_viewed_at: None,
+            scheduling: MissionScheduling {
+                priority,
+                not_before: not_before.map(|s| s.to_string()),
+                deadline: None,
+            },
+        }
+    }
+
+    /// FLEET-004: Paused is a non-terminal status (unlike Blocked), so a paused
+    /// mission can later be resumed.
+    #[test]
+    fn test_paused_not_terminal() {
+        use crate::api::control::mission_status_is_terminal;
+        assert!(!mission_status_is_terminal(MissionStatus::Paused));
+        // Sanity: a genuinely terminal status still reports terminal.
+        assert!(mission_status_is_terminal(MissionStatus::Completed));
+        assert!(mission_status_is_terminal(MissionStatus::Blocked));
+    }
+
+    /// FLEET-001: higher priority wins; ties broken by oldest created_at (FIFO).
+    #[test]
+    fn test_priority_sorting() {
+        let now = Utc::now();
+        let missions = vec![
+            scheduling_mission("2026-01-01T00:00:00Z", 0, None, MissionStatus::Pending),
+            scheduling_mission("2026-01-01T01:00:00Z", 5, None, MissionStatus::Pending),
+            scheduling_mission("2026-01-01T02:00:00Z", 5, None, MissionStatus::Pending),
+        ];
+        let next = select_next_runnable_mission(&missions, now).expect("a runnable mission");
+        // Highest priority is 5; between the two priority-5 missions the older
+        // (01:00) wins over the newer (02:00).
+        assert_eq!(next.scheduling.priority, 5);
+        assert_eq!(next.created_at, "2026-01-01T01:00:00Z");
+    }
+
+    /// FLEET-001: missions with `not_before` in the future are not runnable;
+    /// `Paused` missions are excluded even when otherwise eligible.
+    #[test]
+    fn test_not_before_filtering() {
+        let now = Utc::now();
+        let future = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let past = (now - chrono::Duration::hours(1)).to_rfc3339();
+
+        // Only a future not_before -> nothing runnable.
+        let blocked = vec![scheduling_mission(
+            "2026-01-01T00:00:00Z",
+            10,
+            Some(&future),
+            MissionStatus::Pending,
+        )];
+        assert!(select_next_runnable_mission(&blocked, now).is_none());
+
+        // A past not_before is runnable; a higher-priority Paused mission is
+        // skipped; a higher-priority future mission is skipped.
+        let mixed = vec![
+            scheduling_mission(
+                "2026-01-01T00:00:00Z",
+                1,
+                Some(&past),
+                MissionStatus::Pending,
+            ),
+            scheduling_mission("2026-01-01T00:00:00Z", 99, None, MissionStatus::Paused),
+            scheduling_mission(
+                "2026-01-01T00:00:00Z",
+                99,
+                Some(&future),
+                MissionStatus::Pending,
+            ),
+        ];
+        let next = select_next_runnable_mission(&mixed, now).expect("the past-eligible mission");
+        assert_eq!(next.scheduling.priority, 1);
+        assert!(next.is_dispatchable_at(now));
+    }
+
+    /// FLEET-001: deadline helper reports elapsed deadlines and ignores unset.
+    #[test]
+    fn test_deadline_detection() {
+        let now = Utc::now();
+        let mut m = scheduling_mission("2026-01-01T00:00:00Z", 0, None, MissionStatus::Pending);
+        assert!(!m.is_past_deadline(now));
+        m.scheduling.deadline = Some((now - chrono::Duration::minutes(1)).to_rfc3339());
+        assert!(m.is_past_deadline(now));
+        m.scheduling.deadline = Some((now + chrono::Duration::minutes(1)).to_rfc3339());
+        assert!(!m.is_past_deadline(now));
     }
 }

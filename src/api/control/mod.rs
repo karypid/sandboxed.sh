@@ -63,6 +63,11 @@ use super::routes::AppState;
 pub(crate) const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
 
+/// One entry in the main control queue: (message id, content, optional per-message
+/// agent override, target mission id, source). Aliased to keep signatures under
+/// clippy's `type_complexity` threshold.
+type ControlQueueEntry = (Uuid, String, Option<String>, Option<Uuid>, Option<String>);
+
 /// Silence threshold before declaring a mission stuck. Conservative so
 /// legitimately long codex turns (Lean compiles, CI polls) don't trigger
 /// false positives. Shared between the watchdog loop and the actor's
@@ -545,6 +550,55 @@ mod stall_guard_tests {
         reset_stall_guard(boss);
         assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
         reset_stall_guard(boss);
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_paused_mission_until_resumed_or_cancelled() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mid = mk(&store, None).await;
+        store
+            .update_mission_status(mid, MissionStatus::Paused)
+            .await
+            .expect("pause");
+
+        // Deleting a paused mission is refused with 409 and leaves it intact.
+        let err = delete_mission_with_children(&store, mid, &[])
+            .await
+            .expect_err("paused delete should be refused");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(store.get_mission(mid).await.expect("get").is_some());
+
+        // Once it leaves Paused (e.g. resumed → Interrupted), delete succeeds.
+        store
+            .update_mission_status(mid, MissionStatus::Interrupted)
+            .await
+            .expect("resume");
+        delete_mission_with_children(&store, mid, &[])
+            .await
+            .expect("delete after resume");
+        assert!(store.get_mission(mid).await.expect("get").is_none());
+    }
+
+    #[test]
+    fn resolve_actor_prefers_explicit_then_falls_back_to_user() {
+        let user = AuthUser {
+            id: "u-123".to_string(),
+            username: "thomas".to_string(),
+        };
+        // Explicit override wins (trimmed).
+        assert_eq!(
+            resolve_actor(Some("  system:fleet-watcher ".to_string()), &user),
+            "system:fleet-watcher"
+        );
+        // Blank override is ignored → falls back to the user.
+        assert_eq!(resolve_actor(Some("   ".to_string()), &user), "user:thomas");
+        assert_eq!(resolve_actor(None, &user), "user:thomas");
+        // No username → fall back to the id.
+        let anon = AuthUser {
+            id: "u-123".to_string(),
+            username: String::new(),
+        };
+        assert_eq!(resolve_actor(None, &anon), "user:u-123");
     }
 }
 
@@ -2583,20 +2637,24 @@ pub struct QueuedMessage {
     pub agent: Option<String>,
     /// Which mission this queued message belongs to
     pub mission_id: Option<Uuid>,
+    /// Attribution for the message (e.g. `api:<user_id>`, `telegram`). Persisted
+    /// so a queued message keeps its source after a restart. Defaults to `None`
+    /// for snapshots written before this field existed.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Serialize the control session queue to a stable JSON snapshot for
 /// persistence across restarts (see `MissionStore::save_control_queue`).
-fn serialize_queue_snapshot(
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
-) -> String {
+fn serialize_queue_snapshot(queue: &VecDeque<ControlQueueEntry>) -> String {
     let items: Vec<QueuedMessage> = queue
         .iter()
-        .map(|(id, content, agent, target_mid)| QueuedMessage {
+        .map(|(id, content, agent, target_mid, source)| QueuedMessage {
             id: *id,
             content: content.clone(),
             agent: agent.clone(),
             mission_id: *target_mid,
+            source: source.clone(),
         })
         .collect();
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
@@ -2614,7 +2672,7 @@ fn serialize_queue_snapshot(
 async fn persist_control_queue_if_changed(
     mission_store: &Arc<dyn MissionStore>,
     session_user_id: &str,
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    queue: &VecDeque<ControlQueueEntry>,
     last_persisted: &mut String,
 ) {
     let snapshot = serialize_queue_snapshot(queue);
@@ -3324,6 +3382,7 @@ pub async fn post_message(
             agent,
             target_mission_id,
             strict: false,
+            source: Some(format!("api:{}", user.id)),
             respond: queued_tx,
         })
         .await
@@ -3545,6 +3604,7 @@ pub async fn board_task_verdict(
                         agent: None,
                         target_mission_id: Some(worker_id),
                         strict: false,
+                        source: Some("task-board".to_string()),
                         respond: tx,
                     })
                     .await
@@ -4181,6 +4241,16 @@ pub struct CreateMissionRequest {
     pub parent_mission_id: Option<Uuid>,
     /// Working directory override (for git worktrees etc.)
     pub working_directory: Option<String>,
+    /// FLEET-001 scheduling hint: dispatch priority (higher = more important,
+    /// default 0). The scheduler dispatches higher-priority scheduled missions
+    /// first, FIFO within the same priority.
+    pub priority: Option<i32>,
+    /// FLEET-001 scheduling hint: do not dispatch before this timestamp. The
+    /// mission's first message is held (as `deferred_goal`) until then.
+    pub not_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// FLEET-001 scheduling hint: deadline. A scheduled mission that never
+    /// dispatches before this is failed with reason `deadline_exceeded`.
+    pub deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4279,6 +4349,9 @@ pub async fn create_mission(
         backend: None,
         parent_mission_id: None,
         working_directory: None,
+        priority: None,
+        not_before: None,
+        deadline: None,
     });
 
     let title = req.title.clone();
@@ -4409,6 +4482,11 @@ pub async fn create_mission(
             config_profile: effective_config_profile,
             parent_mission_id: req.parent_mission_id,
             working_directory: req.working_directory,
+            scheduling: crate::api::mission_store::MissionScheduling {
+                priority: req.priority.unwrap_or(0),
+                not_before: req.not_before.map(|t| t.to_rfc3339()),
+                deadline: req.deadline.map(|t| t.to_rfc3339()),
+            },
             respond: tx,
         })
         .await
@@ -5598,6 +5676,206 @@ pub async fn cancel_mission(
         .map_err(|e| (StatusCode::NOT_FOUND, e))
 }
 
+/// Optional body for the pause endpoint (FLEET-004). Carries attribution only.
+#[derive(Debug, Default, Deserialize)]
+pub struct PauseMissionRequest {
+    /// Optional attribution override (e.g. `"system:fleet-watcher"`).
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// Pause a mission (FLEET-004). Sets the mission to `Paused`, a non-terminal
+/// state the dispatcher deliberately skips when selecting the next runnable
+/// mission. Resume via `POST /missions/:id/resume`, which transitions a
+/// `Paused` mission back to `Pending` so the dispatcher re-queues it.
+///
+/// Rejects missions that are already terminal (nothing to pause) or already
+/// paused (no-op kept explicit for the operator).
+pub async fn pause_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    body: Option<Json<PauseMissionRequest>>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let actor = resolve_actor(body.and_then(|b| b.0.actor), &user);
+    let control = control_for_user(&state, &user).await;
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+
+    if mission.status == MissionStatus::Paused {
+        return Err((
+            StatusCode::CONFLICT,
+            "Mission is already paused".to_string(),
+        ));
+    }
+    if mission_status_is_terminal(mission.status) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot pause a terminal mission (status: {})",
+                mission.status
+            ),
+        ));
+    }
+
+    // Route through the control loop so any in-flight runner is actually
+    // stopped before the mission is parked. A bare store update would leave the
+    // active turn executing and let its completion overwrite `Paused`.
+    let (tx, rx) = oneshot::channel();
+    control
+        .cmd_tx
+        .send(ControlCommand::PauseMission {
+            mission_id,
+            respond: tx,
+        })
+        .await
+        .map_err(session_unavailable)?;
+    rx.await
+        .map_err(recv_failed)?
+        .map_err(|e| (StatusCode::CONFLICT, e))?;
+    tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission paused");
+
+    let updated = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+    Ok(Json(updated))
+}
+
+/// Resolve the acting principal for a FLEET control action. An explicit
+/// `actor` override (e.g. `"system:fleet-watcher"`) wins; otherwise we attribute
+/// it to the authenticated user. Recorded in structured logs so a post-mortem
+/// can answer "who paused/cloned/resumed this mission?".
+fn resolve_actor(explicit: Option<String>, user: &AuthUser) -> String {
+    explicit
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| {
+            let who = if user.username.is_empty() {
+                &user.id
+            } else {
+                &user.username
+            };
+            format!("user:{}", who)
+        })
+}
+
+/// Overrides accepted when cloning a mission (FLEET-002). Any field left unset
+/// inherits from the source mission.
+#[derive(Debug, Default, Deserialize)]
+pub struct CloneMissionRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub model_effort: Option<String>,
+    #[serde(default)]
+    pub model_override: Option<String>,
+    /// When true, copy the source mission's conversation history into the clone
+    /// (retry-with-context). Default false — the clone starts fresh.
+    #[serde(default)]
+    pub clone_messages: bool,
+    /// Optional parent to record on the clone for lineage tracing in the UI.
+    /// Left unset, the clone has no parent (independent mission).
+    #[serde(default)]
+    pub parent_mission_id: Option<Uuid>,
+    /// Optional attribution override (e.g. `"system:fleet-watcher"`).
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// Clone an existing mission's configuration into a fresh `Pending` mission
+/// (FLEET-002). Copies title, workspace, agent, config profile, working
+/// directory and model settings; the optional body overrides
+/// title/backend/model_effort/model_override. Conversation history is **not**
+/// copied — the clone starts fresh. Reuses the standard create path so all
+/// backend/agent/model validation applies identically.
+pub async fn clone_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    body: Option<Json<CloneMissionRequest>>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let overrides = body.map(|b| b.0).unwrap_or_default();
+    let actor = resolve_actor(overrides.actor.clone(), &user);
+    let clone_messages = overrides.clone_messages;
+    let parent_mission_id = overrides.parent_mission_id;
+
+    let control = control_for_user(&state, &user).await;
+    let source = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+
+    let req = CreateMissionRequest {
+        title: overrides.title.or_else(|| source.title.clone()),
+        workspace_id: Some(source.workspace_id),
+        agent: source.agent.clone(),
+        model_override: overrides
+            .model_override
+            .or_else(|| source.model_override.clone()),
+        model_effort: overrides
+            .model_effort
+            .or_else(|| source.model_effort.clone()),
+        config_profile: source.config_profile.clone(),
+        backend: overrides.backend.or_else(|| Some(source.backend.clone())),
+        parent_mission_id,
+        working_directory: source.working_directory.clone(),
+        priority: None,
+        not_before: None,
+        deadline: None,
+    };
+
+    let cloned = create_mission(State(state), Extension(user), Some(Json(req))).await?;
+    let clone_id = cloned.0.id;
+
+    // Optionally seed the clone with the source's conversation history
+    // (retry-with-context). `control` still holds the store handle after the
+    // create above moved `state`.
+    if clone_messages && !source.history.is_empty() {
+        control
+            .mission_store
+            .update_mission_history(clone_id, &source.history)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    tracing::info!(
+        source_mission = %mission_id,
+        clone_mission = %clone_id,
+        actor = %actor,
+        clone_messages,
+        parent = ?parent_mission_id,
+        "FLEET-002 mission cloned"
+    );
+
+    Ok(cloned)
+}
+
 /// Request body for resuming a mission
 #[derive(Debug, Deserialize, Default)]
 pub struct ResumeMissionRequest {
@@ -5608,6 +5886,9 @@ pub struct ResumeMissionRequest {
     /// Useful when the user is about to send their own custom message.
     #[serde(default)]
     pub skip_message: bool,
+    /// Optional attribution override (e.g. `"system:fleet-watcher"`).
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 /// Resume an interrupted mission.
@@ -5618,27 +5899,83 @@ pub async fn resume_mission(
     Path(mission_id): Path<Uuid>,
     body: Option<Json<ResumeMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
-    let (clean_workspace, skip_message) = body
-        .map(|b| (b.clean_workspace, b.skip_message))
-        .unwrap_or((false, false));
-    let (tx, rx) = oneshot::channel();
+    let (clean_workspace, skip_message, actor_override) = body
+        .map(|b| {
+            let r = b.0;
+            (r.clean_workspace, r.skip_message, r.actor)
+        })
+        .unwrap_or((false, false, None));
+    let actor = resolve_actor(actor_override, &user);
 
     let control = control_for_user(&state, &user).await;
-    control
-        .cmd_tx
-        .send(ControlCommand::ResumeMission {
-            mission_id,
-            clean_workspace,
-            skip_message,
-            respond: tx,
-        })
-        .await
-        .map_err(session_unavailable)?;
+    tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
-    rx.await
-        .map_err(recv_failed)?
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    // FLEET-004: a Paused mission resumes its *prior work* from history, so it
+    // first transitions to Interrupted (the status `resume_mission_impl`
+    // accepts) and then falls through to the ResumeMission path below to rebuild
+    // context and restart the runner. (Pending would be wrong here: the FLEET-001
+    // dispatcher only dispatches `not_before`-scheduled missions that carry a
+    // fresh `deferred_goal`, not paused missions continuing from history.)
+    let was_paused = matches!(
+        control.mission_store.get_mission(mission_id).await,
+        Ok(Some(ref m)) if m.status == MissionStatus::Paused
+    );
+    if was_paused {
+        control
+            .mission_store
+            .update_mission_status(mission_id, MissionStatus::Interrupted)
+            .await
+            .map_err(internal_error)?;
+        // FLEET-004: leaving Paused clears the pause timestamp.
+        let _ = control
+            .mission_store
+            .set_mission_paused_at(mission_id, None)
+            .await;
+        let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+            mission_id,
+            status: MissionStatus::Interrupted,
+            summary: None,
+        });
+    }
+
+    let outcome: Result<Mission, (StatusCode, String)> = async {
+        let (tx, rx) = oneshot::channel();
+        control
+            .cmd_tx
+            .send(ControlCommand::ResumeMission {
+                mission_id,
+                clean_workspace,
+                skip_message,
+                respond: tx,
+            })
+            .await
+            .map_err(session_unavailable)?;
+        rx.await
+            .map_err(recv_failed)?
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    }
+    .await;
+
+    match outcome {
+        Ok(mission) => Ok(Json(mission)),
+        Err(err) => {
+            // A failed resume must not leave a paused mission stranded in
+            // Interrupted: restore the operator-visible Paused state (best
+            // effort) before surfacing the error.
+            if was_paused {
+                let _ = control
+                    .mission_store
+                    .update_mission_status(mission_id, MissionStatus::Paused)
+                    .await;
+                let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id,
+                    status: MissionStatus::Paused,
+                    summary: None,
+                });
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Delete a mission by ID.
@@ -5707,13 +6044,26 @@ async fn delete_mission_with_children(
     mission_id: Uuid,
     running: &[super::mission_runner::RunningMissionInfo],
 ) -> Result<Vec<Uuid>, (StatusCode, String)> {
-    let Some(_) = mission_store
+    let Some(target) = mission_store
         .get_mission(mission_id)
         .await
         .map_err(internal_error)?
     else {
         return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
     };
+
+    // FLEET-004: a Paused mission is deliberately parked for later resume —
+    // deleting it would silently discard work the operator chose to keep. Require
+    // an explicit resume-or-cancel first (mirrors the pause endpoint's 409s).
+    if target.status == MissionStatus::Paused {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot delete a paused mission ({}). Resume or cancel it first.",
+                mission_id
+            ),
+        ));
+    }
 
     let child_ids = collect_child_mission_ids(mission_store, mission_id).await?;
     let mut ids_to_delete = Vec::with_capacity(child_ids.len() + 1);
@@ -5976,6 +6326,11 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
             content: event.content.clone(),
             queued: false,
             mission_id,
+            source: event
+                .metadata
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         }),
         "assistant_message" => {
             let meta = event.metadata.as_object();
@@ -7412,6 +7767,7 @@ async fn automation_scheduler_loop(
                         agent: None,
                         target_mission_id: Some(mission.id),
                         strict: false,
+                        source: None,
                         respond: respond_tx,
                     })
                     .await;
@@ -7600,7 +7956,7 @@ struct RoutedAutomationMessage {
 }
 
 fn enqueue_agent_finished_messages(
-    queue: &mut VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    queue: &mut VecDeque<ControlQueueEntry>,
     messages: Vec<RoutedAutomationMessage>,
 ) {
     for message in messages {
@@ -7609,6 +7965,7 @@ fn enqueue_agent_finished_messages(
             message.content,
             None,
             Some(message.target_mission_id),
+            Some("automation".to_string()),
         ));
     }
 }
@@ -7886,13 +8243,10 @@ async fn post_turn_handle_grok_goal(
     }
 }
 
-fn queue_has_pending_target_mission(
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
-    mission_id: Uuid,
-) -> bool {
+fn queue_has_pending_target_mission(queue: &VecDeque<ControlQueueEntry>, mission_id: Uuid) -> bool {
     queue
         .iter()
-        .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id))
+        .any(|(_id, _msg, _agent, target_mid, _source)| *target_mid == Some(mission_id))
 }
 
 fn accept_user_message_id(accepted: &mut HashSet<Uuid>, id: Uuid) -> bool {
@@ -8660,7 +9014,7 @@ async fn control_actor_loop(
 ) {
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
-    let mut queue: VecDeque<(Uuid, String, Option<String>, Option<Uuid>)> = VecDeque::new();
+    let mut queue: VecDeque<ControlQueueEntry> = VecDeque::new();
     // Re-drive any messages that were queued before the last restart. They are
     // persisted as a JSON snapshot (see `persist_control_queue_if_changed`) so a
     // restart doesn't lose pending work. We re-inject them through the normal
@@ -8683,6 +9037,7 @@ async fn control_actor_loop(
                             agent: it.agent,
                             target_mission_id: it.mission_id,
                             strict: false,
+                            source: it.source,
                             respond: ack_tx,
                         }) {
                             tracing::warn!("Failed to re-queue restored control message: {e}");
@@ -8766,6 +9121,20 @@ async fn control_actor_loop(
     // sweeps zombies, and wakes idle bosses whose board needs a decision.
     const BOARD_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
     let mut last_board_pass = tokio::time::Instant::now();
+    // FLEET-001 scheduling dispatch cadence: same throttling rationale as the
+    // board pass — a store scan on every 100ms tick is wasteful. Each pass
+    // expires past-deadline scheduled missions and, when the main session is
+    // idle, dispatches the highest-priority dispatchable one.
+    const SCHEDULER_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut last_scheduler_pass = tokio::time::Instant::now();
+    // Guards against double-dispatch: a scheduled mission stays Pending (with its
+    // goal) until the dispatched message is processed and flips it to Active. If
+    // the actor is slow or the start is dropped, that window can exceed one pass,
+    // so we record each dispatch and skip re-dispatching the same mission until
+    // this cooldown elapses (after which a still-Pending mission is retried).
+    const SCHEDULER_DISPATCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut scheduler_inflight: std::collections::HashMap<Uuid, tokio::time::Instant> =
+        std::collections::HashMap::new();
     // Per-boss "wake outstanding" flags, coalescing board wakes across passes.
     let mut board_wake_state: std::collections::HashMap<Uuid, bool> =
         std::collections::HashMap::new();
@@ -8883,11 +9252,13 @@ async fn control_actor_loop(
             None,
             None,
             None,
+            crate::api::mission_store::MissionScheduling::default(),
         )
         .await
     }
 
     // Helper to create a new mission with title
+    #[allow(clippy::too_many_arguments)]
     async fn create_new_mission_with_title(
         mission_store: &Arc<dyn MissionStore>,
         title: Option<&str>,
@@ -8899,8 +9270,9 @@ async fn control_actor_loop(
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
+        scheduling: crate::api::mission_store::MissionScheduling,
     ) -> Result<Mission, String> {
-        mission_store
+        let mut mission = mission_store
             .create_mission_with_parent(
                 title,
                 workspace_id,
@@ -8912,7 +9284,16 @@ async fn control_actor_loop(
                 parent_mission_id,
                 working_directory,
             )
-            .await
+            .await?;
+        // FLEET-001: persist scheduling metadata as a focused follow-up write so
+        // the wide `create_mission_with_parent` signature stays untouched.
+        if scheduling != crate::api::mission_store::MissionScheduling::default() {
+            mission_store
+                .set_mission_scheduling(mission.id, &scheduling)
+                .await?;
+            mission.scheduling = scheduling;
+        }
+        Ok(mission)
     }
 
     // Helper to validate and prepare an interrupted or blocked mission for resume.
@@ -8979,7 +9360,7 @@ async fn control_actor_loop(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, respond } => {
+                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
                             let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
@@ -9079,17 +9460,78 @@ async fn control_actor_loop(
                             }
                         }
 
+                        // FLEET-001 scheduled-mission deferral: if the target is a
+                        // Pending mission whose `not_before` is still in the future
+                        // and it isn't already running, stash the goal and leave it
+                        // Pending. The scheduler tick re-injects it as a normal user
+                        // message once the dispatch window opens. Strict control-plane
+                        // messages are operational and never deferred.
+                        if !strict {
+                            if let Some(tid) = effective_target {
+                                let target_running =
+                                    target_in_parallel || running_mid == Some(tid);
+                                if !target_running {
+                                    if let Ok(Some(m)) = mission_store.get_mission(tid).await {
+                                        let now = chrono::Utc::now();
+                                        if m.status == MissionStatus::Pending
+                                            && !m.is_dispatchable_at(now)
+                                        {
+                                            // Append to any previously-stashed goal so
+                                            // multiple pre-dispatch messages aren't lost.
+                                            let combined = match mission_store
+                                                .get_deferred_goal(tid)
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                            {
+                                                Some(prev) if !prev.is_empty() => {
+                                                    format!("{prev}\n{content}")
+                                                }
+                                                _ => content.clone(),
+                                            };
+                                            if let Err(e) = mission_store
+                                                .set_deferred_goal(tid, Some(combined))
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    mission_id = %tid,
+                                                    "Failed to stash deferred goal: {e}"
+                                                );
+                                            }
+                                            // Surface the queued goal so the UI shows it
+                                            // as pending until dispatch.
+                                            let _ = events_tx.send(AgentEvent::UserMessage {
+                                                id,
+                                                content: content.clone(),
+                                                queued: true,
+                                                mission_id: Some(tid),
+                                                source: source.clone(),
+                                            });
+                                            tracing::info!(
+                                                mission_id = %tid,
+                                                not_before = ?m.scheduling.not_before,
+                                                "Deferred scheduled mission: goal stashed until dispatch window"
+                                            );
+                                            let _ = respond.send(UserMessageAck::Queued);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Case 1: Target is already running in parallel_runners - queue to it
                         if let Some(tid) = effective_target {
                             if target_in_parallel {
                                 if let Some(runner) = parallel_runners.get_mut(&tid) {
                                     let was_running = runner.is_running();
-                                    runner.queue_message(id, content.clone(), msg_agent);
+                                    runner.queue_message(id, content.clone(), msg_agent, source.clone());
                                     let _ = events_tx.send(AgentEvent::UserMessage {
                                         id,
                                         content: content.clone(),
                                         queued: was_running,
                                         mission_id: Some(tid),
+                                        source: source.clone(),
                                     });
                                     // Surface the parallel queue growth to all
                                     // clients (Status events otherwise only
@@ -9158,6 +9600,21 @@ async fn control_actor_loop(
                                     // Load mission and start in parallel
                                     match load_mission_record(&mission_store, tid).await {
                                         Ok(mission) => {
+                                            // A paused mission must not be auto-started by an
+                                            // incoming message — respect the pause. The user
+                                            // resumes it explicitly via the resume API.
+                                            if mission.status == MissionStatus::Paused {
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: format!(
+                                                        "Mission {} is paused; resume it before sending messages",
+                                                        tid
+                                                    ),
+                                                    mission_id: Some(tid),
+                                                    resumable: true,
+                                                });
+                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                continue;
+                                            }
                                             // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
                                             if matches!(
                                                 mission.status,
@@ -9200,13 +9657,14 @@ async fn control_actor_loop(
                                                 runner.history.push((entry.role.clone(), entry.content.clone()));
                                             }
                                             // Queue the message
-                                            runner.queue_message(id, content.clone(), msg_agent);
+                                            runner.queue_message(id, content.clone(), msg_agent, source.clone());
                                             // Emit user message event
                                             let _ = events_tx.send(AgentEvent::UserMessage {
                                                 id,
                                                 content: content.clone(),
                                                 queued: false,
                                                 mission_id: Some(tid),
+                                                source: source.clone(),
                                             });
                                             // Start execution
                                             runner.start_next(
@@ -9416,10 +9874,26 @@ async fn control_actor_loop(
 
                         let was_running = running.is_some();
                         let content_clone = content.clone();
-                        // Capture the target mission ID once, before queuing
-                        // This ensures we use the same mission_id for events and execution
-                        let target_mission_id = *current_mission.read().await;
-                        queue.push_back((id, content, msg_agent, target_mission_id));
+                        // Capture the target mission ID once, before queuing.
+                        // This ensures we use the same mission_id for events and execution.
+                        //
+                        // Honor the message's EXPLICIT target; fall back to the session
+                        // `current_mission` pointer only for untargeted messages. We only
+                        // reach Case 3 when the target is absent or equals the main mission
+                        // (`target_is_main`), so an explicit `effective_target` here is the
+                        // main mission the runner is on — and its history is already what
+                        // the next turn will use. Previously this read `*current_mission`
+                        // unconditionally: when the runner was busy on one mission
+                        // (`running_mission_id`) while the session pointer had drifted to
+                        // another (e.g. the dashboard/MCP moved it), an explicitly-targeted
+                        // follow-up got silently re-pinned to the drifted mission and
+                        // executed there. (Prod 2026-06-23: a Hermes follow-up for mission
+                        // 91f7… ran in the unrelated 4f3f… instead.)
+                        let target_mission_id = match effective_target {
+                            Some(tid) => Some(tid),
+                            None => *current_mission.read().await,
+                        };
+                        queue.push_back((id, content, msg_agent, target_mission_id, source.clone()));
                         let status_mission_id = if running.is_some() {
                             running_mission_id
                         } else {
@@ -9438,10 +9912,11 @@ async fn control_actor_loop(
                                 content: content_clone,
                                 queued: true,
                                 mission_id: target_mission_id,
+                                source: source.clone(),
                             });
                         }
                         if running.is_none() {
-                            if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                            if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                                 // Persist the dequeue before the awaits that start
                                 // the run, so a crash here can't restore + re-run it.
                                 persist_control_queue_if_changed(
@@ -9458,7 +9933,7 @@ async fn control_actor_loop(
                                     queue.len(),
                                     msg_target_mid,
                                 ).await;
-                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid });
+                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: msg_source.clone() });
 
                                 // Immediately persist user message so it's visible when loading mission
                                 history.push(("user".to_string(), msg.clone()));
@@ -9663,7 +10138,7 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, scheduling, respond } => {
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,
@@ -9685,6 +10160,7 @@ async fn control_actor_loop(
                             config_profile.as_deref(),
                             parent_mission_id,
                             working_directory.as_deref(),
+                            scheduling,
                         )
                         .await {
                             Ok(mission) => {
@@ -9852,6 +10328,7 @@ async fn control_actor_loop(
                                         content: handoff,
                                         queued: false,
                                         mission_id: Some(id),
+                                        source: None,
                                     };
                                     if let Err(e) = mission_store.log_event(id, &event).await {
                                         tracing::warn!(
@@ -9899,6 +10376,15 @@ async fn control_actor_loop(
                                 }
                             };
 
+                            // Don't start a paused mission — resume it explicitly first.
+                            if mission.status == MissionStatus::Paused {
+                                let _ = respond.send(Err(format!(
+                                    "Mission {} is paused; resume it before starting",
+                                    mission_id
+                                )));
+                                continue;
+                            }
+
                             // Create a new MissionRunner
                             let mut runner = super::mission_runner::MissionRunner::new(
                                 mission_id,
@@ -9919,7 +10405,7 @@ async fn control_actor_loop(
                             }
 
                             // Queue the initial message (no per-message agent override for parallel start)
-                            runner.queue_message(Uuid::new_v4(), content, None);
+                            runner.queue_message(Uuid::new_v4(), content, None, None);
 
                             // Start execution
                             let started = runner.start_next(
@@ -10121,6 +10607,69 @@ async fn control_actor_loop(
                             }
                         }
                     }
+                    ControlCommand::PauseMission { mission_id, respond } => {
+                        // Stop any in-flight runner before parking the mission so
+                        // the agent turn can't keep executing (and overwrite the
+                        // paused status on completion). Mirrors CancelMission's
+                        // stop logic but lands on `Paused` instead of `Interrupted`.
+                        if let Some(runner) = parallel_runners.get_mut(&mission_id) {
+                            runner.cancel();
+                            parallel_runners.remove(&mission_id);
+                            close_mission_desktop_sessions(
+                                &mission_store,
+                                mission_id,
+                                &config.working_dir,
+                            )
+                            .await;
+                        } else if running_mission_id == Some(mission_id) {
+                            if let Some(token) = &running_cancel {
+                                token.cancel();
+                                // Arm the force-clear deadline so a zombie runner
+                                // that never observes the cancel still gets torn
+                                // down (matches CancelMission).
+                                runner_force_clear_deadline = Some(
+                                    tokio::time::Instant::now() + RUNNER_FORCE_CLEAR_GRACE,
+                                );
+                            }
+                            close_mission_desktop_sessions(
+                                &mission_store,
+                                mission_id,
+                                &config.working_dir,
+                            )
+                            .await;
+                        }
+
+                        // Set Paused last so it survives the runner teardown above.
+                        // maybe_finalize_terminal_mission skips non-Active/Pending/
+                        // Interrupted statuses, so the cancelled turn's completion
+                        // won't promote this back out of Paused.
+                        match mission_store
+                            .update_mission_status(mission_id, MissionStatus::Paused)
+                            .await
+                        {
+                            Ok(()) => {
+                                // FLEET-004: stamp the pause time for UI pause-age.
+                                let _ = mission_store
+                                    .set_mission_paused_at(
+                                        mission_id,
+                                        Some(chrono::Utc::now().to_rfc3339()),
+                                    )
+                                    .await;
+                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    mission_id,
+                                    status: MissionStatus::Paused,
+                                    summary: None,
+                                });
+                                let _ = respond.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = respond.send(Err(format!(
+                                    "Failed to pause mission {}: {}",
+                                    mission_id, e
+                                )));
+                            }
+                        }
+                    }
                     ControlCommand::ListRunning { respond } => {
                         // Return info about currently running missions
                         let mut running_list = Vec::new();
@@ -10246,7 +10795,7 @@ async fn control_actor_loop(
                                             .history
                                             .push((entry.role.clone(), entry.content.clone()));
                                     }
-                                    runner.queue_message(Uuid::new_v4(), resume_prompt, None);
+                                    runner.queue_message(Uuid::new_v4(), resume_prompt, None, None);
 
                                     let started = runner.start_next(
                                         config.clone(),
@@ -10341,12 +10890,18 @@ async fn control_actor_loop(
                                 // Skip if the caller just wants to update the status (e.g., before sending a custom message)
                                 if !skip_message {
                                     let msg_id = Uuid::new_v4();
-                                    queue.push_back((msg_id, resume_prompt, None, Some(mission_id)));
+                                    queue.push_back((
+                                        msg_id,
+                                        resume_prompt,
+                                        None,
+                                        Some(mission_id),
+                                        Some("system:resume".to_string()),
+                                    ));
                                 }
 
                                 // Start execution if not already running
                                 if running.is_none() {
-                                    if let Some((mid, msg, _per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                                    if let Some((mid, msg, _per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                                         // Persist the dequeue before the awaits that
                                         // start the run, so a crash here can't
                                         // restore + re-run it.
@@ -10365,7 +10920,7 @@ async fn control_actor_loop(
                                             queue.len(),
                                             Some(target_mid),
                                         ).await;
-                                        let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: Some(target_mid) });
+                                        let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: Some(target_mid), source: msg_source.clone() });
                                         let cfg = config.clone();
                                         let agent = Arc::clone(&root_agent);
                                         let mcp_ref = Arc::clone(&mcp);
@@ -10543,11 +11098,12 @@ async fn control_actor_loop(
                         // Collect queued messages from main runner with their target mission IDs
                         let mut queued: Vec<QueuedMessage> = queue
                             .iter()
-                            .map(|(id, content, agent, target_mid)| QueuedMessage {
+                            .map(|(id, content, agent, target_mid, source)| QueuedMessage {
                                 id: *id,
                                 content: content.clone(),
                                 agent: agent.clone(),
                                 mission_id: *target_mid,
+                                source: source.clone(),
                             })
                             .collect();
                         // Also collect queued messages from parallel runners
@@ -10558,6 +11114,7 @@ async fn control_actor_loop(
                                     content: qm.content.clone(),
                                     agent: qm.agent.clone(),
                                     mission_id: Some(*mid),
+                                    source: qm.source.clone(),
                                 });
                             }
                         }
@@ -10568,7 +11125,7 @@ async fn control_actor_loop(
 
                         // Try to remove from main queue
                         let before_len = queue.len();
-                        queue.retain(|(id, _, _, _)| *id != message_id);
+                        queue.retain(|(id, _, _, _, _)| *id != message_id);
                         if queue.len() < before_len {
                             removed = true;
                             // Emit event for main queue change
@@ -10626,7 +11183,7 @@ async fn control_actor_loop(
                                 // from one mission's view must not wipe other
                                 // missions' queues.
                                 let before_len = queue.len();
-                                queue.retain(|(_, _, _, target_mid)| *target_mid != Some(target));
+                                queue.retain(|(_, _, _, target_mid, _)| *target_mid != Some(target));
                                 let main_removed = before_len - queue.len();
                                 cleared += main_removed;
                                 if main_removed > 0 {
@@ -11058,7 +11615,7 @@ async fn control_actor_loop(
                         );
                         let already_queued_for_mission = queue
                             .iter()
-                            .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id));
+                            .any(|(_id, _msg, _agent, target_mid, _source)| *target_mid == Some(mission_id));
 
                         // Grok `/goal` post-turn: parse the sentinel from the
                         // assistant's last text and either disable the goal
@@ -11109,7 +11666,7 @@ async fn control_actor_loop(
                 }
 
                 // Start next queued message, if any.
-                if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
                     // Persist the dequeue before the awaits that start the run, so
                     // a crash here can't restore + re-run it.
                     persist_control_queue_if_changed(
@@ -11126,7 +11683,7 @@ async fn control_actor_loop(
                         queue.len(),
                         msg_target_mid,
                     ).await;
-                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid });
+                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: msg_source.clone() });
 
                     // Immediately persist user message so it's visible when loading mission
                     history.push(("user".to_string(), msg.clone()));
@@ -11379,7 +11936,7 @@ async fn control_actor_loop(
                                 .await;
                                 for message in messages {
                                     if message.target_mission_id == *mission_id {
-                                        runner.queue_message(Uuid::new_v4(), message.content, None);
+                                        runner.queue_message(Uuid::new_v4(), message.content, None, None);
                                         continue;
                                     }
 
@@ -11390,6 +11947,7 @@ async fn control_actor_loop(
                                         message.content,
                                         None,
                                         Some(message.target_mission_id),
+                                        Some("automation".to_string()),
                                     ));
                                 }
                             }
@@ -11503,6 +12061,141 @@ async fn control_actor_loop(
                         &mut board_wake_state,
                     )
                     .await;
+                }
+
+                // FLEET-001 scheduling dispatch: expire past-deadline scheduled
+                // missions, then start the highest-priority dispatchable one when
+                // the main session is idle. Throttled like the board pass.
+                if last_scheduler_pass.elapsed() >= SCHEDULER_PASS_INTERVAL {
+                    last_scheduler_pass = tokio::time::Instant::now();
+                    // Drop cooldown records that have aged out so a still-Pending
+                    // (dropped) mission becomes eligible for retry.
+                    scheduler_inflight
+                        .retain(|_, at| at.elapsed() < SCHEDULER_DISPATCH_COOLDOWN);
+                    match mission_store.get_scheduled_pending_missions().await {
+                        Ok(pending) => {
+                            let now = chrono::Utc::now();
+                            // 1. Expire any scheduled mission whose deadline elapsed
+                            //    before it ever dispatched. Missions still within the
+                            //    dispatch cooldown are skipped (not added to `live`) so
+                            //    a slow/lost start can't trigger a duplicate dispatch.
+                            let mut live: Vec<Mission> = Vec::with_capacity(pending.len());
+                            for m in pending {
+                                if m.is_past_deadline(now) {
+                                    tracing::info!(
+                                        mission_id = %m.id,
+                                        deadline = ?m.scheduling.deadline,
+                                        "Scheduler: expiring scheduled mission past deadline"
+                                    );
+                                    let _ = mission_store.set_deferred_goal(m.id, None).await;
+                                    if let Err(e) = mission_store
+                                        .update_mission_status_with_reason(
+                                            m.id,
+                                            MissionStatus::Failed,
+                                            Some("deadline_exceeded"),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            mission_id = %m.id,
+                                            "Scheduler: failed to expire mission: {e}"
+                                        );
+                                    } else {
+                                        maybe_schedule_mission_metadata_refresh_for_status(
+                                            &mission_store,
+                                            &events_tx,
+                                            m.id,
+                                            MissionStatus::Failed,
+                                        );
+                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            mission_id: m.id,
+                                            status: MissionStatus::Failed,
+                                            summary: Some(
+                                                "Scheduled mission expired: deadline passed before dispatch"
+                                                    .to_string(),
+                                            ),
+                                        });
+                                    }
+                                } else if scheduler_inflight.contains_key(&m.id) {
+                                    // A dispatch for this mission is still settling;
+                                    // skip until the cooldown record ages out.
+                                } else {
+                                    live.push(m);
+                                }
+                            }
+                            // 2. Dispatch the next runnable mission when there is spare
+                            //    concurrency. The targeted scheduler message starts a
+                            //    parallel runner (Case 2, explicit target => force
+                            //    parallel), which DROPS at capacity — so mirror its check
+                            //    (main + parallel < max_parallel) rather than requiring the
+                            //    main session to be idle, otherwise eligible scheduled
+                            //    missions stall behind a busy main runner.
+                            let parallel_running = parallel_runners
+                                .values()
+                                .filter(|r| r.is_running())
+                                .count();
+                            let total_running =
+                                parallel_running + if running.is_some() { 1 } else { 0 };
+                            let max_parallel = crate::settings::max_parallel_missions_cached_or(
+                                config.max_parallel_missions,
+                            );
+                            if total_running < max_parallel {
+                                if let Some(next) =
+                                    super::mission_store::select_next_runnable_mission(&live, now)
+                                {
+                                    let mission_id = next.id;
+                                    let priority = next.scheduling.priority;
+                                    if let Ok(Some(goal)) =
+                                        mission_store.get_deferred_goal(mission_id).await
+                                    {
+                                        // Deliberately do NOT clear the goal here. The
+                                        // Pending->Active transition that the dispatched
+                                        // message triggers is what removes the mission from
+                                        // `get_scheduled_pending_missions` (status filter),
+                                        // so it can't be re-dispatched. Leaving the goal in
+                                        // place means a rare dispatch drop (capacity race)
+                                        // simply retries on the next pass instead of losing
+                                        // the scheduled work.
+                                        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+                                        match self_cmd_tx.try_send(ControlCommand::UserMessage {
+                                            id: Uuid::new_v4(),
+                                            content: goal,
+                                            agent: None,
+                                            target_mission_id: Some(mission_id),
+                                            strict: false,
+                                            source: Some("scheduler".to_string()),
+                                            respond: ack_tx,
+                                        }) {
+                                            Ok(()) => {
+                                                // Record the dispatch so the next passes
+                                                // skip this mission until it flips to
+                                                // Active (or the cooldown lets a dropped
+                                                // start retry).
+                                                scheduler_inflight.insert(
+                                                    mission_id,
+                                                    tokio::time::Instant::now(),
+                                                );
+                                                tracing::info!(
+                                                    mission_id = %mission_id,
+                                                    priority,
+                                                    "Scheduler: dispatching scheduled mission"
+                                                );
+                                            }
+                                            Err(e) => tracing::warn!(
+                                                mission_id = %mission_id,
+                                                "Scheduler: dispatch enqueue failed; will retry: {e}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Scheduler: failed to list scheduled pending missions: {e}"
+                            );
+                        }
+                    }
                 }
             }
             // Force-reap a runner whose cancel was fired but whose
@@ -12556,6 +13249,24 @@ pub async fn create_automation(
 ) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
+    if control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        tracing::warn!(
+            mission_id = %mission_id,
+            user_id = %user.id,
+            "Rejecting automation create for missing mission"
+        );
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Mission {} not found; cannot create automation", mission_id),
+        ));
+    }
+
     // Validate the command exists in the library if CommandSource::Library
     if let mission_store::CommandSource::Library { ref name } = req.command_source {
         validate_library_command(&state, name).await?;
@@ -12639,6 +13350,16 @@ pub async fn create_automation(
         .get("__wakeup_source")
         .map(String::as_str)
         == Some("claude-builtin");
+
+    tracing::info!(
+        mission_id = %mission_id,
+        automation_id = %automation.id,
+        command_source = ?automation.command_source,
+        trigger = ?automation.trigger,
+        fresh_session = ?automation.fresh_session,
+        is_builtin_wakeup,
+        "Creating mission automation"
+    );
 
     let mut automation = control
         .mission_store
@@ -12792,6 +13513,7 @@ pub async fn create_automation(
                     agent: None,
                     target_mission_id: Some(target_mission_id),
                     strict: false,
+                    source: None,
                     respond: respond_tx,
                 })
                 .await;
@@ -14042,6 +14764,7 @@ pub async fn webhook_receiver(
             agent: None,
             target_mission_id: Some(mission.id),
             strict: false,
+            source: None,
             respond: respond_tx,
         })
         .await;
@@ -15196,6 +15919,7 @@ pub async fn send_telegram_message_api(
                     agent: None,
                     target_mission_id: Some(mapping.mission_id),
                     strict: false,
+                    source: Some("telegram".to_string()),
                     respond: tx,
                 })
                 .await;
@@ -18216,6 +18940,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -18226,6 +18951,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -18247,6 +18973,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -18257,6 +18984,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let strong_score = mission_search_relevance_score(
@@ -18293,6 +19021,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -18303,6 +19032,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -18336,6 +19066,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -18346,6 +19077,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -18379,6 +19111,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -18389,6 +19122,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -18422,6 +19156,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -18432,6 +19167,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -18549,6 +19285,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -18559,6 +19296,7 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {
@@ -18706,6 +19444,7 @@ Investigate <service/> failures.
             "queued user message".to_string(),
             None,
             Some(existing_target),
+            Some("api:test-user".to_string()),
         )]);
 
         enqueue_agent_finished_messages(
@@ -18724,7 +19463,7 @@ Investigate <service/> failures.
 
         let ordered: Vec<(String, Option<Uuid>)> = queue
             .into_iter()
-            .map(|(_, content, _, mission_id)| (content, mission_id))
+            .map(|(_, content, _, mission_id, _)| (content, mission_id))
             .collect();
         assert_eq!(
             ordered,
@@ -18746,12 +19485,14 @@ Investigate <service/> failures.
                 "other mission".to_string(),
                 None,
                 Some(other_mission_id),
+                None,
             ),
             (
                 Uuid::new_v4(),
                 "current mission".to_string(),
                 None,
                 Some(mission_id),
+                None,
             ),
         ]);
 

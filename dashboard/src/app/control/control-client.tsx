@@ -200,6 +200,18 @@ const MAX_MISSION_DRAFT_CACHE_BYTES = 64 * 1024;
 const MAX_MISSION_DRAFT_CACHE_ENTRIES = 50;
 const DEFAULT_DOCUMENT_TITLE = "Sandboxed.sh";
 const MAX_DOCUMENT_MISSION_TITLE_LENGTH = 80;
+const CONTROL_MISSION_SCOPED_EVENT_TYPES = new Set([
+  "user_message",
+  "assistant_message",
+  "thinking",
+  "text_delta",
+  "text_op",
+  "tool_call",
+  "tool_result",
+  "phase",
+  "goal_iteration",
+  "goal_status",
+]);
 
 type EventsWorkerRequest = {
   id: number;
@@ -238,14 +250,21 @@ function isRetriableSendError(error: unknown): boolean {
   );
 }
 
+function chatItemMatchesMission(item: ChatItem, missionId?: string): boolean {
+  if (!missionId) return true;
+  if (!("missionId" in item)) return true;
+  return item.missionId == null || item.missionId === missionId;
+}
+
 export function appendUnpersistedLiveTail(
   historyItems: ChatItem[],
   liveItems: ChatItem[],
+  missionId?: string,
 ): ChatItem[] {
   if (liveItems.length === 0) return historyItems;
 
   const lastLiveUserIdx = liveItems.findLastIndex(
-    (item) => item.kind === "user",
+    (item) => item.kind === "user" && chatItemMatchesMission(item, missionId),
   );
   if (lastLiveUserIdx === -1) return historyItems;
 
@@ -270,6 +289,7 @@ export function appendUnpersistedLiveTail(
   const unpersistedTail = liveItems
     .slice(lastLiveUserIdx + 1)
     .filter((item) => {
+      if (!chatItemMatchesMission(item, missionId)) return false;
       if (existingIds.has(item.id)) return false;
       if (item.kind === "assistant") {
         const content = item.content.trim();
@@ -289,6 +309,7 @@ export function appendUnpersistedLiveTail(
   const lastLiveUser = liveItems[lastLiveUserIdx];
   const carryUnpersistedUser =
     lastLiveUser.kind === "user" &&
+    chatItemMatchesMission(lastLiveUser, missionId) &&
     !existingIds.has(lastLiveUser.id) &&
     (lastLiveUser.sendStatus === "failed" ||
       lastLiveUser.sendStatus === "sending");
@@ -3089,7 +3110,10 @@ export default function ControlClient() {
   const [items, setItems] = useControlItemsStore();
   // Agent task board + next-wakeup marker for the Workbench panel, derived
   // from the same chat items the transcript renders (single source of truth).
-  const workbenchMissionState = useMemo(() => extractMissionState(items), [items]);
+  const workbenchMissionState = useMemo(
+    () => extractMissionState(items),
+    [items],
+  );
   const itemsRef = useRef<ChatItem[]>([]);
   const [input, setInput] = useState(() => loadControlDraftForMission(null));
   const [canSubmitInput, setCanSubmitInput] = useState(false);
@@ -6534,11 +6558,70 @@ export default function ControlClient() {
     ],
   );
 
+  // Rename any mission by id from the Cmd+K switcher. Optimistic across the
+  // three places a mission title is mirrored (recent list, current, viewing);
+  // reverts on failure.
+  const handleRenameMissionById = useCallback(
+    async (missionId: string, nextTitle: string) => {
+      const trimmed = nextTitle.trim();
+      if (!trimmed) return;
+      // Capture the pre-rename title from whichever source currently holds the
+      // mission. It may be open in current/viewing but absent from the recent
+      // list, in which case restoring from `recentMissions` alone would wipe the
+      // title to null on a failed API call.
+      const previousTitle =
+        recentMissions.find((m) => m.id === missionId)?.title ??
+        (currentMissionRef.current?.id === missionId
+          ? currentMissionRef.current.title
+          : undefined) ??
+        (viewingMissionRef.current?.id === missionId
+          ? viewingMissionRef.current.title
+          : undefined) ??
+        null;
+      const previousById = new Map<string, string | null | undefined>();
+      previousById.set(missionId, previousTitle);
+
+      const applyTitle = (mission: Mission | null) =>
+        mission?.id === missionId ? { ...mission, title: trimmed } : mission;
+
+      setRecentMissions((prev) =>
+        prev.map((mission) =>
+          mission.id === missionId ? { ...mission, title: trimmed } : mission,
+        ),
+      );
+      setCurrentMission(applyTitle);
+      setViewingMission(applyTitle);
+
+      try {
+        await updateMissionTitle(missionId, trimmed);
+      } catch (error) {
+        console.error("Failed to rename mission:", error);
+        toast.error("Failed to rename mission");
+        const restore = (mission: Mission | null) =>
+          mission?.id === missionId
+            ? { ...mission, title: previousById.get(missionId) ?? null }
+            : mission;
+        setRecentMissions((prev) =>
+          prev.map((mission) =>
+            mission.id === missionId
+              ? { ...mission, title: previousById.get(missionId) ?? null }
+              : mission,
+          ),
+        );
+        setCurrentMission(restore);
+        setViewingMission(restore);
+        throw error;
+      }
+    },
+    [recentMissions],
+  );
+
   // Debouncing for thinking updates to reduce re-renders during streaming
   const pendingThinkingRef = useRef<{
     content: string;
     done: boolean;
     id: string;
+    missionId?: string;
     startTime: number;
   } | null>(null);
   const thinkingFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -6549,6 +6632,7 @@ export default function ControlClient() {
 
   const pendingStreamRef = useRef<{
     content: string;
+    missionId?: string;
     startTime: number;
   } | null>(null);
   const streamFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -6619,7 +6703,9 @@ export default function ControlClient() {
           // CLOSED and drop it — history catch-up backfills it on the next
           // sync — rather than risk rendering a main-session message inside an
           // unrelated parallel mission's view (cross-mission leak).
-          if (viewingId !== currentMissionId) {
+          if (CONTROL_MISSION_SCOPED_EVENT_TYPES.has(event.type)) {
+            filterReason = "mission-scoped event has no mission_id";
+          } else if (viewingId !== currentMissionId) {
             if (event.type !== "status") {
               filterReason = currentMissionId
                 ? "event has no mission_id for parallel mission"
@@ -6974,6 +7060,7 @@ export default function ControlClient() {
         const content = String(data["content"] ?? "");
         const done = Boolean(data["done"]);
         const now = Date.now();
+        const acceptedMissionId = eventMissionId ?? viewingId ?? undefined;
 
         // Debounced thinking updates to reduce re-renders during streaming
         const flushThinking = () => {
@@ -6984,12 +7071,20 @@ export default function ControlClient() {
             // Remove phase items when thinking starts
             const filtered = prev.filter((it) => it.kind !== "phase");
             let existingIdx = filtered.findIndex(
-              (it) => it.kind === "thinking" && !it.done,
+              (it) =>
+                it.kind === "thinking" &&
+                !it.done &&
+                (pending.missionId == null ||
+                  it.missionId == null ||
+                  it.missionId === pending.missionId),
             );
             if (existingIdx < 0) {
               existingIdx = filtered.findLastIndex(
                 (it) =>
                   it.kind === "thinking" &&
+                  (pending.missionId == null ||
+                    it.missionId == null ||
+                    it.missionId === pending.missionId) &&
                   isStreamContinuation(pending.content, it.content),
               );
             }
@@ -7014,6 +7109,7 @@ export default function ControlClient() {
                   ),
                   done: pending.done,
                   endTime: pending.done ? now : existing.endTime,
+                  missionId: pending.missionId ?? existing.missionId,
                 };
                 if (pending.done) {
                   pendingThinkingRef.current = null;
@@ -7037,6 +7133,7 @@ export default function ControlClient() {
                   id: pending.id,
                   content: pending.content,
                   done: pending.done,
+                  missionId: pending.missionId,
                   startTime: pending.startTime,
                   endTime: pending.done ? now : undefined,
                 },
@@ -7052,6 +7149,7 @@ export default function ControlClient() {
                   id: pending.id,
                   content: pending.content,
                   done: pending.done,
+                  missionId: pending.missionId,
                   startTime: pending.startTime,
                   endTime: pending.done ? now : undefined,
                 },
@@ -7061,7 +7159,20 @@ export default function ControlClient() {
         };
 
         // Get or create stable ID for current thinking session
-        const existingPending = pendingThinkingRef.current;
+        let existingPending = pendingThinkingRef.current;
+        const pendingMissionChanged = Boolean(
+          existingPending?.missionId &&
+          acceptedMissionId &&
+          existingPending.missionId !== acceptedMissionId,
+        );
+        if (pendingMissionChanged) {
+          pendingThinkingRef.current = {
+            ...existingPending!,
+            done: true,
+          };
+          flushThinking();
+          existingPending = null;
+        }
         const existingContent = existingPending?.content ?? "";
         // P1-#8: tolerant continuation check (see stream-continuation.ts).
         const isContinuation = isStreamContinuation(content, existingContent);
@@ -7077,6 +7188,7 @@ export default function ControlClient() {
             id:
               existingPending?.id ??
               `thinking-${thinkingIdCounterRef.current++}`,
+            missionId: existingPending?.missionId ?? acceptedMissionId,
             startTime: existingPending?.startTime ?? now,
           };
           flushThinking();
@@ -7095,6 +7207,7 @@ export default function ControlClient() {
           content: content || existingPending?.content || "",
           done,
           id: thinkingId,
+          missionId: acceptedMissionId,
           startTime,
         };
 
@@ -7135,6 +7248,7 @@ export default function ControlClient() {
         const content = String(data["content"] ?? "");
         const now = Date.now();
         if (!content.trim()) return;
+        const acceptedMissionId = eventMissionId ?? viewingId ?? undefined;
 
         // Debounced stream updates to reduce re-renders during rapid delta streaming.
         const flushStream = () => {
@@ -7146,7 +7260,12 @@ export default function ControlClient() {
             const filtered = prev.filter((it) => it.kind !== "phase");
             const streamId = "text_delta_latest";
             const existingIdx = filtered.findIndex(
-              (it) => it.kind === "stream" && it.id === streamId,
+              (it) =>
+                it.kind === "stream" &&
+                it.id === streamId &&
+                (pending.missionId == null ||
+                  it.missionId == null ||
+                  it.missionId === pending.missionId),
             );
             if (existingIdx >= 0) {
               const updated = [...filtered];
@@ -7164,6 +7283,7 @@ export default function ControlClient() {
                 ...existing,
                 content: pending.content || existing.content,
                 done: false,
+                missionId: pending.missionId ?? existing.missionId,
                 startTime:
                   isContinuation && !existing.done
                     ? existing.startTime
@@ -7181,6 +7301,7 @@ export default function ControlClient() {
                 id: "text_delta_latest",
                 content: pending.content,
                 done: false,
+                missionId: pending.missionId,
                 startTime: pending.startTime,
                 endTime: undefined,
               },
@@ -7188,13 +7309,24 @@ export default function ControlClient() {
           });
         };
 
-        const existingPending = pendingStreamRef.current;
+        let existingPending = pendingStreamRef.current;
+        const pendingMissionChanged = Boolean(
+          existingPending?.missionId &&
+          acceptedMissionId &&
+          existingPending.missionId !== acceptedMissionId,
+        );
+        if (pendingMissionChanged) {
+          flushStream();
+          pendingStreamRef.current = null;
+          existingPending = null;
+        }
         const existingContent = existingPending?.content ?? "";
         // P1-#8: tolerant continuation check (see stream-continuation.ts).
         const isContinuation = isStreamContinuation(content, existingContent);
 
         pendingStreamRef.current = {
           content: mergeStreamFragment(existingContent, content),
+          missionId: acceptedMissionId,
           startTime: isContinuation ? (existingPending?.startTime ?? now) : now,
         };
 
@@ -7221,11 +7353,21 @@ export default function ControlClient() {
         const bubbleId = String(data["bubble_id"] ?? "text-op-latest");
         const rawOps = Array.isArray(data["ops"]) ? data["ops"] : [];
         const now = Date.now();
+        const acceptedMissionId = eventMissionId ?? viewingId ?? undefined;
 
         setItems((prev) => {
           const filtered = prev.filter((it) => it.kind !== "phase");
+          // Match the live row by id AND mission scope, mirroring the
+          // text_delta flush. Without the mission guard a shared bubble id
+          // (e.g. the "text-op-latest" default) could merge a text_op into
+          // another mission's stream bubble.
           const existingIdx = filtered.findIndex(
-            (it) => it.kind === "stream" && it.id === bubbleId,
+            (it) =>
+              it.kind === "stream" &&
+              it.id === bubbleId &&
+              (acceptedMissionId == null ||
+                it.missionId == null ||
+                it.missionId === acceptedMissionId),
           );
           const existing =
             existingIdx >= 0 && filtered[existingIdx]?.kind === "stream"
@@ -7266,6 +7408,7 @@ export default function ControlClient() {
               ...existing,
               content,
               done: finalized,
+              missionId: acceptedMissionId ?? existing.missionId,
               endTime: finalized ? now : undefined,
             };
             return updated;
@@ -7278,6 +7421,7 @@ export default function ControlClient() {
               id: bubbleId,
               content,
               done: finalized,
+              missionId: acceptedMissionId,
               startTime: now,
               endTime: finalized ? now : undefined,
             },
@@ -8644,6 +8788,7 @@ export default function ControlClient() {
         historyItems = appendUnpersistedLiveTail(
           historyItems,
           itemsRef.current,
+          missionId,
         );
 
         // Pre-queue length: pagination uses this to find the live tail
@@ -9009,7 +9154,10 @@ export default function ControlClient() {
   useFaviconStatus(faviconStatus, viewingMissionIsRunning, hasPendingUserInput);
 
   useEffect(() => {
-    document.title = formatMissionDocumentTitle(activeMission, hasPendingUserInput);
+    document.title = formatMissionDocumentTitle(
+      activeMission,
+      hasPendingUserInput,
+    );
     return () => {
       document.title = DEFAULT_DOCUMENT_TITLE;
     };
@@ -9147,6 +9295,7 @@ export default function ControlClient() {
           onResumeMission={handleResumeMissionById}
           onOpenFailingToolCall={handleOpenFailingToolCallById}
           onFollowUpMission={handleFollowUpMissionById}
+          onRenameMission={handleRenameMissionById}
           onRefresh={refreshRecentMissions}
         />
 

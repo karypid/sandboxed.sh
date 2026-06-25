@@ -79,6 +79,7 @@ pub fn status_emoji(status: MissionStatus) -> &'static str {
         MissionStatus::Interrupted => "⏸️",
         MissionStatus::NotFeasible => "🚫",
         MissionStatus::Acknowledged => "☑️",
+        MissionStatus::Paused => "⏯️",
     }
 }
 
@@ -91,7 +92,7 @@ pub fn buttons_for(status: MissionStatus) -> Vec<CardButton> {
             CardButton::OpenDashboard,
             CardButton::MuteMission,
         ],
-        MissionStatus::Active | MissionStatus::Pending => vec![
+        MissionStatus::Active | MissionStatus::Pending | MissionStatus::Paused => vec![
             CardButton::Reply,
             CardButton::OpenDashboard,
             CardButton::MuteMission,
@@ -192,6 +193,7 @@ fn status_line_for(
         MissionStatus::Interrupted => "Interrupted".to_string(),
         MissionStatus::NotFeasible => "Marked not feasible".to_string(),
         MissionStatus::Acknowledged => "Acknowledged".to_string(),
+        MissionStatus::Paused => "Paused".to_string(),
     }
 }
 
@@ -268,6 +270,7 @@ mod tests {
             created_at: "2026-05-24T00:00:00Z".to_string(),
             updated_at: "2026-05-24T00:00:00Z".to_string(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: vec![],
             session_id: None,
@@ -278,6 +281,7 @@ mod tests {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
         }
     }
 
