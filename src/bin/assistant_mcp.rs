@@ -84,6 +84,10 @@ struct ListMissionsParams {
     status: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -423,18 +427,22 @@ impl AssistantMcp {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "limit": {"type": "integer", "description": "Maximum missions to return, default 50."}
+                        "limit": {"type": "integer", "description": "Maximum missions to return, default 50."},
+                        "project": {"type": "string", "description": "Optional filter: only missions with this project."},
+                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."}
                     }
                 }),
             },
             ToolDefinition {
                 name: "list_missions".to_string(),
-                description: "List recent missions, optionally filtered by status.".to_string(),
+                description: "List recent missions, optionally filtered by status, project, or tag.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "status": {"type": "string", "description": "Optional mission status filter."},
-                        "limit": {"type": "integer", "description": "Maximum missions to return, default 50."}
+                        "limit": {"type": "integer", "description": "Maximum missions to return, default 50."},
+                        "project": {"type": "string", "description": "Optional filter: only missions with this project."},
+                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."}
                     }
                 }),
             },
@@ -601,19 +609,27 @@ impl AssistantMcp {
 
     async fn list_missions(&self, params: ListMissionsParams) -> Result<Value, String> {
         let limit = params.limit.clamp(1, 100);
-        let response = self
-            .api_get(&format!("/api/control/missions?limit={limit}&offset=0"))
-            .await?;
+        // Forward filters to the API so it does the (paginated, scan-bounded)
+        // matching server-side — filtering only the fetched page here would miss
+        // matches outside the window on a larger fleet.
+        let mut path = format!("/api/control/missions?limit={limit}&offset=0");
+        if let Some(status) = params.status.as_deref() {
+            path.push_str(&format!("&status={}", urlencoding::encode(status)));
+        }
+        if let Some(project) = params.project.as_deref() {
+            path.push_str(&format!("&project={}", urlencoding::encode(project)));
+        }
+        if let Some(tag) = params.tag.as_deref() {
+            path.push_str(&format!("&tag={}", urlencoding::encode(tag)));
+        }
+        let response = self.api_get(&path).await?;
         if !response.status().is_success() {
             return Err(format!("Failed to list missions: {}", response.status()));
         }
-        let mut missions: Vec<Value> = response
+        let missions: Vec<Value> = response
             .json()
             .await
             .map_err(|error| format!("Failed to parse missions: {error}"))?;
-        if let Some(status) = params.status {
-            missions.retain(|mission| mission["status"].as_str() == Some(status.as_str()));
-        }
         let missions = missions
             .into_iter()
             .map(compact_mission_summary)
@@ -621,7 +637,12 @@ impl AssistantMcp {
         Ok(json!({ "missions": missions }))
     }
 
-    async fn list_active_missions(&self, limit: usize) -> Result<Value, String> {
+    async fn list_active_missions(
+        &self,
+        limit: usize,
+        project: Option<String>,
+        tag: Option<String>,
+    ) -> Result<Value, String> {
         let requested = limit.clamp(1, 100);
         // The API returns the most recent missions regardless of status, so a
         // narrow fetch limit can be fully consumed by recent completed missions
@@ -632,6 +653,8 @@ impl AssistantMcp {
             .list_missions(ListMissionsParams {
                 status: None,
                 limit: fetch_limit,
+                project,
+                tag,
             })
             .await?;
         if let Some(missions) = result["missions"].as_array_mut() {
@@ -1201,7 +1224,8 @@ impl AssistantMcp {
             "list_active_missions" => {
                 let params: ListMissionsParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
-                self.list_active_missions(params.limit).await
+                self.list_active_missions(params.limit, params.project, params.tag)
+                    .await
             }
             "list_missions" => {
                 let params: ListMissionsParams = serde_json::from_value(arguments)
@@ -1339,6 +1363,17 @@ fn compact_mission_summary(mission: Value) -> Value {
         "workspace_name": mission.get("workspace_name").cloned().unwrap_or(Value::Null),
         "short_description": mission.get("short_description").cloned().unwrap_or(Value::Null),
         "updated_at": mission.get("updated_at").cloned().unwrap_or(Value::Null),
+        // Project tagging + awaiting classification + staleness anchors so
+        // consumers can group/route/triage missions without parsing titles or
+        // replaying events.
+        "project": mission.get("project").cloned().unwrap_or(Value::Null),
+        "track": mission.get("track").cloned().unwrap_or(Value::Null),
+        "intent": mission.get("intent").cloned().unwrap_or(Value::Null),
+        "github_pr": mission.get("github_pr").cloned().unwrap_or(Value::Null),
+        "tags": mission.get("tags").cloned().unwrap_or_else(|| json!([])),
+        "awaiting_kind": mission.get("awaiting_kind").cloned().unwrap_or(Value::Null),
+        "last_activity_at": mission.get("last_activity_at").cloned().unwrap_or(Value::Null),
+        "last_status_change_at": mission.get("last_status_change_at").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -1751,12 +1786,25 @@ mod tests {
             "workspace_name": "assistant",
             "short_description": "Build fix",
             "updated_at": "2026-05-28T12:00:00Z",
+            "project": "verity-core",
+            "track": "C3-bridge-collapse",
+            "github_pr": 2061,
+            "tags": ["c3", "sprint-2"],
+            "awaiting_kind": "decision",
             "prompt": "secret prompt",
             "api_token": "sk-test",
         }));
 
         assert_eq!(summary["id"], "mission-1");
         assert_eq!(summary["workspace_name"], "assistant");
+        assert_eq!(summary["project"], "verity-core");
+        assert_eq!(summary["track"], "C3-bridge-collapse");
+        assert_eq!(summary["github_pr"], 2061);
+        assert_eq!(summary["tags"][1], "sprint-2");
+        assert_eq!(summary["awaiting_kind"], "decision");
+        // Missions without tags get an empty array, not null.
+        let bare = compact_mission_summary(json!({"id": "m2"}));
+        assert_eq!(bare["tags"], json!([]));
         assert!(summary.get("prompt").is_none());
         assert!(summary.get("api_token").is_none());
     }

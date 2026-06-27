@@ -16,9 +16,9 @@ import {
   Pencil,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { searchMissions, type Mission, type RunningMissionInfo } from '@/lib/api';
+import { searchMissions, type AwaitingKind, type Mission, type RunningMissionInfo } from '@/lib/api';
 import { getMissionShortName } from '@/lib/mission-display';
-import { STATUS_LABELS, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
+import { statusLabel, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
 import { AsyncButton } from '@/components/ui/async-button';
 import { getStatusIcon } from '@/components/ui/status-icons';
 
@@ -157,11 +157,22 @@ function getMissionBackendLabel(mission: Mission): string {
 }
 
 function getMissionStatusLabel(mission: Mission): string {
-  return STATUS_LABELS[mission.status] ?? mission.status ?? 'Unknown';
+  // Distinguish "Needs Decision" vs "Awaiting Review" for awaiting_user using
+  // awaiting_kind, matching the control workbench/header.
+  return statusLabel(mission.status, mission.awaiting_kind) ?? mission.status ?? 'Unknown';
 }
 
-function getMissionStatusToneClass(status: string | undefined, isRunning: boolean): string {
+function getMissionStatusToneClass(
+  status: string | undefined,
+  isRunning: boolean,
+  awaitingKind?: AwaitingKind | null,
+): string {
   if (isRunning && status !== 'waiting_for_tool') return 'text-indigo-300/85';
+  // Ack ("Awaiting Review") uses the sky tone to match the workbench/header;
+  // decision (and unclassified) stay amber.
+  if (status === 'awaiting_user' && awaitingKind === 'ack') {
+    return 'text-sky-300/90';
+  }
   switch (status) {
     case 'waiting_for_tool':
     case 'awaiting_user':
@@ -202,7 +213,7 @@ function getMissionStatusDisplay(
   if (!mission) return null;
   return {
     Icon: getStatusIcon(mission.status),
-    tone: getMissionStatusToneClass(mission.status, false),
+    tone: getMissionStatusToneClass(mission.status, false, mission.awaiting_kind),
     label: getMissionStatusLabel(mission),
     spin: false,
   };
@@ -305,6 +316,13 @@ export function getMissionSearchText(mission: Mission): string {
   }
   if (mission.mission_mode === 'assistant') {
     textParts.push('assistant telegram');
+  }
+  // Project tagging so missions are findable by project/track/intent/tag.
+  if (mission.project?.trim()) textParts.push(mission.project.trim());
+  if (mission.track?.trim()) textParts.push(mission.track.trim());
+  if (mission.intent?.trim()) textParts.push(mission.intent.trim());
+  if (mission.tags && mission.tags.length > 0) {
+    textParts.push(mission.tags.join(' '));
   }
   return textParts.join(' ');
 }
@@ -576,6 +594,14 @@ export function missionSearchRelevanceScore(
   const workspaceLabel = getWorkspaceLabel(mission, workspaceNameById) ?? '';
   const backend = mission.backend?.trim() ?? '';
   const status = mission.status ?? '';
+  const projectText = [
+    mission.project,
+    mission.track,
+    mission.intent,
+    ...(mission.tags ?? []),
+  ]
+    .filter(Boolean)
+    .join(' ');
   const combined = `${displayName} ${workspaceLabel} ${getMissionSearchText(mission)}`;
 
   const normalizedCombined = normalizeMetadataText(combined);
@@ -587,6 +613,7 @@ export function missionSearchRelevanceScore(
     { weight: 7, tokens: tokenSetFromText(shortDescription) },
     { weight: 3, tokens: tokenSetFromText(workspaceLabel) },
     { weight: 3, tokens: tokenSetFromText(backend) },
+    { weight: 6, tokens: tokenSetFromText(projectText) },
     { weight: 2, tokens: tokenSetFromText(status) },
     { weight: 1, tokens: tokenSetFromText(combined) },
   ];
